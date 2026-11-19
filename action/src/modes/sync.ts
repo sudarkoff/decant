@@ -10,7 +10,10 @@ function fail(msg: string): number {
   return 1;
 }
 
-type Payload = { pull_request?: { number?: number }; repository?: { default_branch?: string } };
+type Payload = {
+  pull_request?: { number?: number; head?: { repo?: { full_name?: string } | null } };
+  repository?: { default_branch?: string; full_name?: string };
+};
 
 export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const env = deps.env;
@@ -45,7 +48,15 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     if (typeof n !== 'number') return fail('event payload has no pull_request.number');
     ref = `pr-${n}`;
     token = inputs.token;
-    if (!token) return fail('token is required on pull requests');
+    if (!token) {
+      const head = payload.pull_request?.head?.repo;
+      const fork = !head || head.full_name !== payload.repository?.full_name;
+      if (fork) {
+        notice('fork PR has no secrets; decant sync skipped');
+        return 0;
+      }
+      return fail('token is required on pull requests');
+    }
   } else if (event === 'push') {
     const branch = env.GITHUB_REF_NAME || (env.GITHUB_REF ?? '').replace(/^refs\/heads\//, '');
     if (!branch || branch !== payload.repository?.default_branch) {

@@ -207,3 +207,48 @@ describe('sync', () => {
     expect(out.join('')).toContain('::add-mask::sync-tok');
   });
 });
+
+describe('review fixes', () => {
+  it('setup writes npmrc and netrc 0600 even when they pre-existed 0644', async () => {
+    const { deps, fs } = setupDeps();
+    fs.files.set('/home/r/.npmrc', 'old');
+    fs.modes.set('/home/r/.npmrc', 0o644);
+    fs.files.set('/home/r/.netrc', 'old');
+    fs.modes.set('/home/r/.netrc', 0o644);
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(fs.modes.get('/home/r/.npmrc')).toBe(0o600);
+    expect(fs.modes.get('/home/r/.netrc')).toBe(0o600);
+  });
+  it('whitespace-only bypass-reason fails', async () => {
+    const { deps } = setupDeps({ INPUT_BYPASS: 'true', INPUT_BYPASS_REASON: '   ' });
+    const { err } = cap();
+    expect(await run(deps)).toBe(1);
+    expect(err.join('')).toContain('bypass requires bypass-reason');
+  });
+  const noTok = { INPUT_TOKEN: '' };
+  const pr = (head: unknown) => ({ pull_request: { number: 7, head }, repository: { default_branch: 'main', full_name: 'o/r' } });
+  it('fork PR with no token → 0 + notice', async () => {
+    const { deps, f } = syncDeps({ env: noTok, payload: pr({ repo: { full_name: 'x/r' } }) });
+    const { out } = cap();
+    expect(await run(deps)).toBe(0);
+    expect(out.join('')).toContain('::notice::fork PR has no secrets; decant sync skipped');
+    expect(f.calls).toHaveLength(0);
+  });
+  it('deleted fork (head.repo null) with no token → 0', async () => {
+    const { deps } = syncDeps({ env: noTok, payload: pr({ repo: null }) });
+    cap();
+    expect(await run(deps)).toBe(0);
+  });
+  it('same-repo PR with no token → 1', async () => {
+    const { deps } = syncDeps({ env: noTok, payload: pr({ repo: { full_name: 'o/r' } }) });
+    cap();
+    expect(await run(deps)).toBe(1);
+  });
+  it('fork PR with a token still syncs', async () => {
+    const { deps, f } = syncDeps({ payload: pr({ repo: { full_name: 'x/r' } }) });
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(f.calls).toHaveLength(1);
+  });
+});

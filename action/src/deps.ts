@@ -7,6 +7,7 @@ export type Fs = {
   readdir(p: string): Promise<{ name: string; isDir: boolean; isSymlink: boolean }[]>;
   exists(p: string): Promise<boolean>;
   mkdir(p: string): Promise<void>;
+  chmod(p: string, mode: number): Promise<void>;
 };
 
 export type ActionDeps = {
@@ -32,6 +33,7 @@ export const defaultFs: Fs = {
       return false;
     }
   },
+  chmod: (p, mode) => nodeFs.chmod(p, mode),
   async mkdir(p) {
     await nodeFs.mkdir(p, { recursive: true });
   },

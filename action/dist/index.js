@@ -43,6 +43,7 @@ var defaultFs = {
       return false;
     }
   },
+  chmod: (p, mode) => nodeFs.chmod(p, mode),
   async mkdir(p) {
     await nodeFs.mkdir(p, { recursive: true });
   }
@@ -168,15 +169,16 @@ async function run4({ deps, inputs }) {
   const npmrc = `${home}/.npmrc`;
   const netrc = `${home}/.netrc`;
   if (inputs.bypass) {
-    if (!inputs.bypassReason) return fail("bypass requires bypass-reason");
+    const reason = inputs.bypassReason.trim();
+    if (!reason) return fail("bypass requires bypass-reason");
     await deps.fs.writeFile(npmrc, "registry=https://registry.npmjs.org/\nignore-scripts=true\n");
     exportVar("GOPROXY", "https://proxy.golang.org", env);
     const actor = env.GITHUB_ACTOR ?? "";
-    warning(`decant BYPASSED by ${actor}: ${inputs.bypassReason}`);
+    warning(`decant BYPASSED by ${actor}: ${reason}`);
     const runUrl = `${env.GITHUB_SERVER_URL ?? ""}/${env.GITHUB_REPOSITORY ?? ""}/actions/runs/${env.GITHUB_RUN_ID ?? ""}`;
     appendSummary(`## \u26A0\uFE0F decant bypassed
 
-Actor: ${actor} \xB7 Reason: ${inputs.bypassReason} \xB7 Run: ${runUrl}`, env);
+Actor: ${actor} \xB7 Reason: ${reason} \xB7 Run: ${runUrl}`, env);
     return 0;
   }
   if (!inputs.token) return fail("token is required (read token)");
@@ -185,9 +187,11 @@ Actor: ${actor} \xB7 Reason: ${inputs.bypassReason} \xB7 Run: ${runUrl}`, env);
   await deps.fs.writeFile(npmrc, `registry=${base}/npm/
 //${host}/npm/:_authToken=${inputs.token}
 ignore-scripts=true
-`);
+`, 384);
   await deps.fs.writeFile(netrc, `machine ${host} login decant password ${inputs.token}
 `, 384);
+  await deps.fs.chmod(npmrc, 384);
+  await deps.fs.chmod(netrc, 384);
   exportVar("GOPROXY", `${base}/go`, env);
   return 0;
 }
@@ -474,7 +478,15 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     if (typeof n !== "number") return fail2("event payload has no pull_request.number");
     ref = `pr-${n}`;
     token = inputs.token;
-    if (!token) return fail2("token is required on pull requests");
+    if (!token) {
+      const head = payload.pull_request?.head?.repo;
+      const fork = !head || head.full_name !== payload.repository?.full_name;
+      if (fork) {
+        notice("fork PR has no secrets; decant sync skipped");
+        return 0;
+      }
+      return fail2("token is required on pull requests");
+    }
   } else if (event === "push") {
     const branch = env.GITHUB_REF_NAME || (env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "");
     if (!branch || branch !== payload.repository?.default_branch) {

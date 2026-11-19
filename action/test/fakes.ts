@@ -1,18 +1,24 @@
 import type { ActionDeps, Fs } from '../src/deps';
 import type { Exec } from '../src/exec';
 
-export function memFs(files: Record<string, string> = {}, symlinks: string[] = []): Fs & { files: Map<string, string> } {
+export function memFs(files: Record<string, string> = {}, symlinks: string[] = []): Fs & { files: Map<string, string>; modes: Map<string, number> } {
+  const modes = new Map<string, number>();
   const m = new Map(Object.entries(files));
   const dirs = new Set<string>();
   return {
     files: m,
+    modes,
+    async chmod(p, mode) {
+      modes.set(p, mode);
+    },
     async readFile(p) {
       const v = m.get(p);
       if (v === undefined) throw new Error(`ENOENT: ${p}`);
       return v;
     },
-    async writeFile(p, data) {
+    async writeFile(p, data, mode) {
       m.set(p, data);
+      if (mode !== undefined && !modes.has(p)) modes.set(p, mode);
     },
     async readdir(p) {
       const prefix = p.endsWith('/') ? p : `${p}/`;
