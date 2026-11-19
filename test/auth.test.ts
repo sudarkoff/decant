@@ -36,12 +36,12 @@ it('read token over Bearer reaches /npm/', async () => {
 });
 
 it('ci token reaches /go/', async () => {
-  expect((await get('/go/x', bearer(tokens.ci))).status).toBe(501);
+  expect((await get('/go/x', bearer(tokens.ci), 'POST')).status).toBe(405);
 });
 
 it('read token as Basic password reaches /go/', async () => {
   const b = btoa(`anyuser:${tokens.read}`);
-  expect((await get('/go/x', { authorization: `Basic ${b}` })).status).toBe(501);
+  expect((await get('/go/x', { authorization: `Basic ${b}` }, 'POST')).status).toBe(405);
 });
 
 it('operator token on /npm/ -> 403', async () => {

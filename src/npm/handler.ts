@@ -1,19 +1,18 @@
 import type { RequestCtx } from '../auth';
 import { json } from '../http';
 import { maliciousIds } from '../osv';
-import { decide, type Decision } from '../policy/decide';
+import { decider } from '../policy/decider';
 import {
   addGlobalBlock,
-  blockedVersions,
   getPinnedTimes,
   getVersionState,
-  loadPolicyView,
   logServe,
   markOsvChecked,
   markStored,
   pinPublishTimes,
   type PinnedTime,
 } from '../policy/store';
+import { pump, readUpTo } from '../streams';
 import { formatPackageId, type Deps, type Env, type PackageRef } from '../types';
 import { cachedFetch } from '../upstream';
 import { filterPackument, type Packument } from './filter';
@@ -75,24 +74,6 @@ function publishTimes(full: Packument): Map<string, Date> {
   return out;
 }
 
-async function decider(env: Env, deps: Deps, rc: RequestCtx, name: string) {
-  const [blocks, view] = await Promise.all([
-    blockedVersions(env, 'npm', name),
-    loadPolicyView(env, rc.projectId, rc.ref),
-  ]);
-  const allowed = view.allowedFor('npm', name);
-  const now = deps.now();
-  return (version: string, pin: PinnedTime | null | undefined): Decision =>
-    decide({
-      publishTime: pin?.publishTime ?? null,
-      conflict: pin?.conflict ?? false,
-      blocked: blocks.has(version),
-      allowed: allowed.has(version),
-      cooldownDays: view.cooldownDays,
-      now,
-    });
-}
-
 async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx, name: string): Promise<Response> {
   const abbrev = (req.headers.get('accept') ?? '').includes(ABBREV);
   const r = await fetchDoc(env, deps, name, abbrev);
@@ -117,7 +98,7 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx
     }
   }
 
-  const d = await decider(env, deps, rc, name);
+  const d = await decider(env, deps, rc, 'npm', name);
   const allowed = new Set(versions.filter((v) => d(v, pinned.get(v)) === 'allow'));
   const out = filterPackument(doc, allowed, `${rc.base}/npm`);
   return new Response(JSON.stringify(out), {
@@ -148,38 +129,6 @@ function b64(buf: ArrayBuffer): string {
   let s = '';
   for (const b of new Uint8Array(buf)) s += String.fromCharCode(b);
   return btoa(s);
-}
-
-/** Reads the whole stream, or cancels it and returns null once it exceeds `max` bytes. */
-async function readUpTo(reader: ReadableStreamDefaultReader<Uint8Array>, max: number): Promise<Uint8Array | null> {
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > max) {
-      await reader.cancel();
-      return null;
-    }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
-}
-
-async function pump(reader: ReadableStreamDefaultReader<Uint8Array>, sinks: WritableStreamDefaultWriter<Uint8Array>[]): Promise<void> {
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    await Promise.all(sinks.map((w) => w.write(value)));
-  }
-  await Promise.all(sinks.map((w) => w.close()));
 }
 
 /**
@@ -268,7 +217,7 @@ async function handleTarball(
     state = await getVersionState(env, ref);
   }
 
-  const d = (await decider(env, deps, rc, name))(version, state);
+  const d = (await decider(env, deps, rc, 'npm', name))(version, state);
   if (d !== 'allow') return err(404, `${id} is not available: ${d === 'blocked' ? 'blocked' : 'in cooldown'}`);
 
   const serve = () => ctx.waitUntil(logServe(env, rc.projectId, ref, now).catch(() => console.warn(`serve log failed ${id}`)));
