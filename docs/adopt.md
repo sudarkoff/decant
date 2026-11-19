@@ -12,6 +12,12 @@ Every example pins `sudarkoff/decant/action@<release-sha> # v0.1.0`. Replace `<r
 | `ci` | PR policy sync, scan, audit, adopt | repo secret `DECANT_CI_TOKEN` |
 | `sync` | main-branch policy sync only | **environment** secret `DECANT_SYNC_TOKEN` in `decant-sync` |
 
+```sh
+npm run decant -- token create <project> read
+npm run decant -- token create <project> ci
+npm run decant -- token create <project> sync
+```
+
 Also set a repo variable `DECANT_URL` (your Worker's URL).
 
 Create the `decant-sync` environment (Settings, Environments) and restrict it to the default branch (Deployment branches and tags: Selected branches, add `main`). A PR build can then never read the sync token or rewrite the main policy.
@@ -38,9 +44,9 @@ The audit and adopt workflows mint a short-lived token with `actions/create-gith
 
 Copy these to `.github/workflows/`:
 
-- `decant-pr.yml`: on PRs that touch a lockfile or `decant.json`, syncs the PR overlay policy then scans. Needs `contents: read`, `pull-requests: write`, `issues: write` (labels and comments) and a full checkout (`fetch-depth: 0`) so it can read the base branch's lockfile. It runs on `edited` too, so changing a PR's base resets review state.
+- `decant-pr.yml`: on every PR, syncs the PR overlay policy then scans. Needs `contents: read`, `pull-requests: write`, `issues: write` (labels and comments) and a full checkout (`fetch-depth: 0`) so it can read the base branch's lockfile. It runs on `edited` too, so changing a PR's base resets review state. There is deliberately no `paths:` filter: a required check that never runs on a PR stays "Expected" and blocks the merge. When no lockfile changed, scan exits quickly and does not install GuardDog (it is installed lazily, only when a new package needs scanning).
 - `decant-main.yml`: on pushes to the default branch that change `decant.json`, syncs the main policy using the environment's sync token.
-- `decant-audit.yml`: daily at 05:23 UTC and on demand. **It runs on the default branch only**, and the job is guarded to refuse any other ref. It needs Node and Go on the runner (the example installs both) because it runs `npm` and `go` to prepare fixes.
+- `decant-audit.yml`: daily at 05:23 UTC and on demand. **It runs on the default branch only**, and the job is guarded to refuse any other ref. It needs Node and Go on the runner (the example installs both) because it runs `npm` and `go` to prepare fixes. For an npm-only repo, delete the setup-go step (or use `go-version: stable` instead of `go-version-file`).
 - `decant-adopt.yml`: manual, one time. Also default branch only.
 - The install job: add it to your build workflow ([install-snippet.yml](../examples/workflows/install-snippet.yml)):
 
@@ -149,7 +155,7 @@ updates:
 
 ## How the scan behaves
 
-- A flagged GuardDog result can be cleared by a repo writer adding the **`decant:reviewed`** label. A label added by anyone without write access is ignored, and new commits to the PR remove it, so each push needs a fresh review.
+- A flagged GuardDog result can be cleared by a repo writer adding the **`decant:reviewed`** label. A label added by anyone without write access is ignored. decant removes the label on new commits, when the PR is reopened and when its base changes, so each of those needs a fresh review.
 - Lockfiles or directories that are symlinks fail the scan. decant does not follow them.
 - GuardDog runs in its sandbox. A runner that cannot run it fails closed: the scan fails instead of passing unchecked.
 - Fork PRs are skipped, since they have no secrets.
@@ -164,4 +170,4 @@ It **skips**: the cooldown, the vulnerability and malware scans, and blocks. npm
 
 It **still holds**: lockfile integrity hashes (npm verifies `integrity`) and `go.sum` and sumdb hashes (Go verifies against `sum.golang.org`). A tampered tarball or module still fails.
 
-The run leaves a visible warning (`decant BYPASSED by <actor>: <reason>`) and a job summary naming who ran it, why, and the run URL. Afterwards, review what the bypassed run installed, and let the next normal run re-scan it.
+The run leaves a visible warning (`decant BYPASSED by <actor>: <reason>`) and a job summary naming who ran it, why, and the run URL. Afterwards, run audit, and review the versions installed during the bypass by hand (the PR scan only checks lockfile diffs).

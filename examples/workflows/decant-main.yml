@@ -1,4 +1,5 @@
 # Default branch: sync the main policy with the sync token from the decant-sync environment.
+# Change `main` to your default branch, and the path if you set policy-path.
 # Replace <release-sha> with the commit SHA of the decant release you pin.
 name: decant main
 on:

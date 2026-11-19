@@ -6,7 +6,8 @@ decant gates what your clients fetch. These habits stop anything from going arou
 - **Pin Docker base images to digests**: `FROM node:24@sha256:<digest>`.
 - **Install with `npm ci --ignore-scripts`.** `npm ci` installs exactly the lockfile; `--ignore-scripts` stops install scripts running. Keep `ignore-scripts=true` in `.npmrc` too.
 - **No `,direct` in `GOPROXY`.** `https://<your-domain>/go,direct` lets Go fall back to the public proxy for anything decant hides.
-- **Never set `GONOSUMDB`, `GONOSUMCHECK` or `GOFLAGS=-insecure`.** They disable the checksum database, which is what catches a tampered module.
+- **Never set `GONOSUMDB`, `GOSUMDB=off` or `GOFLAGS=-insecure`.** They disable the checksum database, which is what catches a tampered module.
+- **Understand `GOPRIVATE` and `GOINSECURE` before setting them.** `GOPRIVATE` makes Go fetch matching modules directly and skip the checksum database; `GOINSECURE` allows plain HTTP. Either sends those modules around decant's gate.
 - **Least-privilege `permissions:`.** Set `permissions: contents: read` at the workflow level and add only what a job needs (the PR scan adds `pull-requests: write` and `issues: write`).
 - **Keep the sync token out of PRs.** Store it in the `decant-sync` environment, restricted to the default branch.
 - **Require the `decant scan` check** in branch protection, and require review for `decant.json` changes (a CODEOWNERS entry works): a merged `decant.json` is how a version is approved.

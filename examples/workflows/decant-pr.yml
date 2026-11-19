@@ -1,13 +1,10 @@
 # Pull requests: sync the PR overlay policy, then scan changed dependencies.
+# No paths filter: a required check must run on every PR, and scan exits fast when no lockfile changed.
 # Replace <release-sha> with the commit SHA of the decant release you pin.
 name: decant
 on:
   pull_request:
     types: [opened, synchronize, reopened, edited]
-    paths:
-      - '**/package-lock.json'
-      - '**/go.sum'
-      - decant.json
 permissions:
   contents: read
   pull-requests: write
