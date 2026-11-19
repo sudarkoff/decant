@@ -31,7 +31,7 @@ export async function handle(req: Request, env: Env, deps: Deps, ctx: ExecutionC
 
   const auth = await authenticate(req, env);
   if (!auth) return unauthorized();
-  if (auth.kind === 'operator') return text('forbidden', 403);
+  if (auth.kind === 'operator' || auth.kind === 'sync') return text('forbidden', 403);
 
   const rc: RequestCtx = {
     projectId: auth.projectId,

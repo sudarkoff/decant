@@ -5,7 +5,7 @@ export type CliEnv = Record<string, string | undefined>;
 
 export const USAGE = `usage:
   decant project create <id>
-  decant token create <project> <read|ci>
+  decant token create <project> <read|ci|sync>
   decant op-token
 
 env: DECANT_URL, DECANT_OPERATOR_TOKEN`;
@@ -33,7 +33,7 @@ export function buildRequest(argv: string[], env: CliEnv): Request | { error: st
     path = '/api/projects';
     body = { id: a };
   } else if (cmd === 'token' && sub === 'create' && a && b && argv.length === 4) {
-    if (b !== 'read' && b !== 'ci') return { error: 'kind must be read or ci' };
+    if (b !== 'read' && b !== 'ci' && b !== 'sync') return { error: 'kind must be read, ci or sync' };
     path = `/api/projects/${encodeURIComponent(a)}/tokens`;
     body = { kind: b };
   } else {

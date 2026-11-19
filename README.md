@@ -25,6 +25,6 @@ New releases rest before they're poured: decant serves a version only after it h
 - Package bytes are stored in R2 and served unmodified, so checksums still match.
 - Per-project policy (cooldown, allow and block lists) lives in D1, synced from your repo.
 - A daily cron re-checks stored versions against OSV and blocks any newly flagged as malicious.
-- Tokens are per project: `read` for installs, `ci` for policy sync, and one operator token for admin.
+- Tokens are per project: `read` for installs, `sync` for main-branch policy sync, `ci` for overlays and verdicts, and one operator token for admin.
 
 v1 supports npm and Go. See [docs/deploy.md](docs/deploy.md) to set it up.

@@ -1,6 +1,6 @@
 import type { Env } from './types';
 
-export type AuthCtx = { kind: 'operator' } | { kind: 'read' | 'ci'; projectId: string };
+export type AuthCtx = { kind: 'operator' } | { kind: 'read' | 'ci' | 'sync'; projectId: string };
 
 /** Per-request context handed to the npm/go handlers. base = origin + prefix, e.g. https://h/r/pr-12 */
 export interface RequestCtx {
@@ -15,7 +15,7 @@ function b64url(bytes: Uint8Array): string {
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-export function newToken(kind: 'read' | 'ci' | 'op'): string {
+export function newToken(kind: 'read' | 'ci' | 'sync' | 'op'): string {
   return `dk_${kind}_${b64url(crypto.getRandomValues(new Uint8Array(32)))}`;
 }
 
@@ -56,7 +56,7 @@ export async function authenticate(req: Request, env: Env): Promise<AuthCtx | nu
   if (op !== '' && constantTimeEqual(hash, op)) return { kind: 'operator' };
   const row = await env.DB.prepare('SELECT project_id, kind FROM tokens WHERE hash = ?')
     .bind(hash)
-    .first<{ project_id: string; kind: 'read' | 'ci' }>();
+    .first<{ project_id: string; kind: 'read' | 'ci' | 'sync' }>();
   if (!row) return null;
   return { kind: row.kind, projectId: row.project_id };
 }
