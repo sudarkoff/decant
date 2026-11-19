@@ -32,6 +32,9 @@ type World = {
   openPr?: boolean;
   symlinks?: string[];
   existingPolicy?: unknown;
+  stale?: boolean;
+  prFiles?: Record<string, string>;
+  repo?: string;
 };
 
 function harness(w: World) {
@@ -44,6 +47,7 @@ function harness(w: World) {
   const commits: { input: any }[] = [];
   const prs: any[] = [];
   const branches: any[] = [];
+  const patches: { url: string; body: any }[] = [];
   const f = fakeFetch((c: FetchCall) => {
     const u = new URL(c.url);
     const key = `${c.method} ${c.url}`;
@@ -65,7 +69,18 @@ function harness(w: World) {
     }
     if (key === `POST ${R}/git/refs`) {
       branches.push(JSON.parse(c.body!));
+      if (w.stale) return new Response('Reference already exists', { status: 422 });
       return jsonRes({}, 201);
+    }
+    if (c.method === 'PATCH') {
+      patches.push({ url: c.url, body: JSON.parse(c.body!) });
+      return jsonRes({});
+    }
+    if (c.method === 'GET' && c.url.startsWith(`${R}/contents/`)) {
+      const path = decodeURIComponent(u.pathname.slice('/repos/o/r/contents/'.length));
+      const v = w.prFiles?.[path];
+      if (v === undefined) return new Response('nf', { status: 404 });
+      return jsonRes({ encoding: 'base64', content: Buffer.from(v).toString('base64') });
     }
     if (key === 'POST https://api.github.com/graphql') {
       commits.push(JSON.parse(c.body!).variables);
@@ -85,7 +100,7 @@ function harness(w: World) {
     INPUT_GITHUB_TOKEN: 'ghs_secret',
     INPUT_WORKING_DIRECTORY: '/w',
     INPUT_POLICY_PATH: 'decant.json',
-    GITHUB_REPOSITORY: 'o/r',
+    GITHUB_REPOSITORY: w.repo ?? 'o/r',
     GITHUB_OUTPUT: output,
   };
   const out: string[] = [];
@@ -96,7 +111,7 @@ function harness(w: World) {
     const additions = commits[0]!.input.fileChanges.additions as { path: string; contents: string }[];
     return Object.fromEntries(additions.map((a) => [a.path, Buffer.from(a.contents, 'base64').toString('utf8')]));
   };
-  return { run: () => run(deps), f, commits, prs, branches, written, log: () => out.join(''), outputs: () => readFileSync(output, 'utf8') };
+  return { run: () => run(deps), f, commits, prs, branches, patches, written, log: () => out.join(''), outputs: () => readFileSync(output, 'utf8') };
 }
 
 const THREE = {
@@ -202,5 +217,37 @@ describe('adopt', () => {
   it('invalid existing policy fails', async () => {
     const h = harness({ ...THREE, existingPolicy: { project: '' } });
     expect(await h.run()).toBe(1);
+  });
+
+  it('invalid final policy (empty project): exit 1, no commit', async () => {
+    const h = harness({ ...THREE, repo: 'o/' });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('invalid policy');
+    expect(h.commits).toEqual([]);
+  });
+
+  it('stale branch (422 on create): force-resets via updateRef then commits', async () => {
+    const h = harness({ ...THREE, stale: true });
+    expect(await h.run()).toBe(0);
+    expect(h.patches).toContainEqual({ url: `${R}/git/refs/heads/decant/adopt`, body: { sha: HEAD, force: true } });
+    expect(h.commits[0]!.input.expectedHeadOid).toBe(HEAD);
+    expect(h.prs).toHaveLength(1);
+  });
+
+  it('open PR: body is refreshed after the commit', async () => {
+    const h = harness({ ...THREE, openPr: true });
+    expect(await h.run()).toBe(0);
+    const p = h.patches.find((x) => x.url === `${R}/pulls/9`)!;
+    expect(p.body.body).toContain('npm:two@2.0.0');
+  });
+
+  it('open PR already holding the same files: no commit', async () => {
+    const first = harness(THREE);
+    await first.run();
+    const prFiles = first.written();
+    const h = harness({ ...THREE, openPr: true, prFiles });
+    expect(await h.run()).toBe(0);
+    expect(h.log()).toContain('adopt PR already up to date');
+    expect(h.commits).toEqual([]);
   });
 });

@@ -142,6 +142,9 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const allow = [...((raw.allow as Entry[] | undefined) ?? []), ...added.map((a) => ({ package: a.id, reason: 'adopted', added: today }))];
   raw = { ...raw, allow };
 
+  const final = parsePolicy(raw);
+  if (!final.ok) return stop(`invalid policy:\n${final.errors.map((m) => `- ${m}`).join('\n')}`);
+
   const files = [...changedFiles];
   if (added.length || !hadPolicy) files.unshift({ path: policyRel, contents: `${JSON.stringify(raw, null, 2)}\n` });
   if (!files.length) {
@@ -160,10 +163,27 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     if (open) head = open.headSha;
     else {
       head = await gh.branchHead(base);
-      await gh.createBranch(BRANCH, head);
+      try {
+        await gh.createBranch(BRANCH, head);
+      } catch (e) {
+        // A stale branch with no open PR (e.g. a merged or closed adopt): reset it to the default head.
+        if (!/HTTP 422/.test((e as Error).message)) throw e;
+        await gh.updateRef(BRANCH, head);
+      }
+    }
+    if (open) {
+      let same = true;
+      for (const f of files) if ((await gh.fileAt(f.path, head)) !== f.contents) same = false;
+      if (same) {
+        notice('adopt PR already up to date');
+        setOutput('pr-number', String(open.number), env);
+        setOutput('result', 'pass', env);
+        return 0;
+      }
     }
     await gh.commitFiles(BRANCH, head, 'decant: adopt', files);
     if (open) {
+      await gh.updatePr(open.number, { body });
       notice(`updated #${open.number}`);
       setOutput('pr-number', String(open.number), env);
     } else {

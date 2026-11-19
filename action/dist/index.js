@@ -444,6 +444,24 @@ ${body}`) !== null;
       const r = await json("GET", `${R}/git/ref/heads/${name.split("/").map(encodeURIComponent).join("/")}`);
       return r.object.sha;
     },
+    /** Force-moves branch `name` to `sha`. */
+    async updateRef(name, sha) {
+      await rest("PATCH", `${R}/git/refs/heads/${name.split("/").map(encodeURIComponent).join("/")}`, { sha, force: true });
+    },
+    async updatePr(n, p) {
+      await rest("PATCH", `${R}/pulls/${n}`, { body: p.body });
+    },
+    /** UTF-8 contents of `path` at `ref`; null if it does not exist there. */
+    async fileAt(path, ref) {
+      try {
+        const r = await json("GET", `${R}/contents/${path.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`);
+        if (r.encoding !== "base64" || typeof r.content !== "string") return null;
+        return Buffer.from(r.content, "base64").toString("utf8");
+      } catch (e) {
+        if (/HTTP 404/.test(e.message)) return null;
+        throw e;
+      }
+    },
     async createBranch(name, fromSha) {
       await rest("POST", `${R}/git/refs`, { ref: `refs/heads/${name}`, sha: fromSha });
     },
@@ -768,6 +786,9 @@ ${failures.sort().map((m) => `- ${m}`).join("\n")}`);
   const today = ymd(now);
   const allow = [...raw.allow ?? [], ...added.map((a) => ({ package: a.id, reason: "adopted", added: today }))];
   raw = { ...raw, allow };
+  const final = parsePolicy(raw);
+  if (!final.ok) return stop(`invalid policy:
+${final.errors.map((m) => `- ${m}`).join("\n")}`);
   const files = [...changedFiles];
   if (added.length || !hadPolicy) files.unshift({ path: policyRel, contents: `${JSON.stringify(raw, null, 2)}
 ` });
@@ -785,10 +806,26 @@ ${failures.sort().map((m) => `- ${m}`).join("\n")}`);
     if (open) head = open.headSha;
     else {
       head = await gh.branchHead(base);
-      await gh.createBranch(BRANCH, head);
+      try {
+        await gh.createBranch(BRANCH, head);
+      } catch (e) {
+        if (!/HTTP 422/.test(e.message)) throw e;
+        await gh.updateRef(BRANCH, head);
+      }
+    }
+    if (open) {
+      let same = true;
+      for (const f of files) if (await gh.fileAt(f.path, head) !== f.contents) same = false;
+      if (same) {
+        notice("adopt PR already up to date");
+        setOutput("pr-number", String(open.number), env);
+        setOutput("result", "pass", env);
+        return 0;
+      }
     }
     await gh.commitFiles(BRANCH, head, "decant: adopt", files);
     if (open) {
+      await gh.updatePr(open.number, { body });
       notice(`updated #${open.number}`);
       setOutput("pr-number", String(open.number), env);
     } else {

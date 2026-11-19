@@ -236,6 +236,27 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
       return r.object.sha;
     },
 
+    /** Force-moves branch `name` to `sha`. */
+    async updateRef(name: string, sha: string): Promise<void> {
+      await rest('PATCH', `${R}/git/refs/heads/${name.split('/').map(encodeURIComponent).join('/')}`, { sha, force: true });
+    },
+
+    async updatePr(n: number, p: { body: string }): Promise<void> {
+      await rest('PATCH', `${R}/pulls/${n}`, { body: p.body });
+    },
+
+    /** UTF-8 contents of `path` at `ref`; null if it does not exist there. */
+    async fileAt(path: string, ref: string): Promise<string | null> {
+      try {
+        const r = await json<{ content?: string; encoding?: string }>('GET', `${R}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`);
+        if (r.encoding !== 'base64' || typeof r.content !== 'string') return null;
+        return Buffer.from(r.content, 'base64').toString('utf8');
+      } catch (e) {
+        if (/HTTP 404/.test((e as Error).message)) return null;
+        throw e;
+      }
+    },
+
     async createBranch(name: string, fromSha: string): Promise<void> {
       await rest('POST', `${R}/git/refs`, { ref: `refs/heads/${name}`, sha: fromSha });
     },
