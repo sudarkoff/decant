@@ -133,7 +133,7 @@ export GOPROXY=https://decant:<read-token>@<your-domain>/go
 go list -m -versions github.com/google/uuid
 ```
 
-A version younger than the cooldown (7 days by default) is hidden until it ages in, unless the project's policy allows it. Policy files are synced by the GitHub Action (the GitHub Action is not released yet).
+A version younger than the cooldown (7 days by default) is hidden until it ages in, unless the project's policy allows it. Policy files are synced by the GitHub Action; see [adopt.md](adopt.md).
 
 ## Rotating the operator token
 

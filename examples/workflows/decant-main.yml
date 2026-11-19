@@ -1,0 +1,21 @@
+# Default branch: sync the main policy with the sync token from the decant-sync environment.
+# Replace <release-sha> with the commit SHA of the decant release you pin.
+name: decant main
+on:
+  push:
+    branches: [main]
+    paths:
+      - decant.json
+permissions:
+  contents: read
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: decant-sync
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: sudarkoff/decant/action@<release-sha> # v0.1.0
+        with:
+          mode: sync
+          decant-url: ${{ vars.DECANT_URL }}
+          sync-token: ${{ secrets.DECANT_SYNC_TOKEN }}

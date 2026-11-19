@@ -1,0 +1,35 @@
+# Daily audit of the default branch. Scheduled workflows only run on the default branch.
+# Replace <release-sha> with the commit SHA of the decant release you pin.
+name: decant audit
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audit:
+    # Default branch only: audit opens fix PRs and issues against it.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          app-id: ${{ secrets.DECANT_APP_ID }}
+          private-key: ${{ secrets.DECANT_APP_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: sudarkoff/decant/action@<release-sha> # v0.1.0
+        env:
+          DECANT_GITHUB_LOGIN: ${{ steps.app.outputs.app-slug }}[bot]
+        with:
+          mode: audit
+          decant-url: ${{ vars.DECANT_URL }}
+          token: ${{ secrets.DECANT_CI_TOKEN }}
+          github-token: ${{ steps.app.outputs.token }}

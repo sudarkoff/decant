@@ -4,7 +4,7 @@ A self-hosted package cache and supply-chain gate for npm and Go, running on Clo
 
 New releases rest before they're poured: decant serves a version only after it has aged past a cooldown, been scanned, and cleared your policy. Versions you depend on stay cached even if they vanish upstream, and your builds keep working when the public registries don't.
 
-**Status:** Worker usable; GitHub Action coming. Deploy it with [docs/deploy.md](docs/deploy.md).
+**Status:** Worker live; Action ready, unreleased. Docs: [deploy](docs/deploy.md), [adopt](docs/adopt.md), [hardening](docs/hardening.md), [release](docs/release.md).
 
 ## Goals
 

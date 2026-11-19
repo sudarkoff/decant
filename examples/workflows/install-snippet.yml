@@ -1,0 +1,31 @@
+# Add the bypass inputs and the install job to your build workflow.
+# Replace <release-sha> with the commit SHA of the decant release you pin.
+name: build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      bypass:
+        description: 'Emergency only: skip decant and install straight from npm and the Go proxy'
+        type: boolean
+        default: false
+      bypass_reason:
+        description: Why decant is being bypassed (required when bypass is set)
+        type: string
+        default: ''
+permissions:
+  contents: read
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: sudarkoff/decant/action@<release-sha> # v0.1.0
+        with:
+          mode: setup
+          decant-url: ${{ vars.DECANT_URL }}
+          token: ${{ secrets.DECANT_READ_TOKEN }}
+          bypass: ${{ inputs.bypass || 'false' }}
+          bypass-reason: ${{ inputs.bypass_reason }}
+      - run: npm ci --ignore-scripts
