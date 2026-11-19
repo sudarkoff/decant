@@ -56,6 +56,19 @@ describe('verifyAdvisoryFix', () => {
     expect(body).toEqual({ package: { name: 'github.com/x/y', ecosystem: 'Go' }, version: '1.2.3' });
   });
 
+  it('not-fixed when the query returns an alias of the cited advisory (not the cited id)', async () => {
+    const f = fakeFetch({
+      [`${OSV}/v1/vulns/${ghsa}`]: Response.json({
+        id: ghsa,
+        aliases: ['GO-2025-1'],
+        affected: [{ package: { ecosystem: 'Go', name: 'github.com/x/y' } }],
+      }),
+      [`${OSV}/v1/query`]: Response.json({ vulns: [{ id: 'GO-2025-1' }] }),
+    });
+    const goRef: PackageRef = { eco: 'go', name: 'github.com/x/y', version: 'v1.0.0' };
+    expect(await verifyAdvisoryFix({ fetch: f, now }, ghsa, goRef)).toBe('not-fixed');
+  });
+
   it('unavailable on network error, 5xx and 429', async () => {
     const thrown = fakeFetch({});
     expect(await verifyAdvisoryFix({ fetch: thrown, now }, ghsa, ref)).toBe('unavailable');

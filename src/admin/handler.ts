@@ -10,6 +10,7 @@ const ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SCANNER_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const RESULTS = new Set(['clean', 'flagged', 'malicious']);
+const SEVERITY_SQL = (col: string) => `(CASE ${col} WHEN 'malicious' THEN 2 WHEN 'flagged' THEN 1 ELSE 0 END)`;
 
 const NO_STORE = { 'cache-control': 'no-store' };
 const reply = (body: unknown, status = 200) => json(body, status, NO_STORE);
@@ -95,7 +96,7 @@ async function route(req: Request, env: Env, deps: Deps, auth: AuthCtx, path: st
   if (segs.length === 1 && segs[0] === 'verdicts') {
     if (m !== 'PUT' && m !== 'GET') return methodNotAllowed();
     if (!isCi(auth)) return forbidden();
-    return m === 'PUT' ? putVerdict(req, env, deps) : getVerdicts(req, env);
+    return m === 'PUT' ? putVerdict(req, env, deps, auth.projectId) : getVerdicts(req, env);
   }
   if (segs.length === 3 && segs[0] === 'projects') {
     const id = segs[1]!;
@@ -201,26 +202,42 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string)
     ).bind(projectId, ref, JSON.stringify(policy), sha, now),
     db.prepare('DELETE FROM allows WHERE project_id = ? AND ref = ?').bind(projectId, ref),
   ];
-  for (const a of policy.allow) {
+  // One INSERT ... SELECT FROM json_each per table: a sync is a fixed handful of D1 statements
+  // regardless of policy size (each batched statement counts against the per-invocation query limit).
+  const allowRows = policy.allow.map((a) => {
     const p = parsePackageId(a.package)!;
+    return [p.eco, p.name, p.version, a.advisory ?? null, a.reason, a.advisory ? now : null];
+  });
+  if (allowRows.length > 0) {
     stmts.push(
       db.prepare(
-        'INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      ).bind(projectId, ref, p.eco, p.name, p.version, a.advisory ?? null, a.reason, a.advisory ? now : null),
+        `INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at)
+         SELECT ?1, ?2, j.value ->> 0, j.value ->> 1, j.value ->> 2, j.value ->> 3, j.value ->> 4, j.value ->> 5
+         FROM json_each(?3) j`,
+      ).bind(projectId, ref, JSON.stringify(allowRows)),
     );
   }
   if (isMain) {
     const source = `policy:${projectId}`;
     stmts.push(db.prepare('DELETE FROM global_blocks WHERE source = ?').bind(source));
-    for (const b of policy.block) {
-      stmts.push(globalBlockStmt(env, parsePackageId(b.package)!, source, b.reason, deps.now()));
+    const blockRows = policy.block.map((b) => {
+      const p = parsePackageId(b.package)!;
+      return [p.eco, p.name, p.version, b.reason];
+    });
+    if (blockRows.length > 0) {
+      stmts.push(
+        db.prepare(
+          `INSERT OR IGNORE INTO global_blocks (eco, name, version, source, reason, at)
+           SELECT j.value ->> 0, j.value ->> 1, j.value ->> 2, ?1, j.value ->> 3, ?2 FROM json_each(?3) j`,
+        ).bind(source, now, JSON.stringify(blockRows)),
+      );
     }
   }
   await db.batch(stmts);
   return reply({ ref, allows: policy.allow.length, blocks: policy.block.length });
 }
 
-async function putVerdict(req: Request, env: Env, deps: Deps): Promise<Response> {
+async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): Promise<Response> {
   const body = await readJsonObject(req);
   const ref = typeof body.package === 'string' ? parsePackageId(body.package) : null;
   if (!ref) return err(400, 'package must be a package ID like npm:name@1.0.0');
@@ -235,10 +252,15 @@ async function putVerdict(req: Request, env: Env, deps: Deps): Promise<Response>
 
   const stmts: D1PreparedStatement[] = [
     env.DB.prepare(
-      `INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, details, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      // The verdict cache is shared across projects: a write never lowers severity
+      // (malicious > flagged > clean), so one project's CI cannot clear another's finding.
+      `INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, details, scanned_at, project_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (eco, name, version, scanner) DO UPDATE SET
-         scanner_version = excluded.scanner_version, result = excluded.result, details = excluded.details, scanned_at = excluded.scanned_at`,
-    ).bind(ref.eco, ref.name, ref.version, scanner, scannerVersion, result, details, now.toISOString()),
+         scanner_version = excluded.scanner_version, result = excluded.result, details = excluded.details,
+         scanned_at = excluded.scanned_at, project_id = excluded.project_id
+       WHERE ${SEVERITY_SQL('excluded.result')} >= ${SEVERITY_SQL('verdicts.result')}`,
+    ).bind(ref.eco, ref.name, ref.version, scanner, scannerVersion, result, details, now.toISOString(), writer),
   ];
   if (result === 'malicious') {
     stmts.push(globalBlockStmt(env, ref, `verdict:${scanner}`, `malicious verdict from ${scanner} ${scannerVersion}`, now));

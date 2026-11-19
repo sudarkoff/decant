@@ -60,11 +60,14 @@ export async function verifyAdvisoryFix(deps: Deps, advisory: string, ref: Packa
     const lists = (vuln.affected ?? []).some((a) => a.package?.ecosystem === eco && a.package?.name === ref.name);
     if (!lists) return 'unknown-advisory';
 
+    // Match the advisory under any of its names: the cited id, OSV's canonical id and its aliases
+    // (e.g. a cited GHSA can come back from /v1/query as its GO- alias).
+    const ids = new Set([advisory, ...(vuln.id ? [vuln.id] : []), ...(vuln.aliases ?? [])]);
     let pageToken: string | undefined;
     for (let page = 0; page < MAX_PAGES; page++) {
       const q = { ...osvQuery(ref), ...(pageToken ? { page_token: pageToken } : {}) };
       const r = await okJson<{ vulns?: OsvVuln[]; next_page_token?: string }>(await osvFetch(deps, '/v1/query', q));
-      const hit = (r.vulns ?? []).some((v) => v.id === advisory || (v.aliases ?? []).includes(advisory));
+      const hit = (r.vulns ?? []).some((v) => (v.id !== undefined && ids.has(v.id)) || (v.aliases ?? []).some((a) => ids.has(a)));
       if (hit) return 'not-fixed';
       if (!r.next_page_token) return 'verified';
       pageToken = r.next_page_token;

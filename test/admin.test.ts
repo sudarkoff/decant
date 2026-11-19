@@ -203,6 +203,50 @@ describe('policy sync', () => {
     expect(v.allowedFor('npm', 'plain')).toEqual(new Set(['1.0.0']));
   });
 
+  it('syncs a large policy (200 plain allows, 100 blocks) in a handful of statements', async () => {
+    const pd = await seedProject(e, 'pd');
+    const allows = Array.from({ length: 200 }, (_, i) => allow(`npm:many@1.0.${i}`));
+    const blocks = Array.from({ length: 100 }, (_, i) => block(`npm:bad-many@1.0.${i}`));
+    // Count statements sent to D1: each one counts against the per-invocation query limit.
+    let statements = 0;
+    const unwrap = new WeakMap<object, D1PreparedStatement>();
+    const wrapStmt = (st: D1PreparedStatement): D1PreparedStatement => {
+      const w = new Proxy(st, {
+        get(t, p) {
+          const v = Reflect.get(t, p) as (...a: unknown[]) => unknown;
+          if (p === 'bind') return (...a: unknown[]) => wrapStmt(v.apply(t, a) as D1PreparedStatement);
+          if (p === 'first' || p === 'run' || p === 'all' || p === 'raw') return (...a: unknown[]) => ((statements += 1), v.apply(t, a));
+          return typeof v === 'function' ? v.bind(t) : v;
+        },
+      });
+      unwrap.set(w, st);
+      return w;
+    };
+    const countingDb = new Proxy(e.DB, {
+      get(t, p) {
+        if (p === 'prepare') return (q: string) => wrapStmt(t.prepare(q));
+        // D1 batch needs the real statement objects; count each one.
+        if (p === 'batch') return (s: D1PreparedStatement[]) => ((statements += s.length), t.batch(s.map((x) => unwrap.get(x) ?? x)));
+        const v = Reflect.get(t, p);
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+    });
+    const body = JSON.stringify({ policy: policy('pd', { allow: allows, block: blocks }), sha: 'abc123', ref: 'main' });
+    const r = await handle(
+      new Request('https://h/api/projects/pd/policy', { method: 'PUT', headers: { authorization: `Bearer ${pd.ci}` }, body }),
+      { ...e, DB: countingDb },
+      { fetch: fakeFetch({}), now },
+      ctx,
+    );
+    expect(r.status).toBe(200);
+    expect(statements).toBeLessThanOrEqual(10);
+    expect(await r.json()).toEqual({ ref: 'main', allows: 200, blocks: 100 });
+    expect((await loadPolicyView(e, 'pd', null)).allowedFor('npm', 'many').size).toBe(200);
+    expect((await blockedVersions(e, 'npm', 'bad-many')).size).toBe(100);
+    const row = await e.DB.prepare("SELECT reason, verified_at, advisory FROM allows WHERE project_id = 'pd' AND version = '1.0.7'").first();
+    expect(row).toEqual({ reason: 'r', verified_at: null, advisory: null });
+  });
+
   it('duplicate allow entries -> 422', async () => {
     const r = await sync(B.ci, 'pb', policy('pb', { allow: [allow('npm:d@1.0.0'), allow('npm:d@1.0.0')] }));
     expect(r.status).toBe(422);
@@ -235,6 +279,28 @@ describe('verdicts', () => {
         },
       ],
     });
+  });
+
+  it('never downgrades a verdict; same-or-higher severity updates; writer project recorded', async () => {
+    const v = { package: 'npm:sev@1.0.0', scanner: 'guarddog', scannerVersion: '2.1.0' };
+    const get = async () =>
+      e.DB.prepare("SELECT result, scanner_version, project_id FROM verdicts WHERE name = 'sev'").first<Record<string, string>>();
+
+    expect((await call('PUT', '/api/verdicts', A.ci, { ...v, result: 'clean' })).status).toBe(204);
+    expect(await get()).toEqual({ result: 'clean', scanner_version: '2.1.0', project_id: 'pa' });
+
+    expect((await call('PUT', '/api/verdicts', B.ci, { ...v, result: 'flagged', scannerVersion: '2.2.0' })).status).toBe(204);
+    expect(await get()).toEqual({ result: 'flagged', scanner_version: '2.2.0', project_id: 'pb' });
+
+    expect((await call('PUT', '/api/verdicts', A.ci, { ...v, result: 'malicious' })).status).toBe(204);
+    expect(await get()).toMatchObject({ result: 'malicious', project_id: 'pa' });
+
+    const down = await call('PUT', '/api/verdicts', B.ci, { ...v, result: 'clean', scannerVersion: '9.9.9' });
+    expect(down.status).toBe(204);
+    expect(await get()).toEqual({ result: 'malicious', scanner_version: '2.1.0', project_id: 'pa' });
+    expect((await call('PUT', '/api/verdicts', B.ci, { ...v, result: 'flagged' })).status).toBe(204);
+    expect((await get())!.result).toBe('malicious');
+    expect(await blockedVersions(e, 'npm', 'sev')).toEqual(new Set(['1.0.0']));
   });
 
   it('validates package and result', async () => {
