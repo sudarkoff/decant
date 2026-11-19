@@ -27,9 +27,10 @@ export function fakeFetch(routes: Record<string, Route>): typeof fetch & { calls
   return Object.assign(fn, { calls }) as typeof fetch & { calls: string[] };
 }
 
-export async function seedProject(env: Env, id: string): Promise<{ read: string; ci: string }> {
+export async function seedProject(env: Env, id: string): Promise<{ read: string; ci: string; sync: string }> {
   const read = newToken('read');
   const ci = newToken('ci');
+  const sync = newToken('sync');
   const at = '2026-11-19T00:00:00Z';
   await env.DB.batch([
     env.DB.prepare('INSERT INTO projects (id, created_at) VALUES (?, ?)').bind(id, at),
@@ -37,8 +38,10 @@ export async function seedProject(env: Env, id: string): Promise<{ read: string;
       await hashToken(read), id, 'read', at),
     env.DB.prepare('INSERT INTO tokens (hash, project_id, kind, created_at) VALUES (?, ?, ?, ?)').bind(
       await hashToken(ci), id, 'ci', at),
+    env.DB.prepare('INSERT INTO tokens (hash, project_id, kind, created_at) VALUES (?, ?, ?, ?)').bind(
+      await hashToken(sync), id, 'sync', at),
   ]);
-  return { read, ci };
+  return { read, ci, sync };
 }
 
 /** A route that never answers but honors the request's abort signal, like a hung upstream. */

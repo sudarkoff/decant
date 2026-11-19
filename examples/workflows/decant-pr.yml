@@ -1,0 +1,32 @@
+# Pull requests: sync the PR overlay policy, then scan changed dependencies.
+# No paths filter: a required check must run on every PR, and scan exits fast when no lockfile changed.
+# labeled/unlabeled re-run the check when a writer adds (or removes) decant:reviewed.
+# Replace <release-sha> with the commit SHA of the decant release you pin.
+name: decant
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+jobs:
+  scan:
+    # Require the check named "decant scan" in branch protection.
+    name: decant scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: sudarkoff/decant/action@<release-sha> # v0.1.0
+        with:
+          mode: sync
+          decant-url: ${{ vars.DECANT_URL }}
+          token: ${{ secrets.DECANT_CI_TOKEN }}
+      - uses: sudarkoff/decant/action@<release-sha> # v0.1.0
+        with:
+          mode: scan
+          decant-url: ${{ vars.DECANT_URL }}
+          token: ${{ secrets.DECANT_CI_TOKEN }}

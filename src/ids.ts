@@ -1,0 +1,26 @@
+export type Ecosystem = 'npm' | 'go';
+export interface PackageRef {
+  eco: Ecosystem;
+  name: string;
+  version: string;
+}
+
+/** "npm:@s/n@1.2.3", "go:github.com/x/y@v1.2.3" */
+export function formatPackageId(p: PackageRef): string {
+  return `${p.eco}:${p.name}@${p.version}`;
+}
+
+/** Splits on the LAST '@' (names may start with '@'). Returns null if malformed. */
+export function parsePackageId(id: string): PackageRef | null {
+  const colon = id.indexOf(':');
+  if (colon < 0) return null;
+  const eco = id.slice(0, colon);
+  if (eco !== 'npm' && eco !== 'go') return null;
+  const rest = id.slice(colon + 1);
+  const at = rest.lastIndexOf('@');
+  if (at <= 0 || at === rest.length - 1) return null;
+  return { eco, name: rest.slice(0, at), version: rest.slice(at + 1) };
+}
+
+/** A decant project id: what the Worker accepts on project creation and in policy.project. */
+export const PROJECT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;

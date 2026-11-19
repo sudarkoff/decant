@@ -31,7 +31,7 @@ it('missing DECANT_URL or token -> error', () => {
 });
 
 it('bad kind -> error', () => {
-  expect(buildRequest(['token', 'create', 'twocal', 'admin'], env)).toEqual({ error: 'kind must be read or ci' });
+  expect(buildRequest(['token', 'create', 'twocal', 'admin'], env)).toEqual({ error: 'kind must be read, ci or sync' });
 });
 
 it('usage errors', () => {
@@ -45,4 +45,10 @@ it('op-token has the dk_op_ format and a matching SHA-256 hex hash', async () =>
   expect(token).toMatch(/^dk_op_[A-Za-z0-9_-]{43}$/);
   expect(hash).toBe(await hashToken(token));
   expect(hash).toMatch(/^[0-9a-f]{64}$/);
+});
+
+it('token create sync builds a sync-kind request', async () => {
+  const r = buildRequest(['token', 'create', 'twocal', 'sync'], env);
+  if (!(r instanceof Request)) throw new Error('expected request');
+  expect(await r.json()).toEqual({ kind: 'sync' });
 });

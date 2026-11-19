@@ -3,10 +3,10 @@ import { json } from '../http';
 import { verifyAdvisoryFix } from '../osv';
 import { parsePolicy, type Policy } from '../policy/schema';
 import { globalBlockStmt } from '../policy/store';
+import { PROJECT_ID_RE as ID_RE } from '../ids';
 import { formatPackageId, parsePackageId, type Deps, type Env, type PackageRef } from '../types';
 
 const MAX_BODY = 1024 * 1024;
-const ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SCANNER_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const RESULTS = new Set(['clean', 'flagged', 'malicious']);
@@ -65,6 +65,7 @@ async function readJsonObject(req: Request): Promise<Record<string, unknown>> {
 const isOperator = (a: AuthCtx) => a.kind === 'operator';
 const isCi = (a: AuthCtx): a is { kind: 'ci'; projectId: string } => a.kind === 'ci';
 const isOwnCi = (a: AuthCtx, projectId: string) => isCi(a) && a.projectId === projectId;
+const isOwnSync = (a: AuthCtx, projectId: string) => a.kind === 'sync' && a.projectId === projectId;
 
 export async function handleAdmin(
   req: Request,
@@ -98,6 +99,11 @@ async function route(req: Request, env: Env, deps: Deps, auth: AuthCtx, path: st
     if (!isCi(auth)) return forbidden();
     return m === 'PUT' ? putVerdict(req, env, deps, auth.projectId) : getVerdicts(req, env);
   }
+  if (segs.length === 1 && segs[0] === 'blocks') {
+    if (m !== 'GET') return methodNotAllowed();
+    if (!isCi(auth)) return forbidden();
+    return getBlocks(env);
+  }
   if (segs.length === 3 && segs[0] === 'projects') {
     const id = segs[1]!;
     switch (segs[2]) {
@@ -107,8 +113,8 @@ async function route(req: Request, env: Env, deps: Deps, auth: AuthCtx, path: st
         return createToken(req, env, deps, id);
       case 'policy':
         if (m !== 'PUT') return methodNotAllowed();
-        if (!isOwnCi(auth, id)) return forbidden();
-        return syncPolicy(req, env, deps, id);
+        if (!isOwnCi(auth, id) && !isOwnSync(auth, id)) return forbidden();
+        return syncPolicy(req, env, deps, id, auth.kind === 'sync');
       case 'status':
         if (m !== 'GET') return methodNotAllowed();
         if (!isOwnCi(auth, id)) return forbidden();
@@ -130,7 +136,7 @@ async function createProject(req: Request, env: Env, deps: Deps): Promise<Respon
 
 async function createToken(req: Request, env: Env, deps: Deps, projectId: string): Promise<Response> {
   const body = await readJsonObject(req);
-  if (body.kind !== 'read' && body.kind !== 'ci') return err(400, "kind must be 'read' or 'ci'");
+  if (body.kind !== 'read' && body.kind !== 'ci' && body.kind !== 'sync') return err(400, "kind must be 'read', 'ci' or 'sync'");
   const exists = await env.DB.prepare('SELECT 1 AS x FROM projects WHERE id = ?').bind(projectId).first();
   if (!exists) return notFound();
   const token = newToken(body.kind);
@@ -144,7 +150,7 @@ function sameAutoShip(a: Policy['autoShip'], b: Policy['autoShip']): boolean {
   return (Object.keys(a) as (keyof Policy['autoShip'])[]).every((k) => a[k] === b[k]);
 }
 
-async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string): Promise<Response> {
+async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string, isSyncToken: boolean): Promise<Response> {
   const body = await readJsonObject(req);
   if (typeof body.sha !== 'string' || body.sha === '' || body.sha.length > 100) return err(400, 'sha must be a non-empty string');
   if (typeof body.ref !== 'string' || !REF_RE.test(body.ref)) return err(400, 'ref must match ' + REF_RE.source);
@@ -164,6 +170,8 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string)
   const project = await env.DB.prepare('SELECT main_ref FROM projects WHERE id = ?').bind(projectId).first<{ main_ref: string }>();
   if (!project) return notFound();
   const isMain = ref === project.main_ref;
+  if (isMain && !isSyncToken) return err(403, `use the sync token for ${project.main_ref}`);
+  if (!isMain && isSyncToken) return err(403, `sync tokens may only sync ${project.main_ref}`);
 
   if (!isMain) {
     const main = await env.DB.prepare('SELECT json FROM policies WHERE project_id = ? AND ref = ?')
@@ -307,5 +315,18 @@ async function status(env: Env, projectId: string): Promise<Response> {
     syncedAt: main?.synced_at ?? null,
     overlays: rows.filter((r) => r.ref !== p.main_ref).map((r) => ({ ref: r.ref, syncedAt: r.synced_at })),
     globalBlocks: (blocks!.results[0] as { n: number }).n,
+  });
+}
+
+async function getBlocks(env: Env): Promise<Response> {
+  const r = await env.DB.prepare('SELECT eco, name, version, source, reason, at FROM global_blocks ORDER BY at DESC, eco, name, version, source')
+    .all<{ eco: PackageRef['eco']; name: string; version: string; source: string; reason: string; at: string }>();
+  return reply({
+    blocks: r.results.map((b) => ({
+      package: formatPackageId({ eco: b.eco, name: b.name, version: b.version }),
+      source: b.source,
+      reason: b.reason,
+      at: b.at,
+    })),
   });
 }

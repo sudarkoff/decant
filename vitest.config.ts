@@ -17,6 +17,7 @@ export default defineConfig(async () => {
     test: {
       // helpers.ts applies migrations/ to the test D1 before each test file.
       setupFiles: ['./test/helpers.ts'],
+      exclude: ['action/**', 'node_modules/**'],
     },
   };
 });

@@ -12,8 +12,9 @@ const OSV = 'https://api.osv.dev';
 const GHSA = 'GHSA-35jh-r3h4-6jhm';
 const opToken = newToken('op');
 let e: Env;
-let A: { read: string; ci: string };
-let B: { read: string; ci: string };
+type Tokens = { read: string; ci: string; sync: string };
+let A: Tokens;
+let B: Tokens;
 
 beforeAll(async () => {
   e = { ...(env as unknown as Env), OPERATOR_TOKEN_HASH: await hashToken(opToken) };
@@ -70,8 +71,54 @@ describe('projects and tokens', () => {
   });
 
   it("project A's ci token on B's policy and status -> 403", async () => {
+    expect((await sync(A.ci, 'pb', policy('pb'), 'pr-1')).status).toBe(403);
     expect((await sync(A.ci, 'pb', policy('pb'))).status).toBe(403);
+    expect((await sync(A.sync, 'pb', policy('pb'))).status).toBe(403);
     expect((await call('GET', '/api/projects/pb/status', A.ci)).status).toBe(403);
+  });
+
+  it('sync token: main ref only; ci token: non-main only; wrong pairing -> 403', async () => {
+    const s0 = await seedProject(e, 'pe');
+    const ok = await sync(s0.sync, 'pe', policy('pe'));
+    expect(ok.status).toBe(200);
+    const syncOverlay = await sync(s0.sync, 'pe', policy('pe'), 'pr-1');
+    expect(syncOverlay.status).toBe(403);
+    expect(await syncOverlay.text()).toContain('sync tokens may only sync main');
+    const ciMain = await sync(s0.ci, 'pe', policy('pe'));
+    expect(ciMain.status).toBe(403);
+    expect(await ciMain.text()).toContain('use the sync token for main');
+    expect((await sync(s0.ci, 'pe', policy('pe'), 'pr-1')).status).toBe(200);
+    // another project's sync token never works
+    expect((await sync(A.sync, 'pe', policy('pe'))).status).toBe(403);
+  });
+
+  it('sync token gets 403 on verdicts, status and blocks', async () => {
+    expect((await call('PUT', '/api/verdicts', A.sync, {})).status).toBe(403);
+    expect((await call('GET', '/api/verdicts?package=npm:a@1.0.0', A.sync)).status).toBe(403);
+    expect((await call('GET', '/api/projects/pa/status', A.sync)).status).toBe(403);
+    expect((await call('GET', '/api/blocks', A.sync)).status).toBe(403);
+  });
+
+  it('GET /api/blocks (ci) lists blocks newest first', async () => {
+    const p = await seedProject(e, 'pf');
+    await sync(p.sync, 'pf', policy('pf', { block: [block('npm:blk-a@1.0.0')] }));
+    await e.DB.prepare("INSERT INTO global_blocks (eco, name, version, source, reason, at) VALUES ('npm','blk-z','2.0.0','osv:X','r2','2099-01-01T00:00:00.000Z')").run();
+    const r = await call('GET', '/api/blocks', p.ci);
+    expect(r.status).toBe(200);
+    const { blocks } = (await r.json()) as { blocks: { package: string; source: string; reason: string; at: string }[] };
+    expect(blocks[0]).toEqual({ package: 'npm:blk-z@2.0.0', source: 'osv:X', reason: 'r2', at: '2099-01-01T00:00:00.000Z' });
+    expect(blocks).toContainEqual({ package: 'npm:blk-a@1.0.0', source: 'policy:pf', reason: 'bad', at: '2026-11-19T12:00:00.000Z' });
+    const ats = blocks.map((b) => b.at);
+    expect(ats).toEqual([...ats].sort().reverse());
+    expect((await call('GET', '/api/blocks', opToken)).status).toBe(403);
+    expect((await call('GET', '/api/blocks', A.read)).status).toBe(403);
+    expect((await call('POST', '/api/blocks', p.ci, {})).status).toBe(405);
+  });
+
+  it('operator can create sync tokens', async () => {
+    const t = await call('POST', '/api/projects/pa/tokens', opToken, { kind: 'sync' });
+    expect(t.status).toBe(201);
+    expect(((await t.json()) as { token: string }).token).toMatch(/^dk_sync_/);
   });
 
   it('operator cannot sync policy or write verdicts', async () => {
@@ -90,6 +137,7 @@ describe('projects and tokens', () => {
       ['GET', '/api/projects/pa/status'],
       ['PUT', '/api/verdicts'],
       ['GET', '/api/verdicts?package=npm:a@1.0.0'],
+      ['GET', '/api/blocks'],
     ];
     for (const [m, p] of routes) expect((await call(m, p, A.read, m === 'GET' ? undefined : {})).status, `${m} ${p}`).toBe(403);
   });
@@ -110,23 +158,23 @@ describe('request bodies', () => {
   });
 
   it('rejects malformed sync bodies', async () => {
-    expect((await call('PUT', '/api/projects/pa/policy', A.ci, { policy: policy('pa'), sha: 'x' })).status).toBe(400);
-    expect((await call('PUT', '/api/projects/pa/policy', A.ci, { policy: policy('pa'), sha: 'x', ref: 'bad ref' })).status).toBe(400);
-    expect((await sync(A.ci, 'pa', { project: 'pa', cooldownDays: -1 })).status).toBe(422);
-    const r = await sync(A.ci, 'pa', policy('pb'));
+    expect((await call('PUT', '/api/projects/pa/policy', A.sync, { policy: policy('pa'), sha: 'x' })).status).toBe(400);
+    expect((await call('PUT', '/api/projects/pa/policy', A.sync, { policy: policy('pa'), sha: 'x', ref: 'bad ref' })).status).toBe(400);
+    expect((await sync(A.sync, 'pa', { project: 'pa', cooldownDays: -1 })).status).toBe(422);
+    const r = await sync(A.sync, 'pa', policy('pb'));
     expect(r.status).toBe(422);
   });
 });
 
 describe('policy sync', () => {
   it('main sync replaces blocks; re-sync without the entry clears it', async () => {
-    const r = await sync(A.ci, 'pa', policy('pa', { block: [block('npm:evil@1.0.0')], allow: [allow('npm:fast@1.0.0')] }));
+    const r = await sync(A.sync, 'pa', policy('pa', { block: [block('npm:evil@1.0.0')], allow: [allow('npm:fast@1.0.0')] }));
     expect(r.status).toBe(200);
     expect(await r.json()).toEqual({ ref: 'main', allows: 1, blocks: 1 });
     expect(await blockedVersions(e, 'npm', 'evil')).toEqual(new Set(['1.0.0']));
     expect((await loadPolicyView(e, 'pa', null)).allowedFor('npm', 'fast')).toEqual(new Set(['1.0.0']));
 
-    expect((await sync(A.ci, 'pa', policy('pa'))).status).toBe(200);
+    expect((await sync(A.sync, 'pa', policy('pa'))).status).toBe(200);
     expect(await blockedVersions(e, 'npm', 'evil')).toEqual(new Set());
     expect((await loadPolicyView(e, 'pa', null)).allowedFor('npm', 'fast')).toEqual(new Set());
   });
@@ -140,7 +188,7 @@ describe('policy sync', () => {
 
   it('overlay rules: no cooldown/autoShip change, no missing blocks; only adds allows', async () => {
     const base = { cooldownDays: 5, block: [block('npm:evil@1.0.0')] };
-    expect((await sync(A.ci, 'pa', policy('pa', base))).status).toBe(200);
+    expect((await sync(A.sync, 'pa', policy('pa', base))).status).toBe(200);
 
     const diffCooldown = await sync(A.ci, 'pa', policy('pa', { ...base, cooldownDays: 0 }), 'pr-1');
     expect(diffCooldown.status).toBe(422);
@@ -170,7 +218,7 @@ describe('policy sync', () => {
       [`${OSV}/v1/vulns/${GHSA}`]: Response.json({ id: GHSA, affected: [{ package: { ecosystem: 'npm', name: 'lodash' } }] }),
       [`${OSV}/v1/query`]: Response.json({ vulns: [{ id: GHSA }] }),
     });
-    const r = await sync(B.ci, 'pb', policy('pb', { allow: [allow('npm:lodash@4.17.20', GHSA)] }), 'main', f);
+    const r = await sync(B.sync, 'pb', policy('pb', { allow: [allow('npm:lodash@4.17.20', GHSA)] }), 'main', f);
     expect(r.status).toBe(422);
     expect(await r.text()).toContain('npm:lodash@4.17.20');
   });
@@ -178,7 +226,7 @@ describe('policy sync', () => {
   it('OSV 500 -> 503 and nothing is written', async () => {
     const before = await e.DB.prepare("SELECT COUNT(*) AS n FROM policies WHERE project_id = 'pb'").first<{ n: number }>();
     const f = fakeFetch({ [`${OSV}/v1/vulns/${GHSA}`]: new Response('boom', { status: 500 }) });
-    const r = await sync(B.ci, 'pb', policy('pb', { allow: [allow('npm:plain@1.0.0'), allow('npm:lodash@4.17.21', GHSA)] }), 'main', f);
+    const r = await sync(B.sync, 'pb', policy('pb', { allow: [allow('npm:plain@1.0.0'), allow('npm:lodash@4.17.21', GHSA)] }), 'main', f);
     expect(r.status).toBe(503);
     const after = await e.DB.prepare("SELECT COUNT(*) AS n FROM policies WHERE project_id = 'pb'").first<{ n: number }>();
     expect(after).toEqual(before);
@@ -191,7 +239,7 @@ describe('policy sync', () => {
       [`${OSV}/v1/vulns/${GHSA}`]: Response.json({ id: GHSA, affected: [{ package: { ecosystem: 'npm', name: 'lodash' } }] }),
       [`${OSV}/v1/query`]: Response.json({}),
     });
-    const r = await sync(B.ci, 'pb', policy('pb', { allow: [allow('npm:lodash@4.17.21', GHSA), allow('npm:plain@1.0.0')] }), 'main', f);
+    const r = await sync(B.sync, 'pb', policy('pb', { allow: [allow('npm:lodash@4.17.21', GHSA), allow('npm:plain@1.0.0')] }), 'main', f);
     expect(r.status).toBe(200);
     const rows = await e.DB.prepare("SELECT name, verified_at FROM allows WHERE project_id = 'pb' ORDER BY name").all();
     expect(rows.results).toEqual([
@@ -233,7 +281,7 @@ describe('policy sync', () => {
     });
     const body = JSON.stringify({ policy: policy('pd', { allow: allows, block: blocks }), sha: 'abc123', ref: 'main' });
     const r = await handle(
-      new Request('https://h/api/projects/pd/policy', { method: 'PUT', headers: { authorization: `Bearer ${pd.ci}` }, body }),
+      new Request('https://h/api/projects/pd/policy', { method: 'PUT', headers: { authorization: `Bearer ${pd.sync}` }, body }),
       { ...e, DB: countingDb },
       { fetch: fakeFetch({}), now },
       ctx,
@@ -248,7 +296,7 @@ describe('policy sync', () => {
   });
 
   it('duplicate allow entries -> 422', async () => {
-    const r = await sync(B.ci, 'pb', policy('pb', { allow: [allow('npm:d@1.0.0'), allow('npm:d@1.0.0')] }));
+    const r = await sync(B.sync, 'pb', policy('pb', { allow: [allow('npm:d@1.0.0'), allow('npm:d@1.0.0')] }));
     expect(r.status).toBe(422);
   });
 });

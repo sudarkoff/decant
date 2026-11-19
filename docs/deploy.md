@@ -96,14 +96,21 @@ Create a project (lowercase letters, digits, `.`, `_`, `-`):
 npm run decant -- project create <project>
 ```
 
-Create a read token for installs (developers, build machines) and a CI token for the policy sync and scanner verdicts:
+Create three tokens: read, ci and sync:
 
 ```sh
 npm run decant -- token create <project> read
 npm run decant -- token create <project> ci
+npm run decant -- token create <project> sync
 ```
 
-Each prints `{"token":"dk_..."}`. The token is shown once; only its hash is stored. Keep the CI token for the GitHub Action (the GitHub Action is not released yet). Syncing a policy file and CI verdicts depend on it.
+Each prints `{"token":"dk_..."}`. The token is shown once; only its hash is stored.
+
+- `read`: installs (developers, build machines).
+- `ci`: PR overlay policy syncs, scanner verdicts, status and blocks.
+- `sync`: main-branch policy sync only. Keep it in a GitHub Environment restricted to the default branch, so a PR build can never rewrite the main policy.
+
+Existing deployments: a `ci` token on a main-branch policy sync now gets 403. After upgrading, create a `sync` token before the next main sync.
 
 ## 7. Check a client
 
@@ -126,7 +133,7 @@ export GOPROXY=https://decant:<read-token>@<your-domain>/go
 go list -m -versions github.com/google/uuid
 ```
 
-A version younger than the cooldown (7 days by default) is hidden until it ages in, unless the project's policy allows it. Policy files are synced by the GitHub Action (the GitHub Action is not released yet).
+A version younger than the cooldown (7 days by default) is hidden until it ages in, unless the project's policy allows it. Policy files are synced by the GitHub Action; see [adopt.md](adopt.md).
 
 ## Rotating the operator token
 

@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "properties": {
     "$schema": { "type": "string" },
-    "project": { "type": "string", "minLength": 1 },
+    "project": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
     "cooldownDays": { "type": "integer", "minimum": 0, "maximum": 365, "default": 7 },
     "autoShip": {
       "type": "object",
