@@ -5,6 +5,8 @@ import { fakeFetch, jsonRes, type FetchCall } from './fakes';
 const TOKEN = 'ghs_SECRETSECRET';
 const API = 'https://api.github.com';
 const R = `${API}/repos/o/r`;
+const BOT = { login: 'github-actions[bot]', type: 'Bot' };
+const HUMAN = { login: 'mallory', type: 'User' };
 
 function route(table: Record<string, (c: FetchCall) => Response>) {
   return fakeFetch((c) => {
@@ -42,8 +44,8 @@ describe('upsertComment', () => {
     const f = route({
       [`GET ${R}/issues/5/comments?per_page=100`]: () =>
         jsonRes([
-          { id: 1, body: 'hello' },
-          { id: 2, body: '<!-- decant -->\nold' },
+          { id: 1, body: 'hello', user: BOT },
+          { id: 2, body: '<!-- decant -->\nold', user: BOT },
         ]),
       [`PATCH ${R}/issues/comments/2`]: () => jsonRes({ id: 2 }),
     });
@@ -60,18 +62,40 @@ describe('upsertComment', () => {
     expect(await github(f, TOKEN, 'o/r').upsertComment(5, '<!-- m -->', 'body')).toEqual({ id: 9, created: true });
     expect(JSON.parse(f.calls[1]!.body!).body).toBe('<!-- m -->\nbody');
   });
+
+  it("ignores a human's comment containing the marker and posts a new one", async () => {
+    const f = route({
+      [`GET ${R}/issues/5/comments?per_page=100`]: () => jsonRes([{ id: 1, body: '<!-- m -->\nfake', user: HUMAN }]),
+      [`POST ${R}/issues/5/comments`]: () => jsonRes({ id: 9 }, 201),
+    });
+    expect(await github(f, TOKEN, 'o/r').upsertComment(5, '<!-- m -->', 'body')).toEqual({ id: 9, created: true });
+    expect(f.calls.some((c) => c.method === 'PATCH')).toBe(false);
+  });
+
+  it('with selfLogin, matches only that login (not other bots)', async () => {
+    const f = route({
+      [`GET ${R}/issues/5/comments?per_page=100`]: () =>
+        jsonRes([
+          { id: 1, body: '<!-- m -->', user: BOT },
+          { id: 2, body: '<!-- m -->', user: { login: 'decant-app[bot]', type: 'Bot' } },
+        ]),
+      [`PATCH ${R}/issues/comments/2`]: () => jsonRes({ id: 2 }),
+    });
+    const r = await github(f, TOKEN, 'o/r', { selfLogin: 'decant-app[bot]' }).upsertComment(5, '<!-- m -->', 'b');
+    expect(r).toEqual({ id: 2, created: false });
+  });
 });
 
 describe('upsertIssue', () => {
-  it('updates the open issue with the exact title', async () => {
-    const list = `${R}/issues?state=open&per_page=100&labels=decant%3Asecurity`;
+  it('updates the open issue with the exact title (title only, not labels)', async () => {
+    const list = `${R}/issues?state=open&per_page=100`;
     const f = route({
       [`GET ${list}`]: () =>
         jsonRes([
-          { number: 1, title: 'decant: GHSA-x in a (extra)' },
-          { number: 2, title: 'decant: GHSA-x in a', pull_request: {} },
+          { number: 1, title: 'decant: GHSA-x in a (extra)', user: BOT },
+          { number: 2, title: 'decant: GHSA-x in a', pull_request: {}, user: BOT },
         ], 200, { link: `<${list}&page=2>; rel="next"` }),
-      [`GET ${list}&page=2`]: () => jsonRes([{ number: 3, title: 'decant: GHSA-x in a' }]),
+      [`GET ${list}&page=2`]: () => jsonRes([{ number: 3, title: 'decant: GHSA-x in a', user: BOT, labels: [] }]),
       [`PATCH ${R}/issues/3`]: () => jsonRes({ number: 3 }),
     });
     const r = await github(f, TOKEN, 'o/r').upsertIssue('decant: GHSA-x in a', 'b', ['decant:security']);
@@ -86,6 +110,21 @@ describe('upsertIssue', () => {
     });
     expect(await github(f, TOKEN, 'o/r').upsertIssue('T', 'b', [])).toEqual({ number: 7, created: true });
     expect(JSON.parse(f.calls[1]!.body!)).toEqual({ title: 'T', body: 'b', labels: [] });
+  });
+
+  it("ignores a human's issue with the exact title and creates a new one", async () => {
+    const f = route({
+      [`GET ${R}/issues?state=open&per_page=100`]: () => jsonRes([{ number: 1, title: 'T', user: HUMAN }]),
+      [`POST ${R}/issues`]: () => jsonRes({ number: 8 }, 201),
+    });
+    expect(await github(f, TOKEN, 'o/r').upsertIssue('T', 'b', ['decant:security'])).toEqual({ number: 8, created: true });
+  });
+
+  it('throws when a next page remains after 10 pages', async () => {
+    let n = 0;
+    const f = fakeFetch(() => jsonRes([], 200, { link: `<${R}/issues?state=open&per_page=100&page=${++n + 1}>; rel="next"` }));
+    await expect(github(f, TOKEN, 'o/r').upsertIssue('T', 'b', [])).rejects.toThrow(/10 pages/);
+    expect(f.calls.length).toBe(10);
   });
 
   it('closeIssue PATCHes state closed', async () => {
@@ -129,6 +168,8 @@ describe('commitFiles', () => {
 
 describe('labelAddedByWriter', () => {
   const tl = `${R}/issues/3/timeline?per_page=100`;
+  const lb = `GET ${R}/issues/3/labels?per_page=100`;
+  const has = (...names: string[]) => () => jsonRes(names.map((name) => ({ name })));
   it('true when the latest add is by a writer and not removed since', async () => {
     const f = route({
       [`GET ${tl}`]: () =>
@@ -142,6 +183,7 @@ describe('labelAddedByWriter', () => {
         ),
       [`GET ${tl}&page=2`]: () => jsonRes([{ event: 'labeled', label: { name: 'decant:reviewed' }, actor: { login: 'alice' } }]),
       [`GET ${R}/collaborators/alice/permission`]: () => jsonRes({ permission: 'write' }),
+      [lb]: has('decant:reviewed'),
     });
     expect(await github(f, TOKEN, 'o/r').labelAddedByWriter(3, 'decant:reviewed')).toBe(true);
   });
@@ -150,6 +192,7 @@ describe('labelAddedByWriter', () => {
     const f1 = route({
       [`GET ${tl}`]: () => jsonRes([{ event: 'labeled', label: { name: 'L' }, actor: { login: 'bob' } }]),
       [`GET ${R}/collaborators/bob/permission`]: () => jsonRes({ permission: 'read', role_name: 'triage' }),
+      [lb]: has('L'),
     });
     expect(await github(f1, TOKEN, 'o/r').labelAddedByWriter(3, 'L')).toBe(false);
     const f2 = route({
@@ -158,6 +201,7 @@ describe('labelAddedByWriter', () => {
           { event: 'labeled', label: { name: 'L' }, actor: { login: 'alice' } },
           { event: 'unlabeled', label: { name: 'L' }, actor: { login: 'alice' } },
         ]),
+      [lb]: has('L'),
     });
     expect(await github(f2, TOKEN, 'o/r').labelAddedByWriter(3, 'L')).toBe(false);
   });
@@ -166,8 +210,31 @@ describe('labelAddedByWriter', () => {
     const f = route({
       [`GET ${tl}`]: () => jsonRes([{ event: 'labeled', label: { name: 'L' }, actor: { login: 'm' } }]),
       [`GET ${R}/collaborators/m/permission`]: () => jsonRes({ permission: 'write', role_name: 'maintain' }),
+      [lb]: has('L'),
     });
     expect(await github(f, TOKEN, 'o/r').labelAddedByWriter(3, 'L')).toBe(true);
+  });
+
+  it('false when the label is not currently on the PR, even if a writer added it', async () => {
+    const f = route({
+      [`GET ${tl}`]: () => jsonRes([{ event: 'labeled', label: { name: 'L' }, actor: { login: 'alice' } }]),
+      [`GET ${R}/collaborators/alice/permission`]: () => jsonRes({ permission: 'admin' }),
+      [lb]: has('other'),
+    });
+    expect(await github(f, TOKEN, 'o/r').labelAddedByWriter(3, 'L')).toBe(false);
+  });
+
+  it('matches label names case-insensitively', async () => {
+    const f = route({
+      [`GET ${tl}`]: () =>
+        jsonRes([
+          { event: 'labeled', label: { name: 'decant:reviewed' }, actor: { login: 'mallory' } },
+          { event: 'labeled', label: { name: 'Decant:Reviewed' }, actor: { login: 'alice' } },
+        ]),
+      [`GET ${R}/collaborators/alice/permission`]: () => jsonRes({ permission: 'write' }),
+      [lb]: has('DECANT:REVIEWED'),
+    });
+    expect(await github(f, TOKEN, 'o/r').labelAddedByWriter(3, 'decant:reviewed')).toBe(true);
   });
 });
 

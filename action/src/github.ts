@@ -61,12 +61,28 @@ function nextLink(link: string | null): string | null {
 
 export type GitHubClient = ReturnType<typeof github>;
 
+type Author = { login?: string; type?: string } | null | undefined;
+
+export type GitHubOptions = {
+  /** The login the token acts as (e.g. "decant-app[bot]"). See `isMine`. */
+  selfLogin?: string;
+};
+
 /** Minimal GitHub REST + GraphQL client for one repository ("owner/name"). */
-export function github(f: typeof fetch, token: string, repo: string) {
+export function github(f: typeof fetch, token: string, repo: string, opts: GitHubOptions = {}) {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error(`repo must be owner/name, got ${JSON.stringify(repo)}`);
   const owner = repo.slice(0, repo.indexOf('/'));
   const R = `/repos/${repo}`;
   const secrets = [token];
+  const lc = (s: string | undefined) => (s ?? '').toLowerCase();
+
+  /**
+   * Ownership rule for upsertComment/upsertIssue: only items the action itself wrote may be edited,
+   * so a human's comment or issue carrying our marker or title is never hijacked.
+   * With `selfLogin`, the author's login must equal it. Without it (installation tokens cannot
+   * look themselves up), the author must be a Bot account.
+   */
+  const isMine = (u: Author) => (opts.selfLogin ? u?.login === opts.selfLogin : u?.type === 'Bot');
 
   async function rest(method: string, pathOrUrl: string, body?: unknown): Promise<Response> {
     const url = pathOrUrl.startsWith('https://') ? pathOrUrl : `${API}${pathOrUrl}`;
@@ -93,7 +109,8 @@ export function github(f: typeof fetch, token: string, repo: string) {
   async function paged<T>(path: string): Promise<T[]> {
     const out: T[] = [];
     let url: string | null = path;
-    for (let page = 0; url && page < MAX_PAGES; page++) {
+    for (let page = 0; url; page++) {
+      if (page >= MAX_PAGES) throw new Error(`GitHub GET ${path.split('?')[0]}: more than ${MAX_PAGES} pages`);
       const res = await rest('GET', url);
       out.push(...(await readJson<T[]>(res, `GitHub GET ${path}`)));
       url = nextLink(res.headers.get('link'));
@@ -135,16 +152,19 @@ export function github(f: typeof fetch, token: string, repo: string) {
     },
 
     /**
-     * True if `label` is currently applied by its most recent `labeled` event (no later `unlabeled`)
-     * and that event's actor has admin, maintain or write permission on the repo.
+     * True if `label` is on the PR now, its most recent `labeled` event has no later `unlabeled`,
+     * and that event's actor has admin, maintain or write permission. Label names compare case-insensitively.
      */
     async labelAddedByWriter(n: number, label: string): Promise<boolean> {
+      const want = lc(label);
+      const current = await paged<{ name: string }>(`${R}/issues/${n}/labels?per_page=100`);
+      if (!current.some((l) => lc(l.name) === want)) return false;
       const events = await paged<{ event?: string; label?: { name?: string }; actor?: { login?: string } | null }>(
         `${R}/issues/${n}/timeline?per_page=100`,
       );
       let adder: string | null = null;
       for (const e of events) {
-        if (e.label?.name !== label) continue;
+        if (lc(e.label?.name) !== want) continue;
         if (e.event === 'labeled') adder = e.actor?.login ?? null;
         else if (e.event === 'unlabeled') adder = null;
       }
@@ -154,8 +174,8 @@ export function github(f: typeof fetch, token: string, repo: string) {
     /** Edits the first comment containing `marker`, else posts one. The body always carries the marker. */
     async upsertComment(n: number, marker: string, body: string): Promise<{ id: number; created: boolean }> {
       const text = body.includes(marker) ? body : `${marker}\n${body}`;
-      const comments = await paged<{ id: number; body?: string }>(`${R}/issues/${n}/comments?per_page=100`);
-      const hit = comments.find((c) => (c.body ?? '').includes(marker));
+      const comments = await paged<{ id: number; body?: string; user?: Author }>(`${R}/issues/${n}/comments?per_page=100`);
+      const hit = comments.find((c) => isMine(c.user) && (c.body ?? '').includes(marker));
       if (hit) {
         await rest('PATCH', `${R}/issues/comments/${hit.id}`, { body: text });
         return { id: hit.id, created: false };
@@ -210,11 +230,13 @@ export function github(f: typeof fetch, token: string, repo: string) {
       );
     },
 
-    /** Updates the body of the open issue titled exactly `title` (filtered by `labels`), else creates it. */
+    /**
+     * Updates the body of our open issue titled exactly `title`, else creates it with `labels`.
+     * Matches on title and author only (not labels), so a removed label never causes a duplicate.
+     */
     async upsertIssue(title: string, body: string, labels: string[]): Promise<{ number: number; created: boolean }> {
-      const lq = labels.length ? `&labels=${encodeURIComponent(labels.join(','))}` : '';
-      const issues = await paged<{ number: number; title: string; pull_request?: unknown }>(`${R}/issues?state=open&per_page=100${lq}`);
-      const hit = issues.find((i) => i.pull_request === undefined && i.title === title);
+      const issues = await paged<{ number: number; title: string; pull_request?: unknown; user?: Author }>(`${R}/issues?state=open&per_page=100`);
+      const hit = issues.find((i) => i.pull_request === undefined && i.title === title && isMine(i.user));
       if (hit) {
         await rest('PATCH', `${R}/issues/${hit.number}`, { body });
         return { number: hit.number, created: false };

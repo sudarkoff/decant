@@ -1,6 +1,6 @@
 import type { Ecosystem } from '../../src/ids';
 import type { Severity } from '../../src/policy/schema';
-import { compareVersions } from '../../src/semver';
+import { compareVersions, parseVersion } from '../../src/semver';
 import { httpError, OSV_TIMEOUT_MS, readJson, request } from './http';
 import type { Dep } from './lockfiles';
 
@@ -29,6 +29,7 @@ type OsvRecord = {
   summary?: string;
   details?: string;
   database_specific?: { severity?: unknown };
+  severity?: { type?: string; score?: string }[];
   affected?: {
     package?: { ecosystem?: string; name?: string };
     ranges?: { type?: string; events?: OsvEvent[] }[];
@@ -42,6 +43,63 @@ export function depKey(d: Pick<Dep, 'eco' | 'name' | 'version'>): string {
 }
 
 const GHSA_SEVERITY: Record<string, Severity> = { CRITICAL: 'critical', HIGH: 'high', MODERATE: 'moderate', MEDIUM: 'moderate', LOW: 'low' };
+const RANK: Record<Severity | 'unknown', number> = { unknown: 0, low: 1, moderate: 2, high: 3, critical: 4 };
+
+export function maxSeverity(...s: (Severity | 'unknown')[]): Severity | 'unknown' {
+  return s.reduce<Severity | 'unknown'>((a, b) => (RANK[b] > RANK[a] ? b : a), 'unknown');
+}
+
+const CVSS_W = {
+  AV: { N: 0.85, A: 0.62, L: 0.55, P: 0.2 },
+  AC: { L: 0.77, H: 0.44 },
+  UI: { N: 0.85, R: 0.62 },
+  CIA: { H: 0.56, L: 0.22, N: 0 },
+} as const;
+
+/** CVSS v3.x "Roundup": smallest one-decimal number >= x, robust to float error (spec appendix A). */
+function roundup(x: number): number {
+  const i = Math.round(x * 100000);
+  return i % 10000 === 0 ? i / 100000 : (Math.floor(i / 10000) + 1) / 10;
+}
+
+/** CVSS v3.0/v3.1 base score from a vector string; null for anything else (v2, v4, malformed). */
+export function cvss31BaseScore(vector: string): number | null {
+  const parts = vector.split('/');
+  if (parts[0] !== 'CVSS:3.1' && parts[0] !== 'CVSS:3.0') return null;
+  const m: Record<string, string> = {};
+  for (const p of parts.slice(1)) {
+    const [k, v] = p.split(':');
+    if (k && v) m[k] = v;
+  }
+  const S = m.S;
+  if (S !== 'U' && S !== 'C') return null;
+  const av = CVSS_W.AV[m.AV as keyof typeof CVSS_W.AV];
+  const ac = CVSS_W.AC[m.AC as keyof typeof CVSS_W.AC];
+  const ui = CVSS_W.UI[m.UI as keyof typeof CVSS_W.UI];
+  const pr = { N: 0.85, L: S === 'C' ? 0.68 : 0.62, H: S === 'C' ? 0.5 : 0.27 }[m.PR as 'N' | 'L' | 'H'];
+  const [c, i, a] = [m.C, m.I, m.A].map((x) => CVSS_W.CIA[x as keyof typeof CVSS_W.CIA]);
+  if ([av, ac, ui, pr, c, i, a].some((x) => x === undefined)) return null;
+  const iss = 1 - (1 - c!) * (1 - i!) * (1 - a!);
+  const impact = S === 'U' ? 6.42 * iss : 7.52 * (iss - 0.029) - 3.25 * Math.pow(iss - 0.02, 15);
+  const expl = 8.22 * av * ac * pr! * ui;
+  if (impact <= 0) return 0;
+  return roundup(Math.min((S === 'U' ? 1 : 1.08) * (impact + expl), 10));
+}
+
+function scoreSeverity(score: number): Severity | 'unknown' {
+  return score >= 9 ? 'critical' : score >= 7 ? 'high' : score >= 4 ? 'moderate' : score > 0 ? 'low' : 'unknown';
+}
+
+/** Max of the record's GHSA database_specific.severity and any CVSS v3 base score. */
+function ownSeverity(r: OsvRecord): Severity | 'unknown' {
+  const sev = r.database_specific?.severity;
+  const db = typeof sev === 'string' ? (GHSA_SEVERITY[sev.toUpperCase()] ?? 'unknown') : 'unknown';
+  const cvss = (r.severity ?? [])
+    .filter((x) => x.type === 'CVSS_V3' && typeof x.score === 'string')
+    .map((x) => cvss31BaseScore(x.score!))
+    .map((n) => (n === null ? 'unknown' : scoreSeverity(n)));
+  return maxSeverity(db, ...cvss);
+}
 
 /** OSV Go versions omit the leading v; decant's carry it. */
 const withV = (eco: Ecosystem, v: string) => (eco === 'go' && !v.startsWith('v') ? `v${v}` : v);
@@ -89,14 +147,14 @@ function rangeCover(events: OsvEvent[], eco: Ecosystem, version: string): Cover 
 }
 
 export function toVuln(r: OsvRecord): Vuln {
-  const sev = r.database_specific?.severity;
   const entries = (eco: Ecosystem, name: string) =>
     (r.affected ?? []).filter((a) => a.package?.ecosystem === OSV_ECO[eco] && a.package?.name === name);
 
   function cover(eco: Ecosystem, name: string, version: string): Cover {
     let covered = false;
+    const parsable = parseVersion(version, eco) !== null; // unparseable: only an exact versions[] match counts
     for (const a of entries(eco, name)) {
-      for (const rg of a.ranges ?? []) {
+      for (const rg of parsable ? (a.ranges ?? []) : []) {
         if (rg.type !== 'SEMVER' && rg.type !== 'ECOSYSTEM') continue;
         const c = rangeCover(rg.events ?? [], eco, version);
         if (c.covered && c.fixed !== null) return c;
@@ -110,7 +168,7 @@ export function toVuln(r: OsvRecord): Vuln {
   return {
     id: r.id,
     aliases: r.aliases ?? [],
-    severity: typeof sev === 'string' ? (GHSA_SEVERITY[sev.toUpperCase()] ?? 'unknown') : 'unknown',
+    severity: ownSeverity(r),
     summary: r.summary ?? r.details?.split('\n')[0] ?? '',
     malicious: r.id.startsWith('MAL-'),
     fixedFor(eco, name, version) {
@@ -119,6 +177,50 @@ export function toVuln(r: OsvRecord): Vuln {
     },
     affects: (eco, name, version) => cover(eco, name, version).covered,
   };
+}
+
+/**
+ * Merges vulns that alias each other (by id or shared alias) into one Vuln per group:
+ * GHSA id preferred as `id`, aliases unioned, max severity, first non-null fixedFor, any affects.
+ */
+export function mergeAliases(vulns: Vuln[]): Vuln[] {
+  const parent = vulns.map((_, i) => i);
+  const find = (i: number): number => (parent[i] === i ? i : (parent[i] = find(parent[i]!)));
+  const owner = new Map<string, number>();
+  vulns.forEach((v, i) => {
+    for (const name of [v.id, ...v.aliases]) {
+      const j = owner.get(name);
+      if (j === undefined) owner.set(name, i);
+      else parent[find(i)] = find(j);
+    }
+  });
+  const groups = new Map<number, Vuln[]>();
+  vulns.forEach((v, i) => {
+    const g = groups.get(find(i)) ?? [];
+    g.push(v);
+    groups.set(find(i), g);
+  });
+  return [...groups.values()].map((g) => {
+    if (g.length === 1) return g[0]!;
+    const primary = g.find((v) => v.id.startsWith('GHSA-')) ?? g[0]!;
+    const names = new Set(g.flatMap((v) => [v.id, ...v.aliases]));
+    names.delete(primary.id);
+    return {
+      id: primary.id,
+      aliases: [...names],
+      severity: maxSeverity(...g.map((v) => v.severity)),
+      summary: primary.summary || (g.find((v) => v.summary)?.summary ?? ''),
+      malicious: g.some((v) => v.malicious),
+      fixedFor: (eco, name, version) => {
+        for (const v of g) {
+          const x = v.fixedFor(eco, name, version);
+          if (x !== null) return x;
+        }
+        return null;
+      },
+      affects: (eco, name, version) => g.some((v) => v.affects(eco, name, version)),
+    };
+  });
 }
 
 type Query = { package: { ecosystem: string; name: string }; version: string; page_token?: string };
@@ -187,14 +289,20 @@ export function createOsv(f: typeof fetch) {
     const all = [...new Set([...ids.values()].flatMap((s) => [...s]))];
     for (let i = 0; i < all.length; i += DETAIL_CONCURRENCY) await Promise.all(all.slice(i, i + DETAIL_CONCURRENCY).map(vuln));
 
+    // Severity also takes the max with any GHSA alias's own severity (GO-/CVE records often carry none).
+    const resolved = new Map<string, Vuln>();
+    for (const id of all) {
+      const v = await vuln(id);
+      if (!v) continue;
+      const ghsa = v.aliases.filter((a) => a.startsWith('GHSA-') && a !== v.id);
+      const alts = await Promise.all(ghsa.map((a) => vuln(a)));
+      const severity = maxSeverity(v.severity, ...alts.map((a) => a?.severity ?? 'unknown'));
+      resolved.set(id, severity === v.severity ? v : { ...v, severity });
+    }
+
     const out = new Map<string, Vuln[]>();
     for (const [k, s] of ids) {
-      const vs: Vuln[] = [];
-      for (const id of s) {
-        const v = await vuln(id);
-        if (v) vs.push(v);
-      }
-      out.set(k, vs);
+      out.set(k, mergeAliases([...s].flatMap((id) => resolved.get(id) ?? [])));
     }
     return out;
   }

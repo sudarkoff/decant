@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Dep } from '../src/lockfiles';
-import { createOsv, depKey, toVuln } from '../src/osv';
+import { createOsv, cvss31BaseScore, depKey, toVuln } from '../src/osv';
 import { fakeFetch, jsonRes } from './fakes';
 
 const dep = (eco: 'npm' | 'go', name: string, version: string): Dep => ({ eco, name, version, file: 'x', source: 'registry' });
@@ -109,5 +109,73 @@ describe('queryVulns', () => {
 
   it('throws when OSV fails', async () => {
     await expect(createOsv(fakeFetch(() => new Response('x', { status: 503 }))).queryVulns([dep('npm', 'a', '1.0.0')])).rejects.toThrow(/OSV/);
+  });
+});
+
+describe('review fixes: severity', () => {
+  it('cvss31BaseScore matches known vectors', () => {
+    expect(cvss31BaseScore('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H')).toBe(9.8);
+    expect(cvss31BaseScore('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H')).toBe(10);
+    expect(cvss31BaseScore('CVSS:3.0/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N')).toBe(4.3);
+    expect(cvss31BaseScore('CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:L/I:L/A:N')).toBe(6.4);
+    expect(cvss31BaseScore('CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N')).toBe(0);
+    expect(cvss31BaseScore('CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N')).toBeNull();
+    expect(cvss31BaseScore('garbage')).toBeNull();
+  });
+
+  it('a CVSS v3 vector sets severity when no GHSA severity', () => {
+    const v = toVuln(rec({ id: 'GO-2026-1', aliases: [], severity: [{ type: 'CVSS_V3', score: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H' }] }));
+    expect(v.severity).toBe('critical');
+    const low = toVuln(rec({ severity: [{ type: 'CVSS_V3', score: 'CVSS:3.1/AV:P/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N' }] }));
+    expect(low.severity).toBe('low');
+  });
+
+  it('takes the max of database_specific and CVSS', () => {
+    const v = toVuln(rec({ database_specific: { severity: 'LOW' }, severity: [{ type: 'CVSS_V3', score: 'CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N' }] }));
+    expect(v.severity).toBe('moderate');
+  });
+
+  it('a GO- record takes severity from its GHSA alias, and alias groups merge into one GHSA-id Vuln', async () => {
+    const go = {
+      id: 'GO-2026-1',
+      aliases: ['GHSA-xxxx-yyyy-zzzz', 'CVE-2026-9'],
+      summary: 'go summary',
+      affected: [{ package: { ecosystem: 'Go', name: 'github.com/x/y' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }, { fixed: '1.2.0' }] }] }],
+    };
+    const ghsa = {
+      id: 'GHSA-xxxx-yyyy-zzzz',
+      aliases: ['CVE-2026-9'],
+      summary: 'ghsa summary',
+      database_specific: { severity: 'CRITICAL' },
+      affected: [{ package: { ecosystem: 'Go', name: 'github.com/x/y' } }],
+    };
+    const f = fakeFetch((c) => {
+      if (c.url.endsWith('/querybatch')) return jsonRes({ results: [{ vulns: [{ id: 'GO-2026-1' }, { id: 'GHSA-xxxx-yyyy-zzzz' }] }, { vulns: [{ id: 'GO-2026-1' }] }] });
+      if (c.url.endsWith('/GO-2026-1')) return jsonRes(go);
+      if (c.url.endsWith('/GHSA-xxxx-yyyy-zzzz')) return jsonRes(ghsa);
+    });
+    const m = await createOsv(f).queryVulns([dep('go', 'github.com/x/y', 'v1.0.0'), dep('go', 'github.com/x/z', 'v1.0.0')]);
+    const both = m.get('go:github.com/x/y@v1.0.0')!;
+    expect(both.length).toBe(1);
+    expect(both[0]!.id).toBe('GHSA-xxxx-yyyy-zzzz');
+    expect(new Set(both[0]!.aliases)).toEqual(new Set(['GO-2026-1', 'CVE-2026-9']));
+    expect(both[0]!.severity).toBe('critical');
+    expect(both[0]!.fixedFor('go', 'github.com/x/y', 'v1.0.0')).toBe('v1.2.0');
+    // only GO- returned for this dep, but severity is still resolved via the cached GHSA alias
+    const goOnly = m.get('go:github.com/x/z@v1.0.0')!;
+    expect(goOnly.map((v) => [v.id, v.severity])).toEqual([['GO-2026-1', 'critical']]);
+    expect(f.calls.filter((c) => c.url.endsWith('/GHSA-xxxx-yyyy-zzzz')).length).toBe(1);
+  });
+});
+
+describe('review fixes: unparseable versions', () => {
+  it('an unparseable version is not covered by ranges, but an exact versions[] match is', () => {
+    const v = toVuln(
+      rec({ affected: [{ package: { ecosystem: 'npm', name: 'a' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }, { fixed: '1.2.4' }] }], versions: ['weird-1'] }] }),
+    );
+    expect(v.affects('npm', 'a', 'not-a-version')).toBe(false);
+    expect(v.fixedFor('npm', 'a', 'not-a-version')).toBeNull();
+    expect(v.affects('npm', 'a', 'weird-1')).toBe(true);
+    expect(v.fixedFor('npm', 'a', 'weird-1')).toBeNull();
   });
 });
