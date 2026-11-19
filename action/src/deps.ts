@@ -25,7 +25,15 @@ export const defaultFs: Fs = {
   writeBytes: (p, data) => nodeFs.writeFile(p, data),
   async readdir(p) {
     const entries = await nodeFs.readdir(p, { withFileTypes: true });
-    return entries.map((e) => ({ name: e.name, isDir: e.isDirectory(), isSymlink: e.isSymbolicLink() }));
+    // A Dirent for a symlink is never a directory; stat the target so isDir says what the link points to.
+    return Promise.all(
+      entries.map(async (e) => {
+        const isSymlink = e.isSymbolicLink();
+        let isDir = e.isDirectory();
+        if (isSymlink) isDir = await nodeFs.stat(`${p}/${e.name}`).then((s) => s.isDirectory(), () => false);
+        return { name: e.name, isDir, isSymlink };
+      }),
+    );
   },
   async exists(p) {
     try {

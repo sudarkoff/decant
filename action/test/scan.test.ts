@@ -46,6 +46,11 @@ type World = {
   failOn?: string;
   extraFiles?: Record<string, string>;
   publish?: string;
+  symlinks?: string[];
+  changes?: Record<string, unknown>;
+  blocks?: { package: string; source: string; reason: string; at: string }[];
+  osvStatus?: number;
+  priorComment?: boolean;
 };
 
 function harness(w: World) {
@@ -56,15 +61,17 @@ function harness(w: World) {
   writeFileSync(output, '');
   const payload = {
     action: w.action ?? 'opened',
+    ...(w.changes ? { changes: w.changes } : {}),
     pull_request: { number: 7, base: { sha: BASE }, head: { sha: 'b'.repeat(40), repo: { full_name: w.fork ? 'evil/r' : 'o/r' } } },
     repository: { full_name: 'o/r', default_branch: 'main' },
   };
   const files: Record<string, string> = { '/ev.json': JSON.stringify(payload), '/w/package-lock.json': w.head, ...w.extraFiles };
-  const fs = memFs(files);
+  const fs = memFs(files, w.symlinks ?? []);
   const labels = [...(w.labels ?? [])];
   const puts: unknown[] = [];
   const comments: string[] = [];
   const removed: string[] = [];
+  const patched: string[] = [];
   const f = fakeFetch((c: FetchCall) => {
     const u = new URL(c.url);
     const key = `${c.method} ${c.url}`;
@@ -72,6 +79,7 @@ function harness(w: World) {
       const pkg = u.searchParams.get('package')!;
       return jsonRes({ verdicts: (w.verdicts?.[pkg] ?? []).map((v) => ({ package: pkg, scannerVersion: 'x', ...v })) });
     }
+    if (key === `GET ${D}/api/blocks`) return jsonRes({ blocks: w.blocks ?? [] });
     if (key === `PUT ${D}/api/verdicts`) {
       puts.push(JSON.parse(c.body!));
       return new Response(null, { status: 204 });
@@ -86,6 +94,7 @@ function harness(w: World) {
     }
     if (c.method === 'GET' && u.origin === D && u.pathname.endsWith('.tgz')) return new Response(new Uint8Array([1, 2, 3]));
     if (key === 'POST https://api.osv.dev/v1/querybatch') {
+      if (w.osvStatus) return new Response('upstream down', { status: w.osvStatus });
       const qs = (JSON.parse(c.body!) as { queries: { package: { name: string }; version: string }[] }).queries;
       return jsonRes({ results: qs.map((q) => ({ vulns: (w.osv?.[`${q.package.name}@${q.version}`] ?? []).map((v) => ({ id: v.id })) })) });
     }
@@ -110,7 +119,13 @@ function harness(w: World) {
       return jsonRes(w.labeler ? [{ event: 'labeled', label: { name: 'decant:reviewed' }, actor: { login: w.labeler.login } }] : []);
     }
     if (c.method === 'GET' && c.url.startsWith(`${R}/collaborators/`)) return jsonRes({ permission: w.labeler?.permission ?? 'read' });
-    if (key === `GET ${R}/issues/7/comments?per_page=100`) return jsonRes([]);
+    if (key === `GET ${R}/issues/7/comments?per_page=100`) {
+      return jsonRes(w.priorComment ? [{ id: 42, body: '<!-- decant-scan -->\n## decant scan: ❌ fail', user: BOT }] : []);
+    }
+    if (key === `PATCH ${R}/issues/comments/42`) {
+      patched.push((JSON.parse(c.body!) as { body: string }).body);
+      return jsonRes({ id: 42 });
+    }
     if (key === `POST ${R}/issues/7/comments`) {
       comments.push((JSON.parse(c.body!) as { body: string }).body);
       return jsonRes({ id: 1 }, 201);
@@ -146,6 +161,7 @@ function harness(w: World) {
   vi.spyOn(process.stderr, 'write').mockImplementation(((s: string) => (out.push(String(s)), true)) as typeof process.stderr.write);
   const deps = fakeDeps({ env, fetch: f, exec, fs });
   return {
+    env,
     run: () => run(deps),
     f,
     exec,
@@ -153,6 +169,7 @@ function harness(w: World) {
     puts,
     comments,
     removed,
+    patched,
     log: () => out.join(''),
     summary: () => readFileSync(summary, 'utf8'),
     outputs: () => readFileSync(output, 'utf8'),
@@ -186,7 +203,7 @@ describe('scan', () => {
     const h = harness({ head, base: lock([]) });
     expect(await h.run()).toBe(1);
     expect(h.log()).toContain(
-      `run: sed -i.bak -E 's#${D}(/r/[^/]+)?/npm/#https://registry.npmjs.org/#g' /w/package-lock.json && rm /w/package-lock.json.bak`,
+      `run: sed -i.bak -E 's#${D}(/r/[^/]+)?/npm/#https://registry.npmjs.org/#g' '/w/package-lock.json' && rm '/w/package-lock.json.bak'`,
     );
   });
 
@@ -230,7 +247,8 @@ describe('scan', () => {
       verdicts: { 'npm:left-pad@1.3.0': [{ scanner: 'osv', result: 'clean' }, { scanner: 'guarddog', result: 'clean' }] },
     });
     expect(await h.run()).toBe(0);
-    expect(h.f.calls.some((c) => c.url.includes('/r/pr-7/'))).toBe(false);
+    expect(h.f.calls.some((c) => c.url.endsWith('.tgz'))).toBe(false);
+    expect(h.f.calls.some((c) => c.url === `${D}/r/pr-7/npm/left-pad`)).toBe(true);
     expect(h.exec.calls.some((c) => c.cmd.endsWith('guarddog') || c.cmd === 'python3')).toBe(false);
     expect(h.puts).toEqual([]);
   });
@@ -372,5 +390,100 @@ describe('scan', () => {
     const log = h.log().replace(/::add-mask::.*\n/g, '');
     expect(log).not.toContain(TOKEN);
     expect(log).not.toContain(GH);
+  });
+});
+
+describe('scan review fixes', () => {
+  const cachedClean = { 'npm:left-pad@1.3.0': [{ scanner: 'osv', result: 'clean' }, { scanner: 'guarddog', result: 'clean' }] };
+
+  it('a symlinked lockfile fails', async () => {
+    const h = harness({ head: lock([]), base: lock([]), extraFiles: { '/w/sub/package-lock.json': lock([LP]) }, symlinks: ['/w/sub/package-lock.json'] });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('sub/package-lock.json: lockfile is a symlink; not supported');
+    expect(h.outputs()).toMatch(/result<<\S+\nfail\n/);
+  });
+
+  it('a symlinked directory fails', async () => {
+    const h = harness({ head: lock([]), base: lock([]), extraFiles: { '/w/linked/x': '' }, symlinks: ['/w/linked'] });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('linked: symlinked directory; not supported');
+  });
+
+  it.each([
+    ['reopened', undefined],
+    ['edited', { base: { ref: { from: 'old' } } }],
+  ])('%s (new review scope) removes decant:reviewed', async (action, changes) => {
+    const h = harness({
+      head: lock([LP]),
+      base: lock([]),
+      guarddog: flaggedGd,
+      labels: ['decant:reviewed'],
+      labeler: { login: 'maint', permission: 'write' },
+      action,
+      changes,
+    });
+    expect(await h.run()).toBe(1);
+    expect(h.removed).toEqual(['decant:reviewed']);
+  });
+
+  it('edited without a base change keeps decant:reviewed', async () => {
+    const h = harness({
+      head: lock([LP]),
+      base: lock([]),
+      guarddog: flaggedGd,
+      labels: ['decant:reviewed'],
+      labeler: { login: 'maint', permission: 'write' },
+      action: 'edited',
+      changes: { title: { from: 'x' } },
+    });
+    expect(await h.run()).toBe(0);
+    expect(h.removed).toEqual([]);
+  });
+
+  it('cached clean but globally blocked fails', async () => {
+    const h = harness({
+      head: lock([LP]),
+      base: lock([]),
+      verdicts: cachedClean,
+      blocks: [{ package: 'npm:left-pad@1.3.0', source: 'verdict:osv', reason: 'malicious verdict', at: '2026-11-18T00:00:00Z' }],
+    });
+    expect(await h.run()).toBe(1);
+    expect(h.comments[0]).toContain('blocked by decant');
+  });
+
+  it('cached clean but blocked through the PR ref fails', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), verdicts: cachedClean, download: 'blocked' });
+    expect(await h.run()).toBe(1);
+    expect(h.comments[0]).toContain('blocked by decant');
+  });
+
+  it('cached clean but in cooldown fails', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), verdicts: cachedClean, download: 'cooldown' });
+    expect(await h.run()).toBe(1);
+    expect(h.comments[0]).toContain('waiting for cooldown until');
+  });
+
+  it('OSV 5xx fails closed with result=fail', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), osvStatus: 503 });
+    expect(await h.run()).toBe(1);
+    expect(h.outputs()).toMatch(/result<<\S+\nfail\n/);
+  });
+
+  it.each([
+    ['fail-on', { failOn: 'bogus' }],
+    ['github-token', {}],
+  ])('early failure (%s) sets result=fail', async (_n, over) => {
+    const h = harness({ head: lock([LP]), base: lock([]), ...over });
+    if (_n === 'github-token') delete (h as unknown as { env: Record<string, string> }).env.INPUT_GITHUB_TOKEN;
+    expect(await h.run()).toBe(1);
+    expect(h.outputs()).toMatch(/result<<\S+\nfail\n/);
+  });
+
+  it('no new deps but a prior report comment: updates it to pass, creates none', async () => {
+    const h = harness({ head: lock([LP]), base: lock([LP]), priorComment: true });
+    expect(await h.run()).toBe(0);
+    expect(h.comments).toEqual([]);
+    expect(h.patched).toHaveLength(1);
+    expect(h.patched[0]).toContain('decant scan: ✅ pass');
   });
 });

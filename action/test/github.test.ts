@@ -356,3 +356,17 @@ describe('removeLabel', () => {
     expect(f.calls.map((c) => c.method)).toEqual(['DELETE', 'DELETE']);
   });
 });
+
+describe('updateComment (review fix)', () => {
+  it('edits our marker comment and returns true; never creates one', async () => {
+    const f = route({
+      [`GET ${R}/issues/5/comments?per_page=100`]: () => jsonRes([{ id: 2, body: '<!-- m -->\nold', user: BOT }]),
+      [`PATCH ${R}/issues/comments/2`]: () => jsonRes({ id: 2 }),
+      [`GET ${R}/issues/6/comments?per_page=100`]: () => jsonRes([{ id: 3, body: '<!-- m -->\nold', user: HUMAN }]),
+    });
+    const gh = github(f, TOKEN, 'o/r');
+    expect(await gh.updateComment(5, '<!-- m -->', 'new')).toBe(true);
+    expect(await gh.updateComment(6, '<!-- m -->', 'new')).toBe(false);
+    expect(f.calls.map((c) => c.method)).toEqual(['GET', 'PATCH', 'GET']);
+  });
+});

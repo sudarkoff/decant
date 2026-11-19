@@ -99,3 +99,22 @@ describe('decant client', () => {
     expect((err2 as Error).message).not.toContain(Buffer.from(`decant:${TOKEN}`).toString('base64'));
   });
 });
+
+describe('availability (review fix: cached verdicts still check the ref)', () => {
+  it('npm: a listed version is ok after one metadata GET, with no tarball download', async () => {
+    const f = fakeFetch(() => jsonRes({ versions: { '1.0.0': { dist: { tarball: `${URL_}/r/pr-1/npm/a/-/a-1.0.0.tgz` } } } }));
+    expect(await decant(f, URL_, TOKEN).availability('npm', 'a', '1.0.0', 'pr-1')).toBe('ok');
+    expect(f.calls.map((c) => c.url)).toEqual([`${URL_}/r/pr-1/npm/a`]);
+  });
+  it('npm: an unlisted version asks the tarball path why (cooldown/blocked)', async () => {
+    const f = fakeFetch((c) => (c.url.endsWith('.tgz') ? notAvailable('a@1.0.0', 'in cooldown') : jsonRes({ versions: {} })));
+    expect(await decant(f, URL_, TOKEN).availability('npm', 'a', '1.0.0', 'pr-1')).toBe('cooldown');
+  });
+  it('go: GETs .info through the ref', async () => {
+    const f = fakeFetch(() => notAvailable('m@v1.0.0', 'blocked'));
+    expect(await decant(f, URL_, TOKEN).availability('go', 'example.com/m', 'v1.0.0', 'pr-1')).toBe('blocked');
+    expect(f.calls[0]!.url).toBe(`${URL_}/r/pr-1/go/example.com/m/@v/v1.0.0.info`);
+    const ok = fakeFetch(() => jsonRes({ Version: 'v1.0.0', Time: '2026-01-01T00:00:00Z' }));
+    expect(await decant(ok, URL_, TOKEN).availability('go', 'example.com/m', 'v1.0.0', 'pr-1')).toBe('ok');
+  });
+});

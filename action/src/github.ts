@@ -154,6 +154,18 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
     return WRITE_ROLES.has(r.permission ?? '') || WRITE_ROLES.has(r.role_name ?? '');
   }
 
+  /** PATCHes the first comment of ours containing `marker`; returns its id, or null if none. */
+  async function editMine(n: number, marker: string, text: string): Promise<number | null> {
+    const { hit, capped } = await findPaged<{ id: number; body?: string; user?: Author }>(
+      `${R}/issues/${n}/comments?per_page=100`,
+      (c) => isMine(c.user) && (c.body ?? '').includes(marker),
+    );
+    if (capped) warning(`decant: #${n} has more than ${MAX_PAGES} pages of comments; the report comment was not found`);
+    if (!hit) return null;
+    await rest('PATCH', `${R}/issues/comments/${hit.id}`, { body: text });
+    return hit.id;
+  }
+
   return {
     graphql,
 
@@ -201,17 +213,15 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
     /** Edits the first comment containing `marker`, else posts one. The body always carries the marker. */
     async upsertComment(n: number, marker: string, body: string): Promise<{ id: number; created: boolean }> {
       const text = body.includes(marker) ? body : `${marker}\n${body}`;
-      const { hit, capped } = await findPaged<{ id: number; body?: string; user?: Author }>(
-        `${R}/issues/${n}/comments?per_page=100`,
-        (c) => isMine(c.user) && (c.body ?? '').includes(marker),
-      );
-      if (capped) warning(`decant: #${n} has more than ${MAX_PAGES} pages of comments; posting a new report comment`);
-      if (hit) {
-        await rest('PATCH', `${R}/issues/comments/${hit.id}`, { body: text });
-        return { id: hit.id, created: false };
-      }
+      const id = await editMine(n, marker, text);
+      if (id !== null) return { id, created: false };
       const c = await json<{ id: number }>('POST', `${R}/issues/${n}/comments`, { body: text });
       return { id: c.id, created: true };
+    },
+
+    /** Edits our comment containing `marker` if there is one; never creates. True if edited. */
+    async updateComment(n: number, marker: string, body: string): Promise<boolean> {
+      return (await editMine(n, marker, body.includes(marker) ? body : `${marker}\n${body}`)) !== null;
     },
 
     async findOpenPr(head: string): Promise<Pr | null> {

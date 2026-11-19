@@ -15,23 +15,44 @@ const NPM_REGISTRY = 'https://registry.npmjs.org/';
 const SKIP_DIRS = new Set(['node_modules', '.git', 'vendor']);
 const LOCKFILES = new Set(['package-lock.json', 'go.sum']);
 
-export async function findLockfiles(root: string, fs: Fs): Promise<string[]> {
-  const out: string[] = [];
+export type LockfileTree = {
+  /** Regular lockfiles, relative to root, sorted. */
+  files: string[];
+  /** Symlinks never read through: lockfile-named entries and directories (outside skipped dirs). */
+  symlinks: { path: string; dir: boolean }[];
+};
+
+/**
+ * Walks `root` for package-lock.json / go.sum without following symlinks. Symlinked lockfiles and
+ * symlinked directories are reported, so a caller that gates on lockfiles can refuse them (npm ci
+ * and go follow symlinks; this walker does not).
+ */
+export async function findLockfileTree(root: string, fs: Fs): Promise<LockfileTree> {
+  const files: string[] = [];
+  const symlinks: { path: string; dir: boolean }[] = [];
   const base = root.replace(/\/+$/, '');
   async function walk(rel: string): Promise<void> {
     const entries = await fs.readdir(rel ? `${base}/${rel}` : base);
     for (const e of entries) {
       const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isSymlink) continue;
+      if (e.isSymlink) {
+        if (e.isDir || LOCKFILES.has(e.name)) symlinks.push({ path: r, dir: e.isDir });
+        continue;
+      }
       if (e.isDir) {
         if (!SKIP_DIRS.has(e.name)) await walk(r);
       } else if (LOCKFILES.has(e.name)) {
-        out.push(r);
+        files.push(r);
       }
     }
   }
   await walk('');
-  return out.sort();
+  const byPath = (a: { path: string }, b: { path: string }) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+  return { files: files.sort(), symlinks: symlinks.sort(byPath) };
+}
+
+export async function findLockfiles(root: string, fs: Fs): Promise<string[]> {
+  return (await findLockfileTree(root, fs)).files;
 }
 
 function escapeRe(s: string): string {

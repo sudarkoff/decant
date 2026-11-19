@@ -9,10 +9,20 @@ import * as nodeFs from "node:fs/promises";
 
 // action/src/exec.ts
 import { spawn } from "node:child_process";
+var SECRET_NAME = /TOKEN|SECRET|KEY|PASSWORD/i;
+function scrubEnv(env) {
+  const out = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === void 0) continue;
+    if (k.startsWith("INPUT_") || k.startsWith("ACTIONS_") || SECRET_NAME.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
 var defaultExec = (cmd, args, opts = {}) => new Promise((resolve) => {
   const child = spawn(cmd, args, {
     cwd: opts.cwd,
-    env: opts.env ? { ...process.env, ...opts.env } : process.env,
+    env: { ...scrubEnv(process.env), ...opts.env },
     shell: false,
     stdio: ["pipe", "pipe", "pipe"]
   });
@@ -34,7 +44,14 @@ var defaultFs = {
   writeBytes: (p, data) => nodeFs.writeFile(p, data),
   async readdir(p) {
     const entries = await nodeFs.readdir(p, { withFileTypes: true });
-    return entries.map((e) => ({ name: e.name, isDir: e.isDirectory(), isSymlink: e.isSymbolicLink() }));
+    return Promise.all(
+      entries.map(async (e) => {
+        const isSymlink = e.isSymbolicLink();
+        let isDir = e.isDirectory();
+        if (isSymlink) isDir = await nodeFs.stat(`${p}/${e.name}`).then((s) => s.isDirectory(), () => false);
+        return { name: e.name, isDir, isSymlink };
+      })
+    );
   },
   async exists(p) {
     try {
@@ -328,6 +345,26 @@ function decant(f, url, token) {
     if (!res.ok) throw await httpError(res, { label, secrets });
     return { status: "ok", bytes: new Uint8Array(await res.arrayBuffer()) };
   }
+  async function npmTarball(name, version, ref) {
+    const npmBase = `${base}${prefix(ref)}/npm`;
+    const metaLabel = `decant GET ${prefix(ref)}/npm/${name}`;
+    const meta = await call("GET", `${npmBase}/${npmMetaPath(name)}`, { headers: { accept: "application/json" } });
+    if (meta.status === 404) return { status: classify404(await meta.text().catch(() => "")) };
+    const doc = await ok(meta, metaLabel);
+    const tarball = doc.versions?.[version]?.dist?.tarball;
+    if (typeof tarball === "string") {
+      let u;
+      try {
+        u = new URL(tarball);
+      } catch {
+        throw new Error(`${metaLabel}: invalid tarball URL`);
+      }
+      if (u.origin !== origin) throw new Error(`${metaLabel}: tarball host ${u.host} is not the decant host`);
+      return { target: u.href, listed: true };
+    }
+    const basename = name.slice(name.lastIndexOf("/") + 1);
+    return { target: `${npmBase}/${name}/-/${basename}-${encodeURIComponent(version)}.tgz`, listed: false };
+  }
   return {
     /** PUT the policy for `ref`. Never throws on an HTTP status: the caller reports {status, body}. */
     async syncPolicy(project, policy, sha, ref) {
@@ -362,28 +399,32 @@ function decant(f, url, token) {
      * so decant's 404 says why (cooldown or blocked).
      */
     async downloadNpm(name, version, ref) {
-      const npmBase = `${base}${prefix(ref)}/npm`;
-      const metaLabel = `decant GET ${prefix(ref)}/npm/${name}`;
-      const meta = await call("GET", `${npmBase}/${npmMetaPath(name)}`, { headers: { accept: "application/json" } });
-      if (meta.status === 404) return { status: classify404(await meta.text().catch(() => "")) };
-      const doc = await ok(meta, metaLabel);
-      const tarball = doc.versions?.[version]?.dist?.tarball;
-      let target;
-      if (typeof tarball === "string") {
-        let u;
-        try {
-          u = new URL(tarball);
-        } catch {
-          throw new Error(`${metaLabel}: invalid tarball URL`);
-        }
-        if (u.origin !== origin) throw new Error(`${metaLabel}: tarball host ${u.host} is not the decant host`);
-        target = u.href;
-      } else {
-        const basename = name.slice(name.lastIndexOf("/") + 1);
-        target = `${npmBase}/${name}/-/${basename}-${encodeURIComponent(version)}.tgz`;
+      const t = await npmTarball(name, version, ref);
+      if ("status" in t) return t;
+      const res = await call("GET", t.target);
+      return bytesOr404(res, `decant GET ${new URL(t.target).pathname}`);
+    },
+    /**
+     * Whether name@version is installable through `ref` now, without downloading it: npm reads the
+     * (filtered) metadata, asking the tarball path for the reason only when the version is not listed;
+     * Go GETs the gated `.info`.
+     */
+    async availability(eco, name, version, ref) {
+      if (eco === "go") {
+        const path = `${prefix(ref)}/go/${escapeModulePath(name)}/@v/${escapeModulePath(version)}.info`;
+        const res2 = await call("GET", path, { headers: { authorization: `Basic ${basic}` } });
+        const d = await bytesOr404(res2, `decant GET ${path}`);
+        return d.status;
       }
-      const res = await call("GET", target);
-      return bytesOr404(res, `decant GET ${new URL(target).pathname}`);
+      const t = await npmTarball(name, version, ref);
+      if ("status" in t) return t.status;
+      if (t.listed) return "ok";
+      const res = await call("GET", t.target);
+      if (res.status === 404 || res.status === 410) return classify404(await res.text().catch(() => ""));
+      if (!res.ok) throw await httpError(res, { label: `decant GET ${new URL(t.target).pathname}`, secrets });
+      await res.body?.cancel().catch(() => {
+      });
+      return "ok";
     },
     /** Fetches `<prefix>/go/<module>/@v/<version>.zip` with Basic decant:<token>. */
     async downloadGo(module, version, ref) {
@@ -501,6 +542,16 @@ function github(f, token, repo, opts = {}) {
     }
     return WRITE_ROLES.has(r.permission ?? "") || WRITE_ROLES.has(r.role_name ?? "");
   }
+  async function editMine(n, marker, text) {
+    const { hit, capped } = await findPaged(
+      `${R}/issues/${n}/comments?per_page=100`,
+      (c) => isMine(c.user) && (c.body ?? "").includes(marker)
+    );
+    if (capped) warning(`decant: #${n} has more than ${MAX_PAGES} pages of comments; the report comment was not found`);
+    if (!hit) return null;
+    await rest("PATCH", `${R}/issues/comments/${hit.id}`, { body: text });
+    return hit.id;
+  }
   return {
     graphql,
     async defaultBranch() {
@@ -543,17 +594,15 @@ function github(f, token, repo, opts = {}) {
     async upsertComment(n, marker, body) {
       const text = body.includes(marker) ? body : `${marker}
 ${body}`;
-      const { hit, capped } = await findPaged(
-        `${R}/issues/${n}/comments?per_page=100`,
-        (c2) => isMine(c2.user) && (c2.body ?? "").includes(marker)
-      );
-      if (capped) warning(`decant: #${n} has more than ${MAX_PAGES} pages of comments; posting a new report comment`);
-      if (hit) {
-        await rest("PATCH", `${R}/issues/comments/${hit.id}`, { body: text });
-        return { id: hit.id, created: false };
-      }
+      const id = await editMine(n, marker, text);
+      if (id !== null) return { id, created: false };
       const c = await json("POST", `${R}/issues/${n}/comments`, { body: text });
       return { id: c.id, created: true };
+    },
+    /** Edits our comment containing `marker` if there is one; never creates. True if edited. */
+    async updateComment(n, marker, body) {
+      return await editMine(n, marker, body.includes(marker) ? body : `${marker}
+${body}`) !== null;
     },
     async findOpenPr(head) {
       const q = `head=${encodeURIComponent(`${owner}:${head}`)}`;
@@ -680,23 +729,28 @@ var scanGo = (exec, bin, zipPath) => scan(exec, bin, "go", zipPath);
 var NPM_REGISTRY = "https://registry.npmjs.org/";
 var SKIP_DIRS = /* @__PURE__ */ new Set(["node_modules", ".git", "vendor"]);
 var LOCKFILES = /* @__PURE__ */ new Set(["package-lock.json", "go.sum"]);
-async function findLockfiles(root, fs) {
-  const out = [];
+async function findLockfileTree(root, fs) {
+  const files = [];
+  const symlinks = [];
   const base = root.replace(/\/+$/, "");
   async function walk(rel) {
     const entries = await fs.readdir(rel ? `${base}/${rel}` : base);
     for (const e of entries) {
       const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isSymlink) continue;
+      if (e.isSymlink) {
+        if (e.isDir || LOCKFILES.has(e.name)) symlinks.push({ path: r, dir: e.isDir });
+        continue;
+      }
       if (e.isDir) {
         if (!SKIP_DIRS.has(e.name)) await walk(r);
       } else if (LOCKFILES.has(e.name)) {
-        out.push(r);
+        files.push(r);
       }
     }
   }
   await walk("");
-  return out.sort();
+  const byPath = (a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
+  return { files: files.sort(), symlinks: symlinks.sort(byPath) };
 }
 function escapeRe(s) {
   return s.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&");
@@ -1028,6 +1082,9 @@ function createOsv(f) {
       for (let page = 0; pending.length > 0; page++) {
         if (page >= MAX_PAGES2) throw new Error(`OSV: more than ${MAX_PAGES2} pages of results`);
         const r = await post("/v1/querybatch", { queries: pending.map((p) => p.q) });
+        if (!Array.isArray(r.results) || r.results.length < pending.length) {
+          throw new Error(`OSV POST /v1/querybatch: expected ${pending.length} results, got ${Array.isArray(r.results) ? r.results.length : "none"}`);
+        }
         const next = [];
         pending.forEach((p, j) => {
           const res = r.results?.[j];
@@ -1100,6 +1157,10 @@ function fail(msg) {
 }
 var safe = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
 var isPackageLock = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
+var shellQuote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
+function newReviewScope(p) {
+  return p.action === "synchronize" || p.action === "reopened" || p.action === "edited" && !!p.changes?.base;
+}
 var fmtTime = (d) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 async function pool(items, n, fn) {
   let next = 0;
@@ -1163,26 +1224,30 @@ async function run3({ deps, inputs }) {
   const env = deps.env;
   mask(inputs.token);
   mask(inputs.githubToken);
-  if (env.GITHUB_EVENT_NAME !== "pull_request") return fail(`scan runs on pull_request events, not ${env.GITHUB_EVENT_NAME ?? "(none)"}`);
+  const stop = (msg) => {
+    setOutput("result", "fail", env);
+    return fail(msg);
+  };
+  if (env.GITHUB_EVENT_NAME !== "pull_request") return stop(`scan runs on pull_request events, not ${env.GITHUB_EVENT_NAME ?? "(none)"}`);
   let payload;
   try {
     payload = await readPayload(deps);
   } catch (e) {
-    return fail(e.message);
+    return stop(e.message);
   }
   const n = payload.pull_request?.number;
-  if (typeof n !== "number") return fail("event payload has no pull_request.number");
+  if (typeof n !== "number") return stop("event payload has no pull_request.number");
   if (!inputs.token) {
     if (isForkPr(payload)) {
       notice("fork PR has no secrets; decant scan skipped");
       return 0;
     }
-    return fail("token is required on pull requests (ci token)");
+    return stop("token is required on pull requests (ci token)");
   }
-  if (!inputs.githubToken) return fail("github-token is required");
+  if (!inputs.githubToken) return stop("github-token is required");
   const baseSha = payload.pull_request?.base?.sha ?? "";
-  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(baseSha)) return fail("event payload has no valid pull_request.base.sha");
-  if (!SEVERITIES.includes(inputs.failOn)) return fail(`fail-on must be one of ${SEVERITIES.join(", ")}`);
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(baseSha)) return stop("event payload has no valid pull_request.base.sha");
+  if (!SEVERITIES.includes(inputs.failOn)) return stop(`fail-on must be one of ${SEVERITIES.join(", ")}`);
   const failOn = inputs.failOn;
   const wd = inputs.workingDirectory;
   let cooldownDays = 7;
@@ -1192,9 +1257,9 @@ async function run3({ deps, inputs }) {
     try {
       parsed = parsePolicy(JSON.parse(await deps.fs.readFile(policyFile)));
     } catch (e) {
-      return fail(`${policyFile} is not valid JSON: ${e.message}`);
+      return stop(`${policyFile} is not valid JSON: ${e.message}`);
     }
-    if (!parsed.ok) return fail(`invalid policy:
+    if (!parsed.ok) return stop(`invalid policy:
 ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     cooldownDays = parsed.policy.cooldownDays;
   }
@@ -1202,21 +1267,27 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
   const gh = github(deps.fetch, inputs.githubToken, env.GITHUB_REPOSITORY ?? "", {
     selfLogin: env.DECANT_GITHUB_LOGIN || "github-actions[bot]"
   });
-  const stop = (msg) => {
-    setOutput("result", "fail", env);
-    return fail(msg);
-  };
   try {
-    if (payload.action === "synchronize") {
+    if (newReviewScope(payload)) {
       const hit = (await gh.prLabels(n)).find((l) => l.toLowerCase() === REVIEWED);
       if (hit) {
         await gh.removeLabel(n, hit);
-        notice(`new commits: ${REVIEWED} removed; re-review required`);
+        notice(`${payload.action === "synchronize" ? "new commits" : payload.action === "reopened" ? "reopened" : "base changed"}: ${REVIEWED} removed; re-review required`);
       }
     }
     const added = [];
     const withDecantUrls = [];
-    for (const rel of await findLockfiles(wd, deps.fs)) {
+    const tree = await findLockfileTree(wd, deps.fs);
+    if (tree.symlinks.length) {
+      for (const l of tree.symlinks) {
+        const msg = `${join(wd, l.path)}: ${l.dir ? "symlinked directory" : "lockfile is a symlink"}; not supported`;
+        error(msg);
+        process.stderr.write(`${msg}
+`);
+      }
+      return stop(`${tree.symlinks.length} symlink(s) in ${wd}; decant does not scan through symlinks`);
+    }
+    for (const rel of tree.files) {
       const abs = join(wd, rel);
       const head = await deps.fs.readFile(abs);
       const base = await baseFile(deps, wd, baseSha, rel);
@@ -1242,7 +1313,9 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       const url = inputs.decantUrl.replace(/\/+$/, "");
       for (const f of withDecantUrls) {
         error(`${f} contains decant URLs`, f);
-        process.stderr.write(`${f} contains decant URLs; run: sed -i.bak -E 's#${url}(/r/[^/]+)?/npm/#https://registry.npmjs.org/#g' ${f} && rm ${f}.bak
+        const q = shellQuote(f);
+        const qb = shellQuote(`${f}.bak`);
+        process.stderr.write(`${f} contains decant URLs; run: sed -i.bak -E 's#${url}(/r/[^/]+)?/npm/#https://registry.npmjs.org/#g' ${q} && rm ${qb}
 `);
       }
       setOutput("result", "fail", env);
@@ -1279,6 +1352,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       return gd;
     };
     if (regDeps.length) await deps.fs.mkdir(scratch);
+    const blocked = new Set(regDeps.length ? (await client.blocks()).map((b) => b.package) : []);
     const regRows = regDeps.map(row);
     await pool(regRows, CONCURRENCY, async (r, i) => {
       try {
@@ -1292,6 +1366,10 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     async function evaluate(r, i) {
       const d = r.dep;
       const id = formatPackageId(d);
+      const problem = (p) => {
+        if (!r.problems.includes(p)) r.problems.push(p);
+      };
+      if (blocked.has(id)) problem("blocked by decant");
       const cached = await client.getVerdicts(id);
       const of = (s) => cached.find((v) => v.scanner === s);
       if (cached.some((v) => v.result === "malicious")) r.problems.push(`malicious (${cached.filter((v) => v.result === "malicious").map((v) => safe(v.scanner)).join(", ")})`);
@@ -1307,16 +1385,21 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       if (osvResult === "malicious" && !r.problems.some((p) => p.startsWith("malicious"))) r.problems.push("malicious (osv)");
       const bad = r.vulns.filter((v) => !v.malicious && SEV_RANK[v.severity] >= SEV_RANK[failOn]);
       if (bad.length) r.problems.push(`vulnerable (\u2265 ${failOn})`);
+      const unavailable = async (status) => {
+        if (status === "cooldown") problem(await cooldownNote(deps, d, cooldownDays));
+        else problem(status === "blocked" ? "blocked by decant" : "not found in decant");
+      };
       const cGd = of("guarddog");
       let gdResult = null;
       if (cGd) {
         gdResult = cGd.result;
         r.guarddog = `${cGd.result} (cached)`;
+        const status = await client.availability(d.eco, d.name, d.version, ref);
+        if (status !== "ok") await unavailable(status);
       } else {
         const dl = d.eco === "npm" ? await client.downloadNpm(d.name, d.version, ref) : await client.downloadGo(d.name, d.version, ref);
         if (dl.status !== "ok") {
-          if (dl.status === "cooldown") r.problems.push(await cooldownNote(deps, d, cooldownDays));
-          else r.problems.push(dl.status === "blocked" ? "blocked by decant" : "not found in decant");
+          await unavailable(dl.status);
         } else {
           const path = `${scratch}/${i}.${d.eco === "npm" ? "tgz" : "zip"}`;
           await deps.fs.writeBytes(path, dl.bytes);
@@ -1342,10 +1425,12 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     setOutput("result", pass ? "pass" : "fail", env);
     setOutput("flagged", anyFlagged ? "true" : "false", env);
     if (all.length === 0) {
-      appendSummary(`${MARKER}
+      const body = `${MARKER}
 ## decant scan: \u2705 pass
 
-No new dependency versions.`, env);
+No new dependency versions.`;
+      appendSummary(body, env);
+      await gh.updateComment(n, MARKER, body);
       return 0;
     }
     appendSummary(render(all, pass, failOn, ref), env);

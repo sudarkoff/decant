@@ -191,3 +191,14 @@ describe('review fixes: unparseable versions', () => {
     expect(v.fixedFor('npm', 'a', 'weird-1')).toBeNull();
   });
 });
+
+describe('review fix: querybatch fails closed', () => {
+  it('throws on a 200 with missing results or fewer results than queries', async () => {
+    const deps = [
+      { eco: 'npm' as const, name: 'a', version: '1.0.0' },
+      { eco: 'npm' as const, name: 'b', version: '1.0.0' },
+    ];
+    await expect(createOsv(fakeFetch(() => jsonRes({}))).queryVulns(deps)).rejects.toThrow(/OSV/);
+    await expect(createOsv(fakeFetch(() => jsonRes({ results: [{}] }))).queryVulns(deps)).rejects.toThrow(/OSV/);
+  });
+});

@@ -4,12 +4,12 @@ import { formatPackageId } from '../../../src/ids';
 import { parsePolicy, SEVERITIES, type Severity } from '../../../src/policy/schema';
 import { decant, type DecantClient, type Verdict, type VerdictResult } from '../decant-client';
 import type { ActionDeps } from '../deps';
-import { isForkPr, readPayload } from '../event';
+import { isForkPr, readPayload, type Payload } from '../event';
 import { appendSummary, error, mask, notice, setOutput, warning } from '../gh-io';
 import { github } from '../github';
 import { GUARDDOG_VERSION, installGuardDog, scanGo, scanNpm, type GuardDog } from '../guarddog';
 import type { ModeCtx } from '../inputs';
-import { containsDecantUrls, diffDeps, findLockfiles, parseGoSum, parsePackageLock, type Dep } from '../lockfiles';
+import { containsDecantUrls, diffDeps, findLockfileTree, parseGoSum, parsePackageLock, type Dep } from '../lockfiles';
 import { createOsv, depKey, type Vuln } from '../osv';
 import { goPublishTime, npmPublishTime } from '../registries';
 
@@ -43,6 +43,14 @@ type Row = {
 const safe = (s: string) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, '?');
 
 const isPackageLock = (rel: string) => rel === 'package-lock.json' || rel.endsWith('/package-lock.json');
+
+/** POSIX single-quoting for a path in a copy-paste hint. */
+const shellQuote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/** Events after which an earlier decant:reviewed no longer covers the PR: new commits, reopen, base change. */
+function newReviewScope(p: Payload): boolean {
+  return p.action === 'synchronize' || p.action === 'reopened' || (p.action === 'edited' && !!p.changes?.base);
+}
 
 const fmtTime = (d: Date) => `${d.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 
@@ -116,27 +124,32 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const env = deps.env;
   mask(inputs.token);
   mask(inputs.githubToken);
+  // Every failure sets result=fail, so `audit` never reads a missing output as anything else.
+  const stop = (msg: string) => {
+    setOutput('result', 'fail', env);
+    return fail(msg);
+  };
 
-  if (env.GITHUB_EVENT_NAME !== 'pull_request') return fail(`scan runs on pull_request events, not ${env.GITHUB_EVENT_NAME ?? '(none)'}`);
+  if (env.GITHUB_EVENT_NAME !== 'pull_request') return stop(`scan runs on pull_request events, not ${env.GITHUB_EVENT_NAME ?? '(none)'}`);
   let payload;
   try {
     payload = await readPayload(deps);
   } catch (e) {
-    return fail((e as Error).message);
+    return stop((e as Error).message);
   }
   const n = payload.pull_request?.number;
-  if (typeof n !== 'number') return fail('event payload has no pull_request.number');
+  if (typeof n !== 'number') return stop('event payload has no pull_request.number');
   if (!inputs.token) {
     if (isForkPr(payload)) {
       notice('fork PR has no secrets; decant scan skipped');
       return 0;
     }
-    return fail('token is required on pull requests (ci token)');
+    return stop('token is required on pull requests (ci token)');
   }
-  if (!inputs.githubToken) return fail('github-token is required');
+  if (!inputs.githubToken) return stop('github-token is required');
   const baseSha = payload.pull_request?.base?.sha ?? '';
-  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(baseSha)) return fail('event payload has no valid pull_request.base.sha');
-  if (!SEVERITIES.includes(inputs.failOn as Severity)) return fail(`fail-on must be one of ${SEVERITIES.join(', ')}`);
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(baseSha)) return stop('event payload has no valid pull_request.base.sha');
+  if (!SEVERITIES.includes(inputs.failOn as Severity)) return stop(`fail-on must be one of ${SEVERITIES.join(', ')}`);
   const failOn = inputs.failOn as Severity;
 
   const wd = inputs.workingDirectory;
@@ -147,9 +160,9 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     try {
       parsed = parsePolicy(JSON.parse(await deps.fs.readFile(policyFile)));
     } catch (e) {
-      return fail(`${policyFile} is not valid JSON: ${(e as Error).message}`);
+      return stop(`${policyFile} is not valid JSON: ${(e as Error).message}`);
     }
-    if (!parsed.ok) return fail(`invalid policy:\n${parsed.errors.map((m) => `- ${m}`).join('\n')}`);
+    if (!parsed.ok) return stop(`invalid policy:\n${parsed.errors.map((m) => `- ${m}`).join('\n')}`);
     cooldownDays = parsed.policy.cooldownDays;
   }
 
@@ -158,25 +171,29 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     selfLogin: env.DECANT_GITHUB_LOGIN || 'github-actions[bot]',
   });
 
-  const stop = (msg: string) => {
-    setOutput('result', 'fail', env);
-    return fail(msg);
-  };
-
   try {
-    // A review covers only the commits that existed when decant:reviewed was added.
-    if (payload.action === 'synchronize') {
+    // A review covers only the commits (and base) that existed when decant:reviewed was added.
+    if (newReviewScope(payload)) {
       const hit = (await gh.prLabels(n)).find((l) => l.toLowerCase() === REVIEWED);
       if (hit) {
         await gh.removeLabel(n, hit);
-        notice(`new commits: ${REVIEWED} removed; re-review required`);
+        notice(`${payload.action === 'synchronize' ? 'new commits' : payload.action === 'reopened' ? 'reopened' : 'base changed'}: ${REVIEWED} removed; re-review required`);
       }
     }
 
     // 1. New dependency versions per changed lockfile.
     const added: Dep[] = [];
     const withDecantUrls: string[] = [];
-    for (const rel of await findLockfiles(wd, deps.fs)) {
+    const tree = await findLockfileTree(wd, deps.fs);
+    if (tree.symlinks.length) {
+      for (const l of tree.symlinks) {
+        const msg = `${join(wd, l.path)}: ${l.dir ? 'symlinked directory' : 'lockfile is a symlink'}; not supported`;
+        error(msg);
+        process.stderr.write(`${msg}\n`);
+      }
+      return stop(`${tree.symlinks.length} symlink(s) in ${wd}; decant does not scan through symlinks`);
+    }
+    for (const rel of tree.files) {
       const abs = join(wd, rel);
       const head = await deps.fs.readFile(abs);
       const base = await baseFile(deps, wd, baseSha, rel);
@@ -203,7 +220,9 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       const url = inputs.decantUrl.replace(/\/+$/, '');
       for (const f of withDecantUrls) {
         error(`${f} contains decant URLs`, f);
-        process.stderr.write(`${f} contains decant URLs; run: sed -i.bak -E 's#${url}(/r/[^/]+)?/npm/#https://registry.npmjs.org/#g' ${f} && rm ${f}.bak\n`);
+        const q = shellQuote(f);
+        const qb = shellQuote(`${f}.bak`);
+        process.stderr.write(`${f} contains decant URLs; run: sed -i.bak -E 's#${url}(/r/[^/]+)?/npm/#https://registry.npmjs.org/#g' ${q} && rm ${qb}\n`);
       }
       setOutput('result', 'fail', env);
       return 1;
@@ -245,6 +264,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       return gd;
     };
     if (regDeps.length) await deps.fs.mkdir(scratch);
+    const blocked = new Set(regDeps.length ? (await client.blocks()).map((b) => b.package) : []);
 
     const regRows = regDeps.map(row);
     await pool(regRows, CONCURRENCY, async (r, i) => {
@@ -260,6 +280,10 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     async function evaluate(r: Row, i: number): Promise<void> {
       const d = r.dep;
       const id = formatPackageId(d);
+      const problem = (p: string) => {
+        if (!r.problems.includes(p)) r.problems.push(p);
+      };
+      if (blocked.has(id)) problem('blocked by decant');
       const cached = await client.getVerdicts(id);
       const of = (s: string): Verdict | undefined => cached.find((v) => v.scanner === s);
       if (cached.some((v) => v.result === 'malicious')) r.problems.push(`malicious (${cached.filter((v) => v.result === 'malicious').map((v) => safe(v.scanner)).join(', ')})`);
@@ -278,17 +302,23 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       const bad = r.vulns.filter((v) => !v.malicious && SEV_RANK[v.severity] >= SEV_RANK[failOn]);
       if (bad.length) r.problems.push(`vulnerable (≥ ${failOn})`);
 
-      // GuardDog: a cached verdict skips download and scan.
+      const unavailable = async (status: 'cooldown' | 'blocked' | 'missing') => {
+        if (status === 'cooldown') problem(await cooldownNote(deps, d, cooldownDays));
+        else problem(status === 'blocked' ? 'blocked by decant' : 'not found in decant');
+      };
+
+      // GuardDog: a cached verdict skips the download and scan, but not the availability check.
       const cGd = of('guarddog');
       let gdResult: VerdictResult | null = null;
       if (cGd) {
         gdResult = cGd.result;
         r.guarddog = `${cGd.result} (cached)`;
+        const status = await client.availability(d.eco, d.name, d.version, ref);
+        if (status !== 'ok') await unavailable(status);
       } else {
         const dl = d.eco === 'npm' ? await client.downloadNpm(d.name, d.version, ref) : await client.downloadGo(d.name, d.version, ref);
         if (dl.status !== 'ok') {
-          if (dl.status === 'cooldown') r.problems.push(await cooldownNote(deps, d, cooldownDays));
-          else r.problems.push(dl.status === 'blocked' ? 'blocked by decant' : 'not found in decant');
+          await unavailable(dl.status);
         } else {
           const path = `${scratch}/${i}.${d.eco === 'npm' ? 'tgz' : 'zip'}`;
           await deps.fs.writeBytes(path, dl.bytes);
@@ -317,7 +347,10 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     setOutput('result', pass ? 'pass' : 'fail', env);
     setOutput('flagged', anyFlagged ? 'true' : 'false', env);
     if (all.length === 0) {
-      appendSummary(`${MARKER}\n## decant scan: ✅ pass\n\nNo new dependency versions.`, env);
+      const body = `${MARKER}\n## decant scan: ✅ pass\n\nNo new dependency versions.`;
+      appendSummary(body, env);
+      // Replace an earlier report (e.g. the deps were since removed), but never start a new comment.
+      await gh.updateComment(n, MARKER, body);
       return 0;
     }
     appendSummary(render(all, pass, failOn, ref), env);

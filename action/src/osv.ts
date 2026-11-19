@@ -278,6 +278,10 @@ export function createOsv(f: typeof fetch) {
       for (let page = 0; pending.length > 0; page++) {
         if (page >= MAX_PAGES) throw new Error(`OSV: more than ${MAX_PAGES} pages of results`);
         const r = await post<BatchResult>('/v1/querybatch', { queries: pending.map((p) => p.q) });
+        // A short or missing result list would read as "no vulns": fail closed instead.
+        if (!Array.isArray(r.results) || r.results.length < pending.length) {
+          throw new Error(`OSV POST /v1/querybatch: expected ${pending.length} results, got ${Array.isArray(r.results) ? r.results.length : 'none'}`);
+        }
         const next: typeof pending = [];
         pending.forEach((p, j) => {
           const res = r.results?.[j];

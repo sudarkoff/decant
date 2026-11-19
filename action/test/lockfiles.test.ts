@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { containsDecantUrls, diffDeps, findLockfiles, normalizeLockfile, parseGoSum, parsePackageLock, type Dep } from '../src/lockfiles';
+import { containsDecantUrls, diffDeps, findLockfiles, findLockfileTree, normalizeLockfile, parseGoSum, parsePackageLock, type Dep } from '../src/lockfiles';
 import { memFs } from './fakes';
 
 const fx = (n: string) => readFileSync(new URL(`./fixtures/${n}`, import.meta.url), 'utf8');
@@ -135,5 +135,42 @@ describe('identity vs artifact and symlinks', () => {
   it('findLockfiles skips symlinked dirs and files', async () => {
     const fs = memFs({ '/r/go.sum': '', '/r/link/go.sum': '', '/r/package-lock.json': '', '/r/sub/go.sum': '' }, ['/r/link', '/r/go.sum']);
     expect(await findLockfiles('/r', fs)).toEqual(['package-lock.json', 'sub/go.sum']);
+  });
+});
+
+describe('findLockfileTree (review fix: symlinks)', () => {
+  it('reports symlinked lockfiles and symlinked dirs without reading through them', async () => {
+    const fs = memFs(
+      { '/r/go.sum': '', '/r/link/go.sum': '', '/r/package-lock.json': '', '/r/sub/go.sum': '', '/r/README.md': '', '/r/docs': '' },
+      ['/r/link', '/r/go.sum', '/r/README.md'],
+    );
+    expect(await findLockfileTree('/r', fs)).toEqual({
+      files: ['package-lock.json', 'sub/go.sum'],
+      symlinks: [
+        { path: 'go.sum', dir: false },
+        { path: 'link', dir: true },
+      ],
+    });
+  });
+});
+
+describe('findLockfileTree on the real filesystem', () => {
+  it('defaultFs reports a symlinked directory as a dir symlink', async () => {
+    const { mkdtempSync, mkdirSync, symlinkSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { defaultFs } = await import('../src/deps');
+    const d = mkdtempSync(`${tmpdir()}/decant-lf-`);
+    mkdirSync(`${d}/real`);
+    writeFileSync(`${d}/real/package-lock.json`, '{}');
+    writeFileSync(`${d}/go.sum`, '');
+    symlinkSync(`${d}/real`, `${d}/link`);
+    symlinkSync(`${d}/real/package-lock.json`, `${d}/package-lock.json`);
+    expect(await findLockfileTree(d, defaultFs)).toEqual({
+      files: ['go.sum', 'real/package-lock.json'],
+      symlinks: [
+        { path: 'link', dir: true },
+        { path: 'package-lock.json', dir: false },
+      ],
+    });
   });
 });

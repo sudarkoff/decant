@@ -2,6 +2,8 @@ import type { ActionDeps } from './deps';
 
 export type Payload = {
   action?: string;
+  /** On `edited`: what changed (`base` when the PR was retargeted). */
+  changes?: { base?: unknown; [k: string]: unknown };
   pull_request?: {
     number?: number;
     base?: { sha?: string };

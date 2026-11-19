@@ -72,6 +72,36 @@ export function decant(f: typeof fetch, url: string, token: string) {
     return { status: 'ok', bytes: new Uint8Array(await res.arrayBuffer()) };
   }
 
+  /**
+   * Reads `<prefix>/npm/<name>` metadata (filtered by decant for that ref) and returns the version's
+   * tarball URL (`listed`), or the canonical tarball path when the version is filtered out, so a
+   * request there makes decant's 404 say why (cooldown or blocked).
+   */
+  async function npmTarball(
+    name: string,
+    version: string,
+    ref?: string,
+  ): Promise<{ status: 'cooldown' | 'blocked' | 'missing' } | { target: string; listed: boolean }> {
+    const npmBase = `${base}${prefix(ref)}/npm`;
+    const metaLabel = `decant GET ${prefix(ref)}/npm/${name}`;
+    const meta = await call('GET', `${npmBase}/${npmMetaPath(name)}`, { headers: { accept: 'application/json' } });
+    if (meta.status === 404) return { status: classify404(await meta.text().catch(() => '')) };
+    const doc = await ok<{ versions?: Record<string, { dist?: { tarball?: unknown } }> }>(meta, metaLabel);
+    const tarball = doc.versions?.[version]?.dist?.tarball;
+    if (typeof tarball === 'string') {
+      let u: URL;
+      try {
+        u = new URL(tarball);
+      } catch {
+        throw new Error(`${metaLabel}: invalid tarball URL`);
+      }
+      if (u.origin !== origin) throw new Error(`${metaLabel}: tarball host ${u.host} is not the decant host`);
+      return { target: u.href, listed: true };
+    }
+    const basename = name.slice(name.lastIndexOf('/') + 1);
+    return { target: `${npmBase}/${name}/-/${basename}-${encodeURIComponent(version)}.tgz`, listed: false };
+  }
+
   return {
     /** PUT the policy for `ref`. Never throws on an HTTP status: the caller reports {status, body}. */
     async syncPolicy(project: string, policy: unknown, sha: string, ref: string): Promise<{ status: number; body: unknown }> {
@@ -112,28 +142,32 @@ export function decant(f: typeof fetch, url: string, token: string) {
      * so decant's 404 says why (cooldown or blocked).
      */
     async downloadNpm(name: string, version: string, ref?: string): Promise<Download> {
-      const npmBase = `${base}${prefix(ref)}/npm`;
-      const metaLabel = `decant GET ${prefix(ref)}/npm/${name}`;
-      const meta = await call('GET', `${npmBase}/${npmMetaPath(name)}`, { headers: { accept: 'application/json' } });
-      if (meta.status === 404) return { status: classify404(await meta.text().catch(() => '')) };
-      const doc = await ok<{ versions?: Record<string, { dist?: { tarball?: unknown } }> }>(meta, metaLabel);
-      const tarball = doc.versions?.[version]?.dist?.tarball;
-      let target: string;
-      if (typeof tarball === 'string') {
-        let u: URL;
-        try {
-          u = new URL(tarball);
-        } catch {
-          throw new Error(`${metaLabel}: invalid tarball URL`);
-        }
-        if (u.origin !== origin) throw new Error(`${metaLabel}: tarball host ${u.host} is not the decant host`);
-        target = u.href;
-      } else {
-        const basename = name.slice(name.lastIndexOf('/') + 1);
-        target = `${npmBase}/${name}/-/${basename}-${encodeURIComponent(version)}.tgz`;
+      const t = await npmTarball(name, version, ref);
+      if ('status' in t) return t;
+      const res = await call('GET', t.target);
+      return bytesOr404(res, `decant GET ${new URL(t.target).pathname}`);
+    },
+
+    /**
+     * Whether name@version is installable through `ref` now, without downloading it: npm reads the
+     * (filtered) metadata, asking the tarball path for the reason only when the version is not listed;
+     * Go GETs the gated `.info`.
+     */
+    async availability(eco: 'npm' | 'go', name: string, version: string, ref?: string): Promise<Download['status']> {
+      if (eco === 'go') {
+        const path = `${prefix(ref)}/go/${escapeModulePath(name)}/@v/${escapeModulePath(version)}.info`;
+        const res = await call('GET', path, { headers: { authorization: `Basic ${basic}` } });
+        const d = await bytesOr404(res, `decant GET ${path}`);
+        return d.status;
       }
-      const res = await call('GET', target);
-      return bytesOr404(res, `decant GET ${new URL(target).pathname}`);
+      const t = await npmTarball(name, version, ref);
+      if ('status' in t) return t.status;
+      if (t.listed) return 'ok';
+      const res = await call('GET', t.target);
+      if (res.status === 404 || res.status === 410) return classify404(await res.text().catch(() => ''));
+      if (!res.ok) throw await httpError(res, { label: `decant GET ${new URL(t.target).pathname}`, secrets });
+      await res.body?.cancel().catch(() => {});
+      return 'ok';
     },
 
     /** Fetches `<prefix>/go/<module>/@v/<version>.zip` with Basic decant:<token>. */
