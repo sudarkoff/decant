@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { maliciousIds, verifyAdvisoryFix } from '../src/osv';
-import { fakeFetch, fixedClock } from './helpers';
+import { fakeFetch, fixedClock, hang } from './helpers';
 import type { PackageRef } from '../src/types';
 
 const now = fixedClock('2026-11-19T00:00:00Z');
@@ -154,5 +154,14 @@ describe('maliciousIds', () => {
     });
     const m = await maliciousIds({ fetch: f, now }, [{ eco: 'npm', name: 'a', version: '1.0.0' }]);
     expect(m).toEqual(new Map([['npm:a@1.0.0', ['MAL-2025-9']]]));
+  });
+});
+
+describe('OSV timeouts', () => {
+  it('a hung OSV is unavailable for both calls', async () => {
+    const f = fakeFetch({ [`${OSV}/v1/vulns/${ghsa}`]: hang(), [`${OSV}/v1/querybatch`]: hang() });
+    const deps = { fetch: f, now, timeoutMs: 20 };
+    expect(await verifyAdvisoryFix(deps, ghsa, ref)).toBe('unavailable');
+    expect(await maliciousIds(deps, [ref])).toBeNull();
   });
 });

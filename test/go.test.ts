@@ -4,7 +4,7 @@ import { escapeModulePath, unescapeModulePath } from '../src/go/escape';
 import { handle } from '../src/index';
 import { blockedVersions, getVersionState } from '../src/policy/store';
 import type { Deps, Env } from '../src/types';
-import { fakeFetch, fixedClock, seedProject } from './helpers';
+import { fakeFetch, fixedClock, hang, seedProject } from './helpers';
 
 const PROXY = 'https://proxy.golang.org';
 const OSV_BATCH = 'https://api.osv.dev/v1/querybatch';
@@ -35,9 +35,9 @@ function testCtx(): ExecutionContext & { flush(): Promise<void> } {
 
 type Routes = Record<string, Response | ((r: Request) => Response | Promise<Response>)>;
 
-function client(routes: Routes) {
+function client(routes: Routes, timeoutMs?: number) {
   const f = fakeFetch(routes);
-  const deps: Deps = { fetch: f, now };
+  const deps: Deps = { fetch: f, now, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
   const ctx = testCtx();
   const req = (path: string) =>
     handle(new Request(`https://h${path}`, { headers: { authorization: `Bearer ${tok}` } }), e, deps, ctx);
@@ -210,6 +210,29 @@ describe('go .info/.mod/.zip', () => {
       .bind(esc)
       .first();
     expect(row).not.toBeNull();
+  });
+
+  it('.zip upstream hung before headers → 502 after the timeout, nothing stored', async () => {
+    const esc = 'example.com/hangzip';
+    const routes = moduleRoutes(esc, { 'v1.0.0': OLD });
+    routes[`${PROXY}/${esc}/@v/v1.0.0.zip`] = hang();
+    const { ctx, req } = client(routes, 20);
+    const r = await req(`/go/${esc}/@v/v1.0.0.zip`);
+    expect(r.status).toBe(502);
+    await ctx.flush();
+    expect(await e.BUCKET.head(`go/${esc}/@v/v1.0.0.zip`)).toBeNull();
+  });
+
+  it('hung .info/.mod upstream with a cached copy → served from R2', async () => {
+    const esc = 'example.com/hangmod';
+    const routes = moduleRoutes(esc, { 'v1.0.0': OLD });
+    const first = client(routes);
+    expect(await (await first.req(`/go/${esc}/@v/v1.0.0.mod`)).text()).toBe(`module ${esc}\n`);
+    const hung: Routes = Object.fromEntries(Object.keys(routes).map((u) => [u, hang()]));
+    const { req } = client(hung, 20);
+    const r = await req(`/go/${esc}/@v/v1.0.0.mod`);
+    expect(r.status).toBe(200);
+    expect(await r.text()).toBe(`module ${esc}\n`);
   });
 
   it('OSV MAL hit on first .zip → 404 blocked and globally blocked', async () => {

@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { handle } from '../src/index';
 import { blockedVersions } from '../src/policy/store';
 import type { Deps, Env } from '../src/types';
-import { fakeFetch, fixedClock, seedProject } from './helpers';
+import { fakeFetch, fixedClock, hang, seedProject } from './helpers';
 
 const REG = 'https://registry.npmjs.org';
 const OSV_BATCH = 'https://api.osv.dev/v1/querybatch';
@@ -80,9 +80,9 @@ async function fixture(
   return { name, tgz, routes, tarballUrl };
 }
 
-function client(routes: Fixture['routes']) {
+function client(routes: Fixture['routes'], timeoutMs?: number) {
   const f = fakeFetch(routes);
-  const deps: Deps = { fetch: f, now };
+  const deps: Deps = { fetch: f, now, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
   const ctx = testCtx();
   const req = (path: string, init: RequestInit = {}) => {
     const headers = new Headers(init.headers);
@@ -292,6 +292,42 @@ describe('npm tarballs', () => {
     expect((await e.BUCKET.list({ prefix: 'npm/tmp/' })).objects).toEqual([]);
     expect(await e.BUCKET.head('npm/tar/tmpgood/tmpgood-1.0.0.tgz')).not.toBeNull();
     expect(await e.BUCKET.head('npm/tar/tmpbad/tmpbad-1.0.0.tgz')).toBeNull();
+  });
+
+  it('tarball upstream hung before headers → 502 JSON after the timeout, nothing stored', async () => {
+    const fx = await fixture('hangtar');
+    fx.routes[fx.tarballUrl('1.0.0')] = hang();
+    const { req, ctx } = client(fx.routes, 20);
+    const r = await req('/npm/hangtar/-/hangtar-1.0.0.tgz');
+    expect(r.status).toBe(502);
+    expect(await r.json()).toEqual({ error: 'upstream unavailable and nothing cached' });
+    await ctx.flush();
+    expect(await e.BUCKET.head('npm/tar/hangtar/hangtar-1.0.0.tgz')).toBeNull();
+    const st = await e.DB.prepare("SELECT stored_at FROM versions WHERE eco='npm' AND name='hangtar' AND version='1.0.0'").first();
+    expect(st).toEqual({ stored_at: null });
+  });
+
+  it('tarball body streaming slower than the timeout is not cut once headers arrived', async () => {
+    const fx = await fixture('slowtar');
+    fx.routes[fx.tarballUrl('1.0.0')] = (r) => {
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          r.signal.addEventListener('abort', () => c.error(r.signal.reason));
+          setTimeout(() => {
+            if (r.signal.aborted) return;
+            c.enqueue(fx.tgz);
+            c.close();
+          }, 80);
+        },
+      });
+      return new Response(body, { headers: { 'content-length': String(fx.tgz.length) } });
+    };
+    const { req, ctx } = client(fx.routes, 20);
+    const r = await req('/npm/slowtar/-/slowtar-1.0.0.tgz');
+    expect(r.status).toBe(200);
+    expect(new Uint8Array(await r.arrayBuffer())).toEqual(fx.tgz);
+    await ctx.flush();
+    expect(await e.BUCKET.head('npm/tar/slowtar/slowtar-1.0.0.tgz')).not.toBeNull();
   });
 
   it('tarball URL on another host → 404 "unexpected tarball host", nothing fetched', async () => {

@@ -1,8 +1,8 @@
 import { env } from 'cloudflare:workers';
 import { describe, expect, it } from 'vitest';
-import { cachedFetch, upstreamUnavailable } from '../src/upstream';
+import { cachedFetch } from '../src/upstream';
 import type { Deps, Env } from '../src/types';
-import { fakeFetch } from './helpers';
+import { fakeFetch, hang } from './helpers';
 
 const e = env as unknown as Env;
 let n = 0;
@@ -134,9 +134,21 @@ describe('cachedFetch', () => {
     }
   });
 
-  it('upstreamUnavailable is 502', async () => {
-    const r = upstreamUnavailable();
-    expect(r.status).toBe(502);
-    expect(await r.text()).toBe('upstream unavailable and nothing cached');
+  it('hung upstream times out: stored copy served stale; nothing stored is unavailable', async () => {
+    const key = k();
+    const url = 'https://u.test/hang';
+    let hung = false;
+    const ok = fakeFetch({ [url]: new Response('old') });
+    const h = fakeFetch({ [url]: hang() });
+    const f = ((i: RequestInfo | URL, init?: RequestInit) => (hung ? h(i, init) : ok(i, init))) as typeof fetch;
+    const t = { ms: T0 };
+    const d: Deps = { ...mk(f, t), timeoutMs: 20 };
+    await cachedFetch(e, d, { key, url });
+    hung = true;
+    t.ms = T0 + 400_000;
+    const r = await cachedFetch(e, d, { key, url });
+    expect(r).toMatchObject({ status: 'ok', stale: true });
+    if (r.status === 'ok') expect(text(r.body)).toBe('old');
+    expect(await cachedFetch(e, d, { key: k(), url })).toEqual({ status: 'unavailable' });
   });
 });

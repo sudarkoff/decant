@@ -40,3 +40,12 @@ export async function seedProject(env: Env, id: string): Promise<{ read: string;
   ]);
   return { read, ci };
 }
+
+/** A route that never answers but honors the request's abort signal, like a hung upstream. */
+export function hang(): (req: Request) => Promise<Response> {
+  return (req) =>
+    new Promise((_, reject) => {
+      if (req.signal.aborted) return reject(req.signal.reason);
+      req.signal.addEventListener('abort', () => reject(req.signal.reason));
+    });
+}

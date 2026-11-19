@@ -16,7 +16,7 @@ import {
 import { compareVersions, isPrerelease, parseVersion } from '../semver';
 import { pump, readUpTo } from '../streams';
 import { formatPackageId, type Deps, type Env, type PackageRef } from '../types';
-import { cachedFetch } from '../upstream';
+import { cachedFetch, fetchHeaders } from '../upstream';
 import { escapeModulePath, unescapeModulePath } from './escape';
 
 const PROXY = 'https://proxy.golang.org';
@@ -287,7 +287,7 @@ async function handleFile(
   if (new URL(url).host !== UPSTREAM_HOST) return err(404, 'unexpected upstream host');
   let res: Response;
   try {
-    res = await deps.fetch(url);
+    res = await fetchHeaders(deps, url);
   } catch {
     return unavailable();
   }

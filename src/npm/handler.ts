@@ -14,7 +14,7 @@ import {
 } from '../policy/store';
 import { pump, readUpTo } from '../streams';
 import { formatPackageId, type Deps, type Env, type PackageRef } from '../types';
-import { cachedFetch } from '../upstream';
+import { cachedFetch, fetchHeaders } from '../upstream';
 import { filterPackument, type Packument } from './filter';
 
 const REGISTRY = 'https://registry.npmjs.org';
@@ -260,7 +260,7 @@ async function handleTarball(
 
   let res: Response;
   try {
-    res = await deps.fetch(tarballUrl);
+    res = await fetchHeaders(deps, tarballUrl);
   } catch {
     return err(502, 'upstream unavailable and nothing cached');
   }
@@ -284,7 +284,7 @@ async function handleAudit(req: Request, deps: Deps, path: string): Promise<Resp
   }
   let res: Response;
   try {
-    res = await deps.fetch(`${REGISTRY}${path}`, { method: 'POST', headers, body: await req.arrayBuffer() });
+    res = await fetchHeaders(deps, `${REGISTRY}${path}`, { method: 'POST', headers, body: await req.arrayBuffer() });
   } catch {
     return err(502, 'upstream unavailable');
   }

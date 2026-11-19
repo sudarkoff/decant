@@ -14,13 +14,28 @@ export type CachedFetchResult =
   | { status: 'unavailable' };
 
 const DEFAULT_MAX_AGE_SEC = 300;
+export const UPSTREAM_TIMEOUT_MS = 10_000;
+
+export function upstreamTimeout(deps: Deps): number {
+  return deps.timeoutMs ?? UPSTREAM_TIMEOUT_MS;
+}
+
+/**
+ * fetch with a timeout on the response headers only: aborts if they haven't arrived in time,
+ * then clears the timer so a slow body (a large tarball) can stream for as long as it takes.
+ */
+export async function fetchHeaders(deps: Deps, url: string, init: RequestInit = {}): Promise<Response> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(new Error('upstream timeout')), upstreamTimeout(deps));
+  try {
+    return await deps.fetch(url, { ...init, signal: ac.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // One in-flight promise per key within this isolate.
 const inflight = new Map<string, Promise<CachedFetchResult>>();
-
-export function upstreamUnavailable(): Response {
-  return new Response('upstream unavailable and nothing cached', { status: 502 });
-}
 
 export function cachedFetch(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedFetchResult> {
   const existing = inflight.get(opts.key);
@@ -48,15 +63,23 @@ async function run(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedF
   const fallback = (): CachedFetchResult =>
     storedBody ? { status: 'ok', body: storedBody, stale: true } : { status: 'unavailable' };
 
+  // The whole exchange (headers and body) shares one timeout: a hung upstream falls back to the stored copy.
+  const signal = AbortSignal.timeout(upstreamTimeout(deps));
   let res: Response;
   try {
-    res = await deps.fetch(opts.url, opts.accept ? { headers: { Accept: opts.accept } } : undefined);
+    res = await deps.fetch(opts.url, { signal, ...(opts.accept ? { headers: { Accept: opts.accept } } : {}) });
   } catch {
     return fallback();
   }
 
   if (res.status === 200) {
-    const body = await res.arrayBuffer();
+    let body: ArrayBuffer;
+    try {
+      body = await res.arrayBuffer();
+    } catch {
+      return fallback();
+    }
+    storedBody = null; // superseded; don't hold two copies
     try {
       await env.BUCKET.put(opts.key, body, { customMetadata: { fetchedAt: deps.now().toISOString() } });
     } catch {

@@ -12,6 +12,8 @@ export interface Env {
 export interface Deps {
   fetch: typeof fetch;
   now: () => Date;
+  /** Upstream timeout in ms (default 10 000). Tests shorten it. */
+  timeoutMs?: number;
 }
 
 /** "npm:@s/n@1.2.3", "go:github.com/x/y@v1.2.3" */

@@ -1,4 +1,5 @@
 import { formatPackageId, type Deps, type Ecosystem, type PackageRef } from './types';
+import { upstreamTimeout } from './upstream';
 
 const OSV = 'https://api.osv.dev';
 const OSV_ECO: Record<Ecosystem, string> = { npm: 'npm', go: 'Go' };
@@ -21,15 +22,19 @@ function osvQuery(ref: PackageRef): { package: { name: string; ecosystem: string
   return { package: { name: ref.name, ecosystem: OSV_ECO[ref.eco] }, version };
 }
 
-/** Network error, 5xx or 429 → Unavailable. Returns the response otherwise (caller checks other statuses). */
+/**
+ * Network error, timeout, 5xx or 429 → Unavailable. Returns the response otherwise (caller checks other statuses).
+ * The timeout also covers reading the body, so a stalled body fails in okJson as Unavailable.
+ */
 async function osvFetch(deps: Deps, path: string, body?: unknown): Promise<Response> {
+  const signal = AbortSignal.timeout(upstreamTimeout(deps));
   let res: Response;
   try {
     res = await deps.fetch(
       `${OSV}${path}`,
       body === undefined
-        ? { method: 'GET' }
-        : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) },
+        ? { method: 'GET', signal }
+        : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal },
     );
   } catch {
     throw new Unavailable();
