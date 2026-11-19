@@ -5,6 +5,7 @@ import { parsePolicy, SEVERITIES, type Severity } from '../../../src/policy/sche
 import { decant, type DecantClient, type Verdict, type VerdictResult } from '../decant-client';
 import type { ActionDeps } from '../deps';
 import { isForkPr, readPayload, type Payload } from '../event';
+import { fileAtCommit as baseFile, SHA_RE } from '../git';
 import { appendSummary, error, mask, notice, setOutput, warning } from '../gh-io';
 import { github } from '../github';
 import { GUARDDOG_VERSION, installGuardDog, scanGo, scanNpm, type GuardDog } from '../guarddog';
@@ -17,6 +18,7 @@ export const MARKER = '<!-- decant-scan -->';
 const MAX_DEPS = 500;
 const CONCURRENCY = 4;
 const REVIEWED = 'decant:reviewed';
+const SECURITY = 'decant:security';
 const OSV_SCANNER_VERSION = 'api.osv.dev/v1';
 const COMMENT_LIMIT = 60_000; // GitHub caps comment bodies at 65536 chars
 const SEV_RANK: Record<Severity | 'unknown', number> = { low: 1, moderate: 2, unknown: 2, high: 3, critical: 4 };
@@ -65,16 +67,6 @@ async function pool<T>(items: T[], n: number, fn: (x: T, i: number) => Promise<v
   await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
 }
 
-/** `git show <sha>:./<rel>` from the working directory; null when the file did not exist at base. */
-async function baseFile(deps: ActionDeps, wd: string, sha: string, rel: string): Promise<string | null> {
-  const r = await deps.exec('git', ['show', `${sha}:./${rel}`], { cwd: wd });
-  if (r.code === 0) return r.stdout;
-  if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null;
-  throw new Error(
-    `git show ${sha.slice(0, 12)}:${rel} failed: ${r.stderr.trim().slice(0, 300)} (actions/checkout needs fetch-depth: 0)`,
-  );
-}
-
 function parseLock(rel: string, text: string, decantUrl: string): Dep[] {
   return isPackageLock(rel) ? parsePackageLock(text, rel, decantUrl) : parseGoSum(text, rel);
 }
@@ -89,11 +81,12 @@ async function cooldownNote(deps: ActionDeps, dep: Dep, cooldownDays: number): P
   return 'waiting for cooldown (publish time unknown)';
 }
 
-function render(rows: Row[], pass: boolean, failOn: string, ref: string, limit = Infinity): string {
+function render(rows: Row[], pass: boolean, failOn: string, ref: string, limit = Infinity, note = ''): string {
   const head = [
     MARKER,
     `## decant scan: ${pass ? '✅ pass' : '❌ fail'}`,
     '',
+    ...(note ? [note, ''] : []),
     `${rows.length} new dependency version${rows.length === 1 ? '' : 's'} (ref \`${ref}\`, fail-on \`${failOn}\`).`,
     '',
     '| Package | Source | OSV | GuardDog | Vulns | Status |',
@@ -120,6 +113,16 @@ function render(rows: Row[], pass: boolean, failOn: string, ref: string, limit =
   return `${head}\n${lines.join('\n')}\n`;
 }
 
+/** Lockfiles (relative to wd) that differ from base; symlinked ones count as changed (never followed). */
+async function changedLockfiles(deps: ActionDeps, wd: string, baseSha: string): Promise<string[]> {
+  const tree = await findLockfileTree(wd, deps.fs);
+  const out = tree.symlinks.map((l) => l.path);
+  for (const rel of tree.files) {
+    if ((await baseFile(deps, wd, baseSha, rel)) !== (await deps.fs.readFile(join(wd, rel)))) out.push(rel);
+  }
+  return out.map(safe);
+}
+
 export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const env = deps.env;
   mask(inputs.token);
@@ -139,20 +142,26 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   }
   const n = payload.pull_request?.number;
   if (typeof n !== 'number') return stop('event payload has no pull_request.number');
+  const baseSha = payload.pull_request?.base?.sha ?? '';
+  if (!SHA_RE.test(baseSha)) return stop('event payload has no valid pull_request.base.sha');
+  const wd = inputs.workingDirectory;
   if (!inputs.token) {
-    if (isForkPr(payload)) {
-      notice('fork PR has no secrets; decant scan skipped');
-      return 0;
+    if (!isForkPr(payload)) return stop('token is required on pull requests (ci token)');
+    // A fork PR gets no secrets, so it cannot be scanned; a lockfile diff needs none (git show).
+    try {
+      const changed = await changedLockfiles(deps, wd, baseSha);
+      if (changed.length) return stop(`fork changes lockfiles (${changed.join(', ')}); push the branch to this repo to scan it`);
+    } catch (e) {
+      return stop(`decant scan: ${(e as Error).message}`);
     }
-    return stop('token is required on pull requests (ci token)');
+    notice('fork PR changes no lockfile; nothing to scan');
+    setOutput('result', 'pass', env);
+    return 0;
   }
   if (!inputs.githubToken) return stop('github-token is required');
-  const baseSha = payload.pull_request?.base?.sha ?? '';
-  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(baseSha)) return stop('event payload has no valid pull_request.base.sha');
   if (!SEVERITIES.includes(inputs.failOn as Severity)) return stop(`fail-on must be one of ${SEVERITIES.join(', ')}`);
   const failOn = inputs.failOn as Severity;
 
-  const wd = inputs.workingDirectory;
   let cooldownDays = 7;
   const policyFile = join(wd, inputs.policyPath);
   if (await deps.fs.exists(policyFile)) {
@@ -342,6 +351,17 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       else r.problems.push(`flagged by GuardDog (needs ${REVIEWED} from a writer)`);
     }
 
+    // A flagged security fix never auto-merges: decant:reviewed can turn the check green, but a human merges.
+    let securityNote = '';
+    if (anyFlagged && (await gh.prLabels(n)).some((l) => l.toLowerCase() === SECURITY)) {
+      const pr = await gh.getPr(n);
+      if (pr.autoMerge) {
+        await gh.disableAutoMerge(pr.nodeId);
+        notice('flagged security PR: auto-merge disabled; merge it manually after review');
+      }
+      securityNote = `**Auto-merge is off:** a dependency was flagged by GuardDog, so this \`${SECURITY}\` PR must be merged manually after review.`;
+    }
+
     const all = [...regRows, ...rows];
     const pass = all.every((r) => r.problems.length === 0);
     setOutput('result', pass ? 'pass' : 'fail', env);
@@ -353,8 +373,8 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       await gh.updateComment(n, MARKER, body);
       return 0;
     }
-    appendSummary(render(all, pass, failOn, ref), env);
-    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT));
+    appendSummary(render(all, pass, failOn, ref, Infinity, securityNote), env);
+    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT, securityNote));
     if (!pass) return fail(`decant scan failed: ${all.filter((r) => r.problems.length).length} dependency version(s) need attention`);
     return 0;
   } catch (e) {

@@ -51,6 +51,7 @@ type World = {
   blocks?: { package: string; source: string; reason: string; at: string }[];
   osvStatus?: number;
   priorComment?: boolean;
+  autoMerge?: boolean;
 };
 
 function harness(w: World) {
@@ -72,6 +73,7 @@ function harness(w: World) {
   const comments: string[] = [];
   const removed: string[] = [];
   const patched: string[] = [];
+  const graphql: { query: string; variables: Record<string, unknown> }[] = [];
   const f = fakeFetch((c: FetchCall) => {
     const u = new URL(c.url);
     const key = `${c.method} ${c.url}`;
@@ -126,6 +128,18 @@ function harness(w: World) {
       patched.push((JSON.parse(c.body!) as { body: string }).body);
       return jsonRes({ id: 42 });
     }
+    if (key === `GET ${R}/pulls/7`) {
+      return jsonRes({
+        number: 7, node_id: 'PR_node7', title: 't', body: '', state: 'open',
+        labels: labels.map((name) => ({ name })),
+        head: { ref: 'fix', sha: 'b'.repeat(40) }, base: { ref: 'main', sha: BASE },
+        auto_merge: w.autoMerge ? { merge_method: 'squash' } : null,
+      });
+    }
+    if (key === 'POST https://api.github.com/graphql') {
+      graphql.push(JSON.parse(c.body!));
+      return jsonRes({ data: { disablePullRequestAutoMerge: { clientMutationId: null } } });
+    }
     if (key === `POST ${R}/issues/7/comments`) {
       comments.push((JSON.parse(c.body!) as { body: string }).body);
       return jsonRes({ id: 1 }, 201);
@@ -170,6 +184,7 @@ function harness(w: World) {
     comments,
     removed,
     patched,
+    graphql,
     log: () => out.join(''),
     summary: () => readFileSync(summary, 'utf8'),
     outputs: () => readFileSync(output, 'utf8'),
@@ -185,12 +200,72 @@ const flaggedGd = {
 };
 
 describe('scan', () => {
-  it('fork PR with an empty token: notice, exit 0, no network calls', async () => {
-    const h = harness({ head: lock([LP]), base: lock([]), token: '', fork: true });
+  it('fork PR with an empty token and no lockfile change: notice, exit 0, no network calls', async () => {
+    const h = harness({ head: lock([LP]), base: lock([LP]), token: '', fork: true });
     expect(await h.run()).toBe(0);
-    expect(h.log()).toContain('::notice::');
+    expect(h.log()).toContain('::notice::fork PR changes no lockfile; nothing to scan');
     expect(h.f.calls).toEqual([]);
-    expect(h.exec.calls).toEqual([]);
+    expect(h.exec.calls.map((c) => c.cmd)).toEqual(['git']);
+    expect(h.outputs()).toMatch(/result<<\S+\npass\n/);
+  });
+
+  it('fork PR with an empty token that changes a lockfile fails: push the branch to this repo', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), token: '', fork: true });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('fork changes lockfiles (package-lock.json); push the branch to this repo to scan it');
+    expect(h.f.calls).toEqual([]);
+    expect(h.outputs()).toMatch(/result<<\S+\nfail\n/);
+  });
+
+  it('fork PR adding a new lockfile (absent at base) fails', async () => {
+    const h = harness({ head: lock([LP]), base: null, token: '', fork: true });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('fork changes lockfiles');
+  });
+
+  it('fork PR with a symlinked lockfile fails', async () => {
+    const h = harness({ head: lock([LP]), base: lock([LP]), token: '', fork: true, extraFiles: { '/w/sub/package-lock.json': lock([]) }, symlinks: ['/w/sub'] });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('fork changes lockfiles (sub)');
+  });
+
+  it('flagged + decant:security: disables auto-merge and says so; check still passes with decant:reviewed', async () => {
+    const h = harness({
+      head: lock([LP]),
+      base: lock([]),
+      guarddog: flaggedGd,
+      labels: ['decant:security', 'decant:high', 'decant:reviewed'],
+      labeler: { login: 'maint', permission: 'write' },
+      autoMerge: true,
+    });
+    expect(await h.run()).toBe(0);
+    expect(h.graphql).toHaveLength(1);
+    expect(h.graphql[0]!.query).toContain('disablePullRequestAutoMerge');
+    expect(h.graphql[0]!.variables).toEqual({ id: 'PR_node7' });
+    expect(h.log()).toContain('auto-merge disabled');
+    expect(h.comments[0]).toContain('**Auto-merge is off:**');
+    expect(h.summary()).toContain('**Auto-merge is off:**');
+  });
+
+  it('flagged + decant:security without auto-merge on: no mutation, report still says merge manually', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), guarddog: flaggedGd, labels: ['decant:security'] });
+    expect(await h.run()).toBe(1);
+    expect(h.graphql).toEqual([]);
+    expect(h.comments[0]).toContain('**Auto-merge is off:**');
+  });
+
+  it('flagged without decant:security leaves auto-merge alone', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), guarddog: flaggedGd, autoMerge: true });
+    expect(await h.run()).toBe(1);
+    expect(h.graphql).toEqual([]);
+    expect(h.f.calls.some((c) => c.url === `${R}/pulls/7`)).toBe(false);
+  });
+
+  it('decant:security but nothing flagged leaves auto-merge alone', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), labels: ['decant:security'], autoMerge: true });
+    expect(await h.run()).toBe(0);
+    expect(h.graphql).toEqual([]);
+    expect(h.comments[0]).not.toContain('Auto-merge is off');
   });
 
   it('same-repo PR with an empty token fails', async () => {

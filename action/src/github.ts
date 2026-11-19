@@ -18,6 +18,8 @@ export type Pr = {
   headSha: string;
   baseRef: string;
   baseSha: string;
+  /** Auto-merge is enabled on the PR. */
+  autoMerge: boolean;
 };
 
 type RawPr = {
@@ -31,6 +33,7 @@ type RawPr = {
   labels?: { name: string }[];
   head: { ref: string; sha: string };
   base: { ref: string; sha: string };
+  auto_merge?: unknown;
 };
 
 function toPr(p: RawPr): Pr {
@@ -47,6 +50,7 @@ function toPr(p: RawPr): Pr {
     headSha: p.head.sha,
     baseRef: p.base.ref,
     baseSha: p.base.sha,
+    autoMerge: p.auto_merge !== null && p.auto_merge !== undefined,
   };
 }
 
@@ -320,6 +324,10 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
         'mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method }) { clientMutationId } }',
         { id: prNodeId, method },
       );
+    },
+
+    async disableAutoMerge(prNodeId: string): Promise<void> {
+      await graphql('mutation($id: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $id }) { clientMutationId } }', { id: prNodeId });
     },
 
     /** Our open issue titled exactly `title` (see upsertIssue for the search order); null if none. */
