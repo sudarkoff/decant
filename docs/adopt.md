@@ -22,7 +22,7 @@ Also set a repo variable `DECANT_URL` (your Worker's URL).
 
 Create the `decant-sync` environment (Settings, Environments) and restrict it to the default branch (Deployment branches and tags: Selected branches, add `main`). A PR build can then never read the sync token or rewrite the main policy.
 
-Fork PRs get no secrets, so decant skips them (sync and scan stop with a notice). Review fork PRs by hand.
+Fork PRs get no secrets. Sync skips them with a notice. Scan still diffs the lockfiles (that needs no token): a fork PR that changes no lockfile passes with a notice, and one that changes a lockfile fails with `fork changes lockfiles; push the branch to this repo to scan it`. A maintainer pushes the branch to this repo (a same-repo PR) to get it scanned.
 
 ## 2. GitHub App
 
@@ -44,14 +44,19 @@ The audit and adopt workflows mint a short-lived token with `actions/create-gith
 
 Copy these to `.github/workflows/`:
 
-- `decant-pr.yml`: on every PR, syncs the PR overlay policy then scans. Needs `contents: read`, `pull-requests: write`, `issues: write` (labels and comments) and a full checkout (`fetch-depth: 0`) so it can read the base branch's lockfile. It runs on `edited` too, so changing a PR's base resets review state. There is deliberately no `paths:` filter: a required check that never runs on a PR stays "Expected" and blocks the merge. When no lockfile changed, scan exits quickly and does not install GuardDog (it is installed lazily, only when a new package needs scanning).
-- `decant-main.yml`: on pushes to the default branch that change `decant.json`, syncs the main policy using the environment's sync token.
+- `decant-pr.yml`: on every PR, syncs the PR overlay policy then scans. Needs `contents: read`, `pull-requests: write`, `issues: write` (labels and comments) and a full checkout (`fetch-depth: 0`, `persist-credentials: false`) so it can read the base branch's lockfile and policy. It runs on `edited` too, so changing a PR's base resets review state, and on `labeled`/`unlabeled`, so adding `decant:reviewed` re-runs the check.
+  The overlay is built from the **base branch's** `decant.json` plus the PR's new `allow` entries and any `block` entries it adds. Other policy edits in a PR (`cooldownDays`, `autoShip`, removing a block) are not applied to the PR: the run posts the notice `policy changes in decant.json take effect after merge`. There is deliberately no `paths:` filter: a required check that never runs on a PR stays "Expected" and blocks the merge. When no lockfile changed, scan exits quickly and does not install GuardDog (it is installed lazily, only when a new package needs scanning).
+- `decant-main.yml`: on pushes to the default branch that change `decant.json`, and on demand (`workflow_dispatch`), syncs the main policy using the environment's sync token. PR overlays are rejected until main has been synced once, so add this workflow first (see [step 5](#5-sync-main-then-run-adopt)).
 - `decant-audit.yml`: daily at 05:23 UTC and on demand. **It runs on the default branch only**, and the job is guarded to refuse any other ref. It needs Node and Go on the runner (the example installs both) because it runs `npm` and `go` to prepare fixes. For an npm-only repo, delete the setup-go step (or use `go-version: stable` instead of `go-version-file`).
 - `decant-adopt.yml`: manual, one time. Also default branch only.
-- The install job: add it to your build workflow ([install-snippet.yml](../examples/workflows/install-snippet.yml)):
+- The install job: add it to your build workflow ([install-snippet.yml](../examples/workflows/install-snippet.yml)).
+
+On a PR, `setup` installs through the PR's overlay (`/r/pr-<n>/npm/` and `/r/pr-<n>/go`), so an allow entry the PR adds (for example a security fix still inside the cooldown) works in that PR's own build. The overlay only has the entry after the PR's sync has run, so the install job must run **after** a sync job (`needs: decant`). `needs` cannot reach a job in another workflow, so the build workflow runs its own sync on PRs (syncing twice is harmless):
 
 ```yaml
 on:
+  push:
+  pull_request:
   workflow_dispatch:
     inputs:
       bypass:
@@ -60,7 +65,22 @@ on:
       bypass_reason:
         type: string
 jobs:
+  decant:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: sudarkoff/decant/action@<release-sha> # v0.1.0
+        with:
+          mode: sync
+          decant-url: ${{ vars.DECANT_URL }}
+          token: ${{ secrets.DECANT_CI_TOKEN }}
   install:
+    needs: decant
+    if: ${{ !cancelled() && (needs.decant.result == 'success' || needs.decant.result == 'skipped') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,16 +94,22 @@ jobs:
       - run: npm ci --ignore-scripts
 ```
 
-`setup` writes `~/.npmrc` and `~/.netrc` (mode 600) and exports `GOPROXY`. For Go, run `go` after it with no `,direct` anywhere.
+`setup` writes `~/.npmrc` and `~/.netrc` (mode 600) and exports `GOPROXY`. For Go, run `go` after it with no `,direct` anywhere. On other events (push, workflow_dispatch) and on fork PRs it uses the main paths.
 
-## 5. Run adopt first
+After a PR that adds allow entries merges, a build on the merge commit can start before `decant-main.yml` has synced them to main, and fail to install the new version. Re-run the failed build once the **decant main** run is green (or trigger the build from it with `on: workflow_run: workflows: [decant main]`).
 
-Run the **decant adopt** workflow once before enabling the PR check. It opens a PR (label `decant:adopt`) that:
+## 5. Sync main, then run adopt
 
-- creates `decant.json` if you have none (project name defaults to the repo name, 7-day cooldown), and adds an allow entry for every version in your lockfiles that is still inside the cooldown, so installs keep working on day one;
-- rewrites lockfile `resolved` URLs to `https://registry.npmjs.org/`, so lockfiles stay portable.
+Order matters: the Worker refuses PR overlays (`sync main first`) until the main policy has been synced once.
 
-Review and merge it, then merge the other workflows. Lockfiles must be package-lock v2 or v3; for v1, regenerate with npm 7 or newer.
+1. Merge `decant-main.yml` (and `decant-adopt.yml`) first, before the adopt PR and before `decant-pr.yml`. If `decant.json` already exists on the default branch, run **decant main** once from the Actions tab (it has a `workflow_dispatch` trigger) so main is synced now.
+2. Run the **decant adopt** workflow once. It opens a PR (label `decant:adopt`) that:
+   - creates `decant.json` if you have none (project name defaults to the repo name, lowercased; 7-day cooldown), and adds an allow entry for every version in your lockfiles that is still inside the cooldown, so installs keep working on day one;
+   - rewrites lockfile `resolved` URLs to `https://registry.npmjs.org/`, so lockfiles stay portable.
+3. Review and merge it. Merging changes `decant.json` on the default branch, so `decant-main.yml` syncs main.
+4. Then merge `decant-pr.yml` and the install job, and require the `decant scan` check.
+
+The project name defaults to the repo name lowercased; it must match `^[a-z0-9][a-z0-9._-]{0,63}$` (the Worker's project id rule). If your repo name does not, set the action's `project` input to your decant project. Lockfiles must be package-lock v2 or v3; for v1, regenerate with npm 7 or newer.
 
 ## 6. Local development
 
@@ -143,6 +169,8 @@ Renovate (`renovate.json`, for a 7-day cooldown):
 { "minimumReleaseAge": "7 days" }
 ```
 
+Dependabot PRs get **no Actions secrets**: workflows triggered by Dependabot read only Dependabot secrets. Store `DECANT_CI_TOKEN` (and `DECANT_READ_TOKEN`, for the install job) as **Dependabot secrets** too (Settings, Secrets and variables, Dependabot), with the same values. Without them, the PR check fails on every Dependabot PR (`token is required on pull requests`).
+
 Dependabot: use `cooldown` in `dependabot.yml`:
 
 ```yaml
@@ -155,10 +183,11 @@ updates:
 
 ## How the scan behaves
 
-- A flagged GuardDog result can be cleared by a repo writer adding the **`decant:reviewed`** label. A label added by anyone without write access is ignored. decant removes the label on new commits, when the PR is reopened and when its base changes, so each of those needs a fresh review.
+- A flagged GuardDog result can be cleared by a repo writer adding the **`decant:reviewed`** label. Adding it re-runs the check (the workflow listens for `labeled`). A label added by anyone without write access is ignored. decant removes the label on new commits, when the PR is reopened and when its base changes, so each of those needs a fresh review.
+- A flagged dependency on a `decant:security` PR (an audit fix) turns auto-merge off and says so in the report. `decant:reviewed` can still make the check green, but a person must merge it.
 - Lockfiles or directories that are symlinks fail the scan. decant does not follow them.
 - GuardDog runs in its sandbox. A runner that cannot run it fails closed: the scan fails instead of passing unchecked.
-- Fork PRs are skipped, since they have no secrets.
+- Fork PRs have no secrets: one that changes no lockfile passes; one that changes a lockfile fails until the branch is pushed to this repo.
 
 ## Emergency bypass
 
