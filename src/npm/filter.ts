@@ -13,6 +13,7 @@ export interface Packument {
 /** Pure: returns a filtered copy of a full or abbreviated packument. */
 export function filterPackument(doc: Packument, allowed: Set<string>, tarballBase: string): Packument {
   const out = structuredClone(doc);
+  out.versions ??= {}; // unpublished packages have time.unpublished and no versions
   const basename = out.name.split('/').pop() as string;
 
   for (const v of Object.keys(out.versions ?? {})) {

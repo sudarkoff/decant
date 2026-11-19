@@ -16,8 +16,9 @@ beforeAll(async () => {
   tokens = await seedProject(e, 'proj1');
 });
 
-const get = (path: string, headers: Record<string, string> = {}) =>
-  handle(new Request(`https://h${path}`, { headers }), e, deps, ctx);
+const get = (path: string, headers: Record<string, string> = {}, method = 'GET') =>
+  handle(new Request(`https://h${path}`, { headers, method }), e, deps, ctx);
+// The npm handler answers PUT with 405, which proves the request got past auth.
 const bearer = (t: string) => ({ authorization: `Bearer ${t}` });
 
 it('no header -> 401 with Basic challenge', async () => {
@@ -31,7 +32,7 @@ it('unknown token -> 401', async () => {
 });
 
 it('read token over Bearer reaches /npm/', async () => {
-  expect((await get('/npm/', bearer(tokens.read))).status).toBe(501);
+  expect((await get('/npm/', bearer(tokens.read), 'PUT')).status).toBe(405);
 });
 
 it('ci token reaches /go/', async () => {
@@ -54,7 +55,7 @@ it('invalid refs -> 404 (before auth)', async () => {
 });
 
 it('valid ref routes with auth', async () => {
-  expect((await get('/r/pr-12/npm/x', bearer(tokens.read))).status).toBe(501);
+  expect((await get('/r/pr-12/npm/x', bearer(tokens.read), 'PUT')).status).toBe(405);
 });
 
 it('anything else -> 404; unknown /api/* is 404 for operator', async () => {

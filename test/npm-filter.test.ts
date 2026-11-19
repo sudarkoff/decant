@@ -85,3 +85,12 @@ describe('filterPackument', () => {
     expect(doc).toEqual(before);
   });
 });
+
+describe('filterPackument: unpublished package', () => {
+  it('does not throw when versions is missing; returns empty versions and dist-tags', () => {
+    const doc = { name: 'gone', time: { created: T0, modified: T2, unpublished: { time: T2, versions: ['1.0.0'] } } } as unknown as Packument;
+    const out = filterPackument(doc, new Set(['1.0.0']), BASE);
+    expect(out.versions).toEqual({});
+    expect(out['dist-tags']).toEqual({});
+  });
+});
