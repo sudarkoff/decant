@@ -71,6 +71,8 @@ describe('projects and tokens', () => {
   });
 
   it("project A's ci token on B's policy and status -> 403", async () => {
+    expect((await sync(A.ci, 'pb', policy('pb'), 'pr-1')).status).toBe(403);
+    expect((await sync(A.ci, 'pb', policy('pb'))).status).toBe(403);
     expect((await sync(A.sync, 'pb', policy('pb'))).status).toBe(403);
     expect((await call('GET', '/api/projects/pb/status', A.ci)).status).toBe(403);
   });
