@@ -57,7 +57,12 @@ async function run(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedF
 
   if (res.status === 200) {
     const body = await res.arrayBuffer();
-    await env.BUCKET.put(opts.key, body, { customMetadata: { fetchedAt: deps.now().toISOString() } });
+    try {
+      await env.BUCKET.put(opts.key, body, { customMetadata: { fetchedAt: deps.now().toISOString() } });
+    } catch {
+      // Cache write is best-effort; we already have the body.
+      console.warn(`upstream cache write failed for key ${opts.key}`);
+    }
     return { status: 'ok', body, stale: false };
   }
   if (res.status === 404) {

@@ -120,6 +120,20 @@ describe('cachedFetch', () => {
     expect(f.calls.length).toBe(1);
   });
 
+  it('R2 put failure still returns the body', async () => {
+    const url = 'https://u.test/g';
+    const f = fakeFetch({ [url]: new Response('data') });
+    const badEnv = {
+      BUCKET: { get: async () => null, put: async () => { throw new Error('r2 down'); } },
+    } as unknown as Env;
+    const r = await cachedFetch(badEnv, mk(f, { ms: T0 }), { key: k(), url });
+    expect(r.status).toBe('ok');
+    if (r.status === 'ok') {
+      expect(r.stale).toBe(false);
+      expect(text(r.body)).toBe('data');
+    }
+  });
+
   it('upstreamUnavailable is 502', async () => {
     const r = upstreamUnavailable();
     expect(r.status).toBe(502);
