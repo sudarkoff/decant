@@ -4,7 +4,7 @@ import { defaultExec, type Exec } from './exec';
 export type Fs = {
   readFile(p: string): Promise<string>;
   writeFile(p: string, data: string, mode?: number): Promise<void>;
-  readdir(p: string): Promise<{ name: string; isDir: boolean }[]>;
+  readdir(p: string): Promise<{ name: string; isDir: boolean; isSymlink: boolean }[]>;
   exists(p: string): Promise<boolean>;
   mkdir(p: string): Promise<void>;
 };
@@ -22,7 +22,7 @@ export const defaultFs: Fs = {
   writeFile: (p, data, mode) => nodeFs.writeFile(p, data, mode === undefined ? undefined : { mode }),
   async readdir(p) {
     const entries = await nodeFs.readdir(p, { withFileTypes: true });
-    return entries.map((e) => ({ name: e.name, isDir: e.isDirectory() }));
+    return entries.map((e) => ({ name: e.name, isDir: e.isDirectory(), isSymlink: e.isSymbolicLink() }));
   },
   async exists(p) {
     try {

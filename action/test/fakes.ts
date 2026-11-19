@@ -1,7 +1,7 @@
 import type { ActionDeps, Fs } from '../src/deps';
 import type { Exec } from '../src/exec';
 
-export function memFs(files: Record<string, string> = {}): Fs & { files: Map<string, string> } {
+export function memFs(files: Record<string, string> = {}, symlinks: string[] = []): Fs & { files: Map<string, string> } {
   const m = new Map(Object.entries(files));
   const dirs = new Set<string>();
   return {
@@ -17,14 +17,17 @@ export function memFs(files: Record<string, string> = {}): Fs & { files: Map<str
     async readdir(p) {
       const prefix = p.endsWith('/') ? p : `${p}/`;
       const out = new Map<string, boolean>();
+      const links = new Set<string>();
       for (const k of m.keys()) {
         if (!k.startsWith(prefix)) continue;
         const rest = k.slice(prefix.length);
         const i = rest.indexOf('/');
-        if (i < 0) out.set(rest, false);
-        else out.set(rest.slice(0, i), true);
+        const n = i < 0 ? rest : rest.slice(0, i);
+        if (i < 0) out.set(n, false);
+        else out.set(n, true);
+        if (symlinks.includes(`${prefix}${n}`)) links.add(n);
       }
-      return [...out].map(([name, isDir]) => ({ name, isDir }));
+      return [...out].map(([name, isDir]) => ({ name, isDir, isSymlink: links.has(name) }));
     },
     async exists(p) {
       return m.has(p) || dirs.has(p) || [...m.keys()].some((k) => k.startsWith(`${p}/`));

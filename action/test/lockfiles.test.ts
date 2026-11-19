@@ -114,3 +114,26 @@ describe('review fixes', () => {
     expect(r.map((d) => d.version)).toEqual(['v2.0.0+incompatible']);
   });
 });
+
+describe('identity vs artifact and symlinks', () => {
+  const P = (e: Record<string, unknown>) => parsePackageLock(JSON.stringify({ lockfileVersion: 3, packages: { '': {}, ...e } }), 'f', D);
+  it('matching scoped/unscoped/alias/decant pass', () => {
+    const r = P({
+      'node_modules/a': { version: '1.0.0', resolved: 'https://registry.npmjs.org/a/-/a-1.0.0.tgz' },
+      'node_modules/@s/p': { version: '2.0.0', resolved: 'https://registry.npmjs.org/@s/p/-/p-2.0.0.tgz' },
+      'node_modules/x': { name: 'real', version: '5.0.0', resolved: `${D}/npm/real/-/real-5.0.0.tgz` },
+    });
+    expect(r.every((d) => d.source === 'registry' && !d.mismatch)).toBe(true);
+  });
+  it('mismatched name or version flagged', () => {
+    const r = P({
+      'node_modules/lodash': { version: '4.17.21', resolved: 'https://registry.npmjs.org/evil/-/evil-1.0.0.tgz' },
+      'node_modules/b': { version: '1.0.0', resolved: 'https://registry.npmjs.org/b/-/b-1.0.1.tgz' },
+    });
+    expect(r.every((d) => d.source === 'other' && d.mismatch === true)).toBe(true);
+  });
+  it('findLockfiles skips symlinked dirs and files', async () => {
+    const fs = memFs({ '/r/go.sum': '', '/r/link/go.sum': '', '/r/package-lock.json': '', '/r/sub/go.sum': '' }, ['/r/link', '/r/go.sum']);
+    expect(await findLockfiles('/r', fs)).toEqual(['package-lock.json', 'sub/go.sum']);
+  });
+});

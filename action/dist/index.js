@@ -33,7 +33,7 @@ var defaultFs = {
   writeFile: (p, data, mode) => nodeFs.writeFile(p, data, mode === void 0 ? void 0 : { mode }),
   async readdir(p) {
     const entries = await nodeFs.readdir(p, { withFileTypes: true });
-    return entries.map((e) => ({ name: e.name, isDir: e.isDirectory() }));
+    return entries.map((e) => ({ name: e.name, isDir: e.isDirectory(), isSymlink: e.isSymbolicLink() }));
   },
   async exists(p) {
     try {

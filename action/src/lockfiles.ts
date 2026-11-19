@@ -8,6 +8,7 @@ export type Dep = {
   source: 'registry' | 'other';
   resolved?: string;
   integrity?: string;
+  mismatch?: boolean;
 };
 
 const NPM_REGISTRY = 'https://registry.npmjs.org/';
@@ -21,6 +22,7 @@ export async function findLockfiles(root: string, fs: Fs): Promise<string[]> {
     const entries = await fs.readdir(rel ? `${base}/${rel}` : base);
     for (const e of entries) {
       const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isSymlink) continue;
       if (e.isDir) {
         if (!SKIP_DIRS.has(e.name)) await walk(r);
       } else if (LOCKFILES.has(e.name)) {
@@ -42,6 +44,17 @@ function decantPrefix(decantUrl: string): RegExp {
 
 type LockEntry = { integrity?: string; name?: string; version?: string; resolved?: string; link?: boolean; inBundle?: boolean };
 
+function tarballMatches(resolved: string, name: string, version: string): boolean {
+  let path: string;
+  try {
+    path = decodeURIComponent(new URL(resolved).pathname);
+  } catch {
+    return false;
+  }
+  const base = name.slice(name.lastIndexOf('/') + 1);
+  return path === `/${name}/-/${base}-${version}.tgz`;
+}
+
 export function parsePackageLock(text: string, file: string, decantUrl?: string): Dep[] {
   const lock = JSON.parse(text) as { lockfileVersion?: number; packages?: Record<string, LockEntry> };
   if (!lock.packages || (lock.lockfileVersion ?? 1) < 2) {
@@ -60,6 +73,10 @@ export function parsePackageLock(text: string, file: string, decantUrl?: string)
     // decant URLs are stored normalized so diffs never see normalization as a change
     if (resolved !== undefined) dep.resolved = prefix ? resolved.replace(prefix, NPM_REGISTRY) : resolved;
     if (entry.integrity !== undefined) dep.integrity = entry.integrity;
+    if (dep.source === 'registry' && dep.resolved !== undefined && !tarballMatches(dep.resolved, name, dep.version)) {
+      dep.source = 'other';
+      dep.mismatch = true;
+    }
     deps.push(dep);
   }
   return deps;
