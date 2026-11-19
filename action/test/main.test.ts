@@ -18,7 +18,7 @@ describe('run', () => {
     expect(code).toBe(1);
     expect(err.join('')).toContain('unknown mode nope');
   });
-  it.each(['setup', 'sync', 'scan', 'audit', 'adopt'])('mode %s stub returns 1 with not implemented', async (m) => {
+  it.each(['scan', 'audit', 'adopt'])('mode %s stub returns 1 with not implemented', async (m) => {
     const err = capErr();
     const code = await run(fakeDeps({ env: { INPUT_MODE: m, 'INPUT_DECANT-URL': 'https://d.example' } }));
     expect(code).toBe(1);
