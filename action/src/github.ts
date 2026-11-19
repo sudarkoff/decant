@@ -230,6 +230,12 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
       return prs[0] ? toPr(prs[0]) : null;
     },
 
+    /** Head commit sha of branch `name`. */
+    async branchHead(name: string): Promise<string> {
+      const r = await json<{ object: { sha: string } }>('GET', `${R}/git/ref/heads/${name.split('/').map(encodeURIComponent).join('/')}`);
+      return r.object.sha;
+    },
+
     async createBranch(name: string, fromSha: string): Promise<void> {
       await rest('POST', `${R}/git/refs`, { ref: `refs/heads/${name}`, sha: fromSha });
     },
