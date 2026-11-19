@@ -101,8 +101,10 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       if (o.changed) notice('policy changes in decant.json take effect after merge');
     }
   } else if (event === 'push' || event === 'workflow_dispatch') {
-    const branch = env.GITHUB_REF_NAME || (env.GITHUB_REF ?? '').replace(/^refs\/heads\//, '');
-    if (!branch || branch !== payload.repository?.default_branch) {
+    // Match the full ref: GITHUB_REF_NAME is also set for tags, so a tag named like the branch must not pass.
+    const branch = payload.repository?.default_branch ?? '';
+    if (!branch || env.GITHUB_REF !== `refs/heads/${branch}`) {
+      if (event === 'workflow_dispatch') return fail('sync must run on the default branch');
       notice('not the default branch; nothing to sync');
       return 0;
     }

@@ -142,6 +142,7 @@ function syncDeps(
     GITHUB_EVENT_PATH: '/event.json',
     GITHUB_SHA: 'abc123',
     GITHUB_REF_NAME: 'main',
+    GITHUB_REF: 'refs/heads/main',
     GITHUB_OUTPUT: t.f('out'),
     ...over.env,
   };
@@ -179,7 +180,7 @@ describe('sync', () => {
     expect(err.join('')).toContain('sync-token is required on the default branch');
   });
   it('push to non-default branch → 0 with notice, no call', async () => {
-    const { deps, f } = syncDeps({ event: 'push', env: { GITHUB_REF_NAME: 'feat' } });
+    const { deps, f } = syncDeps({ event: 'push', env: { GITHUB_REF_NAME: 'feat', GITHUB_REF: 'refs/heads/feat' } });
     const { out } = cap();
     expect(await run(deps)).toBe(0);
     expect(out.join('')).toContain('::notice::not the default branch; nothing to sync');
@@ -325,8 +326,22 @@ describe('sync bootstrap and base-derived overlays', () => {
     expect(JSON.parse(f.calls[0].body!).ref).toBe('main');
     expect(t.read('out')).toContain('main');
   });
-  it('workflow_dispatch on another branch is a no-op notice', async () => {
-    const { deps, f } = syncDeps({ event: 'workflow_dispatch', payload: dispatch, env: { GITHUB_REF_NAME: 'feat' } });
+  it('workflow_dispatch on another branch fails', async () => {
+    const { deps, f } = syncDeps({ event: 'workflow_dispatch', payload: dispatch, env: { GITHUB_REF_NAME: 'feat', GITHUB_REF: 'refs/heads/feat' } });
+    const { err } = cap();
+    expect(await run(deps)).toBe(1);
+    expect(err.join('')).toContain('sync must run on the default branch');
+    expect(f.calls).toHaveLength(0);
+  });
+  it('workflow_dispatch on a tag named like the default branch fails', async () => {
+    const { deps, f } = syncDeps({ event: 'workflow_dispatch', payload: dispatch, env: { GITHUB_REF_NAME: 'main', GITHUB_REF: 'refs/tags/main' } });
+    const { err } = cap();
+    expect(await run(deps)).toBe(1);
+    expect(err.join('')).toContain('sync must run on the default branch');
+    expect(f.calls).toHaveLength(0);
+  });
+  it('push of a tag named like the default branch (refs/tags/main) does not sync', async () => {
+    const { deps, f } = syncDeps({ event: 'push', payload: dispatch, env: { GITHUB_REF_NAME: 'main', GITHUB_REF: 'refs/tags/main' } });
     const { out } = cap();
     expect(await run(deps)).toBe(0);
     expect(out.join('')).toContain('::notice::not the default branch; nothing to sync');

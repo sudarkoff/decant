@@ -2386,8 +2386,9 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       if (o.changed) notice("policy changes in decant.json take effect after merge");
     }
   } else if (event === "push" || event === "workflow_dispatch") {
-    const branch = env.GITHUB_REF_NAME || (env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "");
-    if (!branch || branch !== payload.repository?.default_branch) {
+    const branch = payload.repository?.default_branch ?? "";
+    if (!branch || env.GITHUB_REF !== `refs/heads/${branch}`) {
+      if (event === "workflow_dispatch") return fail3("sync must run on the default branch");
       notice("not the default branch; nothing to sync");
       return 0;
     }

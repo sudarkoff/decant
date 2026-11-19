@@ -20,7 +20,7 @@ npm run decant -- token create <project> sync
 
 Also set a repo variable `DECANT_URL` (your Worker's URL).
 
-Create the `decant-sync` environment (Settings, Environments) and restrict it to the default branch (Deployment branches and tags: Selected branches, add `main`). A PR build can then never read the sync token or rewrite the main policy.
+Create the `decant-sync` environment (Settings, Environments) and restrict it to the default branch only (Deployment branches and tags: Selected branches and tags, add a **branch** rule for `main`, and add no tag rules). A PR build or a tag (even one named `main`) can then never read the sync token or rewrite the main policy. The sync step also checks the full ref (`refs/heads/<default>`), so a tag never syncs main.
 
 Fork PRs get no secrets. Sync skips them with a notice. Scan still diffs the lockfiles (that needs no token): a fork PR that changes no lockfile passes with a notice, and one that changes a lockfile fails with `fork changes lockfiles; push the branch to this repo to scan it`. A maintainer pushes the branch to this repo (a same-repo PR) to get it scanned.
 
