@@ -78,3 +78,39 @@ describe('findLockfiles', () => {
     expect(await findLockfiles('/r', fs)).toEqual(['go.sum', 'package-lock.json', 'sub/go.sum']);
   });
 });
+
+describe('review fixes', () => {
+  const lock = (e: Record<string, unknown>) => JSON.stringify({ lockfileVersion: 3, packages: { '': {}, ...e } });
+  const P = (e: Record<string, unknown>, d?: string) => parsePackageLock(lock(e), 'f', d);
+  const R = 'https://registry.npmjs.org/foo/-/foo-1.0.0.tgz';
+  it('repointed resolved is new', () => {
+    const a = P({ 'node_modules/foo': { version: '1.0.0', resolved: R } });
+    const b = P({ 'node_modules/foo': { version: '1.0.0', resolved: 'git+https://x/foo.git#1' } });
+    expect(diffDeps(a, b)).toHaveLength(1);
+  });
+  it('changed integrity is new', () => {
+    const a = P({ 'node_modules/foo': { version: '1.0.0', resolved: R, integrity: 'sha512-a' } });
+    const b = P({ 'node_modules/foo': { version: '1.0.0', resolved: R, integrity: 'sha512-b' } });
+    expect(diffDeps(a, b)).toHaveLength(1);
+  });
+  it('decant vs npmjs url for same tarball is not new', () => {
+    const a = P({ 'node_modules/foo': { version: '1.0.0', resolved: R, integrity: 'x' } }, D);
+    const b = P({ 'node_modules/foo': { version: '1.0.0', resolved: `${D}/r/pr-1/npm/foo/-/foo-1.0.0.tgz`, integrity: 'x' } }, D);
+    expect(diffDeps(a, b)).toHaveLength(0);
+  });
+  it('missing version kept as other', () => {
+    const [d] = P({ 'node_modules/foo': { resolved: R } });
+    expect(d).toMatchObject({ name: 'foo', version: '', source: 'other' });
+  });
+  it('optional and peer entries included', () => {
+    const r = P({ 'node_modules/o': { version: '1.0.0', optional: true }, 'node_modules/p': { version: '2.0.0', peer: true } });
+    expect(r.map((d) => d.name)).toEqual(['o', 'p']);
+  });
+  it('trailing-slash decantUrl normalizes', () => {
+    expect(normalizeLockfile(`"resolved": "${D}/npm/a"`, `${D}/`)).toEqual({ text: '"resolved": "https://registry.npmjs.org/a"', changed: 1 });
+  });
+  it('+incompatible kept, its go.mod line dropped', () => {
+    const r = parseGoSum('a.com/m v2.0.0+incompatible h1:x=\na.com/m v2.0.0+incompatible/go.mod h1:y=\n', 'go.sum');
+    expect(r.map((d) => d.version)).toEqual(['v2.0.0+incompatible']);
+  });
+});

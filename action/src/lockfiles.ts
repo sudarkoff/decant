@@ -7,6 +7,7 @@ export type Dep = {
   file: string;
   source: 'registry' | 'other';
   resolved?: string;
+  integrity?: string;
 };
 
 const NPM_REGISTRY = 'https://registry.npmjs.org/';
@@ -39,7 +40,7 @@ function decantPrefix(decantUrl: string): RegExp {
   return new RegExp(`^${escapeRe(decantUrl.replace(/\/+$/, ''))}(/r/[A-Za-z0-9._-]{1,64})?/npm/`);
 }
 
-type LockEntry = { name?: string; version?: string; resolved?: string; link?: boolean; inBundle?: boolean };
+type LockEntry = { integrity?: string; name?: string; version?: string; resolved?: string; link?: boolean; inBundle?: boolean };
 
 export function parsePackageLock(text: string, file: string, decantUrl?: string): Dep[] {
   const lock = JSON.parse(text) as { lockfileVersion?: number; packages?: Record<string, LockEntry> };
@@ -52,12 +53,13 @@ export function parsePackageLock(text: string, file: string, decantUrl?: string)
     if (key === '' || entry.link || entry.inBundle) continue;
     const idx = key.lastIndexOf('node_modules/');
     if (idx < 0) continue; // workspace package
-    if (!entry.version) continue;
     const name = entry.name ?? key.slice(idx + 'node_modules/'.length);
     const resolved = entry.resolved;
-    const registry = resolved === undefined || resolved.startsWith(NPM_REGISTRY) || (prefix?.test(resolved) ?? false);
-    const dep: Dep = { eco: 'npm', name, version: entry.version, file, source: registry ? 'registry' : 'other' };
-    if (resolved !== undefined) dep.resolved = resolved;
+    const registry = !!entry.version && (resolved === undefined || resolved.startsWith(NPM_REGISTRY) || (prefix?.test(resolved) ?? false));
+    const dep: Dep = { eco: 'npm', name, version: entry.version ?? '', file, source: registry ? 'registry' : 'other' };
+    // decant URLs are stored normalized so diffs never see normalization as a change
+    if (resolved !== undefined) dep.resolved = prefix ? resolved.replace(prefix, NPM_REGISTRY) : resolved;
+    if (entry.integrity !== undefined) dep.integrity = entry.integrity;
     deps.push(dep);
   }
   return deps;
@@ -79,7 +81,10 @@ export function parseGoSum(text: string, file: string): Dep[] {
   return deps;
 }
 
-const key = (d: Dep) => `${d.eco}:${d.name}@${d.version}`;
+const key = (d: Dep) =>
+  d.eco === 'npm'
+    ? `npm:${d.name}@${d.version}|${d.source}|${d.resolved ?? ''}|${d.integrity ?? ''}`
+    : `${d.eco}:${d.name}@${d.version}`;
 
 export function diffDeps(base: Dep[], head: Dep[]): Dep[] {
   const have = new Set(base.map(key));
