@@ -1,4 +1,4 @@
-import { parsePackageId } from '../types';
+import { parsePackageId } from '../ids';
 
 export type Severity = 'critical' | 'high' | 'moderate' | 'low';
 export type ShipMode = 'auto' | 'approve';
