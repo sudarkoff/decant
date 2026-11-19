@@ -1,6 +1,6 @@
 # Deploying decant
 
-decant runs in your own Cloudflare account: one Worker, one R2 bucket, one D1 database. Setup takes about ten minutes.
+decant runs in your own Cloudflare account: one Worker, one R2 bucket, one D1 database.
 
 ## Before you start
 
@@ -103,7 +103,7 @@ npm run decant -- token create <project> read
 npm run decant -- token create <project> ci
 ```
 
-Each prints `{"token":"dk_..."}`. The token is shown once; only its hash is stored. Keep the CI token for the GitHub Action (coming in the GitHub Action, plan 2). Syncing a policy file and CI verdicts depend on it.
+Each prints `{"token":"dk_..."}`. The token is shown once; only its hash is stored. Keep the CI token for the GitHub Action (the GitHub Action is not released yet). Syncing a policy file and CI verdicts depend on it.
 
 ## 7. Check a client
 
@@ -126,7 +126,7 @@ export GOPROXY=https://decant:<read-token>@<your-domain>/go
 go list -m -versions github.com/google/uuid
 ```
 
-A version younger than the cooldown (7 days by default) is hidden until it ages in, unless the project's policy allows it. Policy files are synced by the GitHub Action (coming in the GitHub Action, plan 2).
+A version younger than the cooldown (7 days by default) is hidden until it ages in, unless the project's policy allows it. Policy files are synced by the GitHub Action (the GitHub Action is not released yet).
 
 ## Rotating the operator token
 
