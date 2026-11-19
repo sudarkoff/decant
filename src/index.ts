@@ -1,10 +1,46 @@
+import { authenticate, type RequestCtx } from './auth';
+import { handleGo } from './go/handler';
 import { notFound, text } from './http';
+import { handleNpm } from './npm/handler';
 import type { Deps, Env } from './types';
 
-export async function handle(req: Request, _env: Env, _deps: Deps, _ctx: ExecutionContext): Promise<Response> {
+const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+function unauthorized(): Response {
+  return text('unauthorized', 401, { 'www-authenticate': 'Basic realm="decant"' });
+}
+
+export async function handle(req: Request, env: Env, deps: Deps, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(req.url);
-  if (url.pathname === '/healthz') return text('ok');
-  return notFound();
+  const p = url.pathname;
+  if (p === '/healthz') return text('ok');
+
+  if (p === '/api' || p.startsWith('/api/')) {
+    const auth = await authenticate(req, env);
+    if (!auth) return unauthorized();
+    if (auth.kind !== 'operator') return text('forbidden', 403);
+    return notFound(); // stub: Task 5 replaces with the admin handler
+  }
+
+  // /(r/<ref>/)?(npm|go)(/...)?
+  const m = /^(?:\/r\/([^/]+))?\/(npm|go)(\/.*)?$/.exec(p);
+  if (!m) return notFound();
+  const ref = m[1] ?? null;
+  if (ref !== null && !REF_RE.test(ref)) return notFound();
+
+  const auth = await authenticate(req, env);
+  if (!auth) return unauthorized();
+  if (auth.kind === 'operator') return text('forbidden', 403);
+
+  const rc: RequestCtx = {
+    projectId: auth.projectId,
+    ref,
+    base: url.origin + (ref === null ? '' : `/r/${ref}`),
+  };
+  const rest = m[3] ?? '/';
+  return m[2] === 'npm'
+    ? handleNpm(req, env, deps, ctx, rc, rest)
+    : handleGo(req, env, deps, ctx, rc, rest);
 }
 
 function defaultDeps(): Deps {

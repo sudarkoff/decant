@@ -1,5 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { applyD1Migrations } from 'cloudflare:test';
+import { hashToken, newToken } from '../src/auth';
 import type { Env } from '../src/types';
 
 // Setup (runs via vitest setupFiles): apply migrations/ to the test D1.
@@ -26,6 +27,16 @@ export function fakeFetch(routes: Record<string, Route>): typeof fetch & { calls
   return Object.assign(fn, { calls }) as typeof fetch & { calls: string[] };
 }
 
-export async function seedProject(_env: Env, _id: string): Promise<{ read: string; ci: string }> {
-  throw new Error('not implemented until Task 3');
+export async function seedProject(env: Env, id: string): Promise<{ read: string; ci: string }> {
+  const read = newToken('read');
+  const ci = newToken('ci');
+  const at = '2026-11-19T00:00:00Z';
+  await env.DB.batch([
+    env.DB.prepare('INSERT INTO projects (id, created_at) VALUES (?, ?)').bind(id, at),
+    env.DB.prepare('INSERT INTO tokens (hash, project_id, kind, created_at) VALUES (?, ?, ?, ?)').bind(
+      await hashToken(read), id, 'read', at),
+    env.DB.prepare('INSERT INTO tokens (hash, project_id, kind, created_at) VALUES (?, ?, ?, ?)').bind(
+      await hashToken(ci), id, 'ci', at),
+  ]);
+  return { read, ci };
 }
