@@ -10,9 +10,12 @@ export interface Packument {
   [k: string]: unknown;
 }
 
-/** Pure: returns a filtered copy of a full or abbreviated packument. */
+/**
+ * Filters a full or abbreviated packument IN PLACE and returns it. Callers pass a freshly parsed
+ * document they own: copying a large packument would double its memory in a 128 MB isolate.
+ */
 export function filterPackument(doc: Packument, allowed: Set<string>, tarballBase: string): Packument {
-  const out = structuredClone(doc);
+  const out = doc;
   out.versions ??= {}; // unpublished packages have time.unpublished and no versions
   const basename = out.name.split('/').pop() as string;
 

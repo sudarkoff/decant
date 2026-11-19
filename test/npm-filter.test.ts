@@ -78,11 +78,11 @@ describe('filterPackument', () => {
     expect(out['dist-tags']!.latest).toBe('2.0.0');
   });
 
-  it('does not mutate input', () => {
+  it('filters in place (no copy of large documents): returns the same object', () => {
     const doc = full();
-    const before = structuredClone(doc);
-    filterPackument(doc, allowed, BASE);
-    expect(doc).toEqual(before);
+    const out = filterPackument(doc, allowed, BASE);
+    expect(out).toBe(doc);
+    expect(Object.keys(doc.versions).every((v) => allowed.has(v))).toBe(true);
   });
 });
 

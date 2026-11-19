@@ -53,13 +53,20 @@ async function fetchDoc(env: Env, deps: Deps, name: string, abbrev: boolean): Pr
   });
   if (r.status === 'not-found') return { ok: false, res: err(404, `npm:${name} not found`) };
   if (r.status === 'unavailable') return { ok: false, res: err(502, 'upstream unavailable and nothing cached') };
+  // Only the parsed object leaves this function: the raw bytes and decoded text become garbage on return,
+  // before the caller filters and re-stringifies. Each call parses its own object, so callers may mutate it.
+  const doc = parseDoc(r.body);
+  return doc ? { ok: true, doc, stale: r.stale } : { ok: false, res: err(502, 'invalid upstream document') };
+}
+
+function parseDoc(body: ArrayBuffer): Packument | null {
   try {
-    const doc = JSON.parse(new TextDecoder().decode(r.body)) as Packument;
-    if (doc && typeof doc === 'object' && typeof doc.name === 'string') return { ok: true, doc, stale: r.stale };
+    const doc = JSON.parse(new TextDecoder().decode(body)) as Packument;
+    if (doc && typeof doc === 'object' && typeof doc.name === 'string') return doc;
   } catch {
     // fall through
   }
-  return { ok: false, res: err(502, 'invalid upstream document') };
+  return null;
 }
 
 /** Publish times of listed versions, from a full document's `time`. */
@@ -72,6 +79,12 @@ function publishTimes(full: Packument): Map<string, Date> {
     if (!Number.isNaN(d.getTime())) out.set(v, d);
   }
   return out;
+}
+
+/** Publish times from the full document; the (large) full document itself is dropped on return. */
+async function fullDocTimes(env: Env, deps: Deps, name: string): Promise<{ times: Map<string, Date>; stale: boolean } | null> {
+  const full = await fetchDoc(env, deps, name, false);
+  return full.ok ? { times: publishTimes(full.doc), stale: full.stale } : null;
 }
 
 async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx, name: string): Promise<Response> {
@@ -90,10 +103,10 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx
     pinned = await getPinnedTimes(env, 'npm', name, versions);
     if (versions.some((v) => !pinned.has(v))) {
       // Times only live in the full document. If it can't be had, unpinned versions stay hidden.
-      const full = await fetchDoc(env, deps, name, false);
-      if (full.ok) {
-        stale ||= full.stale;
-        for (const [v, p] of await pinPublishTimes(env, 'npm', name, publishTimes(full.doc), now)) pinned.set(v, p);
+      const times = await fullDocTimes(env, deps, name);
+      if (times) {
+        stale ||= times.stale;
+        for (const [v, p] of await pinPublishTimes(env, 'npm', name, times.times, now)) pinned.set(v, p);
       }
     }
   }
