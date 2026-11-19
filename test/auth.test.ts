@@ -81,6 +81,15 @@ it('empty OPERATOR_TOKEN_HASH never authenticates', async () => {
   expect(r2).toBeNull();
 });
 
+it('OPERATOR_TOKEN_HASH is normalized: uppercase with whitespace authenticates; whitespace-only never does', async () => {
+  const req = (t: string) => new Request('https://h/api/x', { headers: bearer(t) });
+  const messy = { ...e, OPERATOR_TOKEN_HASH: `  ${(await hashToken(opToken)).toUpperCase()}\n` };
+  expect(await authenticate(req(opToken), messy)).toEqual({ kind: 'operator' });
+  const blank = { ...e, OPERATOR_TOKEN_HASH: ' \n\t ' };
+  expect(await authenticate(req(opToken), blank)).toBeNull();
+  expect(await authenticate(new Request('https://h/api/x', { headers: { authorization: 'Basic ' + btoa('u:') } }), blank)).toBeNull();
+});
+
 it('authenticate returns contexts', async () => {
   const req = (t: string) => new Request('https://h/', { headers: bearer(t) });
   expect(await authenticate(req(opToken), e)).toEqual({ kind: 'operator' });

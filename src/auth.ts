@@ -51,8 +51,9 @@ export async function authenticate(req: Request, env: Env): Promise<AuthCtx | nu
   const token = extractToken(req);
   if (!token) return null;
   const hash = await hashToken(token);
-  const op = env.OPERATOR_TOKEN_HASH;
-  if (op && constantTimeEqual(hash, op)) return { kind: 'operator' };
+  // Tolerate a pasted secret with stray whitespace or uppercase hex. An empty hash never authenticates.
+  const op = (env.OPERATOR_TOKEN_HASH ?? '').trim().toLowerCase();
+  if (op !== '' && constantTimeEqual(hash, op)) return { kind: 'operator' };
   const row = await env.DB.prepare('SELECT project_id, kind FROM tokens WHERE hash = ?')
     .bind(hash)
     .first<{ project_id: string; kind: 'read' | 'ci' }>();
