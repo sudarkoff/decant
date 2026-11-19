@@ -58,6 +58,13 @@ it('valid ref routes with auth', async () => {
   expect((await get('/r/pr-12/npm/x', bearer(tokens.read), 'PUT')).status).toBe(405);
 });
 
+it('read token reaches PR overlay routes for npm (Bearer) and Go (netrc Basic)', async () => {
+  // `setup` on a PR points npm and GOPROXY at /r/pr-<n>/ with the read token.
+  expect((await get('/r/pr-12/npm/', bearer(tokens.read), 'PUT')).status).toBe(405);
+  const b = btoa(`decant:${tokens.read}`);
+  expect((await get('/r/pr-12/go/x', { authorization: `Basic ${b}` }, 'POST')).status).toBe(405);
+});
+
 it('anything else -> 404; unknown /api/* is 404 for operator', async () => {
   expect((await get('/nope')).status).toBe(404);
   expect((await get('/api/x', bearer(opToken))).status).toBe(404);

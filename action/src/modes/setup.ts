@@ -1,3 +1,4 @@
+import { isForkPr, readPayload } from '../event';
 import { appendSummary, error, exportVar, mask, warning } from '../gh-io';
 import type { ModeCtx } from '../inputs';
 
@@ -30,10 +31,27 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   }
 
   if (!inputs.token) return fail('token is required (read token)');
-  const base = inputs.decantUrl.replace(/\/+$/, '');
-  const host = new URL(base).host;
+  const origin = inputs.decantUrl.replace(/\/+$/, '');
+  const host = new URL(origin).host;
+  // A same-repo PR installs through its overlay (pr-<n>), so allow entries the PR adds (e.g. a fix
+  // still in cooldown) apply to its own CI. The overlay is synced by `sync`; run setup after it.
+  let prefix = '';
+  if (env.GITHUB_EVENT_NAME === 'pull_request') {
+    let payload;
+    try {
+      payload = await readPayload(deps);
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+    const n = payload.pull_request?.number;
+    if (typeof n !== 'number') return fail('event payload has no pull_request.number');
+    if (!isForkPr(payload)) prefix = `/r/pr-${n}`;
+  }
+  const base = `${origin}${prefix}`;
+  const npmPath = new URL(`${base}/npm/`).pathname;
   // Both files hold the token. Node applies `mode` only on create, so chmod after writing too.
-  await deps.fs.writeFile(npmrc, `registry=${base}/npm/\n//${host}/npm/:_authToken=${inputs.token}\nignore-scripts=true\n`, 0o600);
+  await deps.fs.writeFile(npmrc, `registry=${base}/npm/\n//${host}${npmPath}:_authToken=${inputs.token}\nignore-scripts=true\n`, 0o600);
+  // netrc is per host, so it covers the overlay paths too.
   await deps.fs.writeFile(netrc, `machine ${host} login decant password ${inputs.token}\n`, 0o600);
   await deps.fs.chmod(npmrc, 0o600);
   await deps.fs.chmod(netrc, 0o600);
