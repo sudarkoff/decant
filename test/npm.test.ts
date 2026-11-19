@@ -52,13 +52,13 @@ interface Fixture {
 /** Package with 1.0.0 (OLD) and 2.0.0 (YOUNG). */
 async function fixture(
   name: string,
-  opts: { integrity?: string | null; contentLength?: boolean; osv?: unknown } = {},
+  opts: { integrity?: string | null; contentLength?: boolean; osv?: unknown; tarballBase?: string } = {},
 ): Promise<Fixture> {
   const base = name.split('/').pop()!;
   const tgz = new TextEncoder().encode(`tarball-bytes-of-${name}`);
   const integrity = opts.integrity === undefined ? await sri(tgz) : opts.integrity;
   const times: Record<string, string> = { '1.0.0': OLD, '2.0.0': YOUNG };
-  const tarballUrl = (v: string) => `${REG}/${name}/-/${base}-${v}.tgz`;
+  const tarballUrl = (v: string) => `${opts.tarballBase ?? REG}/${name}/-/${base}-${v}.tgz`;
   const ver = (v: string) => ({
     name,
     version: v,
@@ -133,6 +133,21 @@ describe('npm metadata', () => {
     expect(Object.keys(doc.versions)).toEqual(['1.0.0']);
     expect(await e.BUCKET.head('npm/meta/abbrev/abbr.json')).not.toBeNull();
     expect(await e.BUCKET.head('npm/meta/full/abbr.json')).not.toBeNull();
+  });
+
+  it('stale cached doc (upstream down) → 200 with X-Decant-Stale: 1; fresh → no header', async () => {
+    const fx = await fixture('stale-pkg');
+    const fullDoc = await (await (fx.routes[`${REG}/stale-pkg`] as (r: Request) => Response)(new Request(`${REG}/stale-pkg`))).text();
+    await e.BUCKET.put('npm/meta/full/stale-pkg.json', fullDoc, { customMetadata: { fetchedAt: '2026-11-01T00:00:00.000Z' } });
+    const down = client({ [`${REG}/stale-pkg`]: new Response('', { status: 503 }) });
+    const r = await down.req('/npm/stale-pkg');
+    expect(r.status).toBe(200);
+    expect(r.headers.get('x-decant-stale')).toBe('1');
+    expect(Object.keys(((await r.json()) as Doc).versions)).toEqual(['1.0.0']);
+
+    const fresh = await fixture('fresh-pkg');
+    const ok = await client(fresh.routes).req('/npm/fresh-pkg');
+    expect(ok.headers.get('x-decant-stale')).toBeNull();
   });
 
   it('unknown package → 404 JSON', async () => {
@@ -251,6 +266,41 @@ describe('npm tarballs', () => {
     await ctx.flush();
     const st = await e.DB.prepare("SELECT osv_checked_at FROM versions WHERE eco='npm' AND name='osvdown' AND version='1.0.0'").first();
     expect(st).toEqual({ osv_checked_at: null });
+  });
+
+  it('object at the final key but stored_at null → not served from R2; upstream is fetched', async () => {
+    const fx = await fixture('half');
+    await e.BUCKET.put('npm/tar/half/half-1.0.0.tgz', 'unverified-bytes');
+    const { req, ctx, f } = client(fx.routes);
+    await (await req('/npm/half')).arrayBuffer(); // pins the version row (stored_at null)
+    const r = await req('/npm/half/-/half-1.0.0.tgz');
+    expect(r.status).toBe(200);
+    expect(new Uint8Array(await r.arrayBuffer())).toEqual(fx.tgz);
+    expect(f.calls).toContain(fx.tarballUrl('1.0.0'));
+    await ctx.flush();
+    const obj = await e.BUCKET.get('npm/tar/half/half-1.0.0.tgz');
+    expect(new Uint8Array(await obj!.arrayBuffer())).toEqual(fx.tgz);
+  });
+
+  it('verification happens on a temp key that is cleaned up', async () => {
+    const good = await fixture('tmpgood');
+    const bad = await fixture('tmpbad', { integrity: await sri(new TextEncoder().encode('other')) });
+    const { req, ctx } = client({ ...good.routes, ...bad.routes });
+    await (await req('/npm/tmpgood/-/tmpgood-1.0.0.tgz')).arrayBuffer();
+    await (await req('/npm/tmpbad/-/tmpbad-1.0.0.tgz')).arrayBuffer();
+    await ctx.flush();
+    expect((await e.BUCKET.list({ prefix: 'npm/tmp/' })).objects).toEqual([]);
+    expect(await e.BUCKET.head('npm/tar/tmpgood/tmpgood-1.0.0.tgz')).not.toBeNull();
+    expect(await e.BUCKET.head('npm/tar/tmpbad/tmpbad-1.0.0.tgz')).toBeNull();
+  });
+
+  it('tarball URL on another host → 404 "unexpected tarball host", nothing fetched', async () => {
+    const fx = await fixture('ssrf', { tarballBase: 'https://evil.example' });
+    const { req, f } = client(fx.routes);
+    const r = await req('/npm/ssrf/-/ssrf-1.0.0.tgz');
+    expect(r.status).toBe(404);
+    expect(await r.json()).toEqual({ error: 'unexpected tarball host' });
+    expect(f.calls).not.toContain(fx.tarballUrl('1.0.0'));
   });
 
   it('unknown version or bad file name → 404', async () => {

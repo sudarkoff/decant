@@ -20,7 +20,8 @@ import { filterPackument, type Packument } from './filter';
 
 const REGISTRY = 'https://registry.npmjs.org';
 const ABBREV = 'application/vnd.npm.install-v1+json';
-const MAX_BUFFER = 64 * 1024 * 1024;
+const MAX_BUFFER = 32 * 1024 * 1024; // cap for tarballs with no content-length
+const UPSTREAM_HOST = 'registry.npmjs.org';
 const AUDIT_PATHS = new Set(['/-/npm/v1/security/advisories/bulk', '/-/npm/v1/security/audits/quick']);
 // npm names: optional @scope/, no leading '.' or '_', URL-safe characters only.
 const NAME_RE = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/i;
@@ -43,7 +44,7 @@ function parsePath(path: string): { name: string; file: string | null } | null {
   return { name: m[1]!, file: m[2] ?? null };
 }
 
-type DocResult = { ok: true; doc: Packument } | { ok: false; res: Response };
+type DocResult = { ok: true; doc: Packument; stale: boolean } | { ok: false; res: Response };
 
 async function fetchDoc(env: Env, deps: Deps, name: string, abbrev: boolean): Promise<DocResult> {
   const r = await cachedFetch(env, deps, {
@@ -55,7 +56,7 @@ async function fetchDoc(env: Env, deps: Deps, name: string, abbrev: boolean): Pr
   if (r.status === 'unavailable') return { ok: false, res: err(502, 'upstream unavailable and nothing cached') };
   try {
     const doc = JSON.parse(new TextDecoder().decode(r.body)) as Packument;
-    if (doc && typeof doc === 'object' && typeof doc.name === 'string') return { ok: true, doc };
+    if (doc && typeof doc === 'object' && typeof doc.name === 'string') return { ok: true, doc, stale: r.stale };
   } catch {
     // fall through
   }
@@ -99,6 +100,7 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx
   const doc = r.doc;
   const versions = Object.keys(doc.versions ?? {});
   const now = deps.now();
+  let stale = r.stale;
 
   let pinned: Map<string, PinnedTime>;
   if (!abbrev) {
@@ -109,6 +111,7 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx
       // Times only live in the full document. If it can't be had, unpinned versions stay hidden.
       const full = await fetchDoc(env, deps, name, false);
       if (full.ok) {
+        stale ||= full.stale;
         for (const [v, p] of await pinPublishTimes(env, 'npm', name, publishTimes(full.doc), now)) pinned.set(v, p);
       }
     }
@@ -118,7 +121,12 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx
   const allowed = new Set(versions.filter((v) => d(v, pinned.get(v)) === 'allow'));
   const out = filterPackument(doc, allowed, `${rc.base}/npm`);
   return new Response(JSON.stringify(out), {
-    headers: { 'content-type': abbrev ? ABBREV : 'application/json', vary: 'Accept', ...NO_STORE },
+    headers: {
+      'content-type': abbrev ? ABBREV : 'application/json',
+      vary: 'Accept',
+      ...NO_STORE,
+      ...(stale ? { 'x-decant-stale': '1' } : {}),
+    },
   });
 }
 
@@ -143,8 +151,7 @@ function b64(buf: ArrayBuffer): string {
 }
 
 /** Reads the whole stream, or cancels it and returns null once it exceeds `max` bytes. */
-async function readUpTo(stream: ReadableStream<Uint8Array>, max: number): Promise<Uint8Array | null> {
-  const reader = stream.getReader();
+async function readUpTo(reader: ReadableStreamDefaultReader<Uint8Array>, max: number): Promise<Uint8Array | null> {
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
@@ -166,21 +173,19 @@ async function readUpTo(stream: ReadableStream<Uint8Array>, max: number): Promis
   return out;
 }
 
-async function pump(stream: ReadableStream<Uint8Array>, sinks: WritableStreamDefaultWriter<Uint8Array>[]): Promise<void> {
-  const reader = stream.getReader();
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      await Promise.all(sinks.map((w) => w.write(value)));
-    }
-    await Promise.all(sinks.map((w) => w.close()));
-  } catch (e) {
-    await Promise.allSettled([reader.cancel(e), ...sinks.map((w) => w.abort(e))]);
-    throw e;
+async function pump(reader: ReadableStreamDefaultReader<Uint8Array>, sinks: WritableStreamDefaultWriter<Uint8Array>[]): Promise<void> {
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    await Promise.all(sinks.map((w) => w.write(value)));
   }
+  await Promise.all(sinks.map((w) => w.close()));
 }
 
+/**
+ * Writes to a temp key, verifies the sha512, then copies to `key` and marks the version stored.
+ * Readers only serve `key` once stored_at is set, so unverified bytes are never served from R2.
+ */
 async function storeTarball(
   env: Env,
   stream: ReadableStream<Uint8Array>,
@@ -191,37 +196,47 @@ async function storeTarball(
   now: Date,
 ): Promise<void> {
   const id = formatPackageId(ref);
+  const tmp = `npm/tmp/${crypto.randomUUID()}`;
+  const reader = stream.getReader();
+  const writers: WritableStreamDefaultWriter<Uint8Array>[] = [];
   try {
     let digest: ArrayBuffer;
     if (length === null) {
-      const buf = await readUpTo(stream, MAX_BUFFER);
+      const buf = await readUpTo(reader, MAX_BUFFER);
       if (buf === null) {
-        console.warn(`tarball over 64 MB with no content-length, not stored ${id}`);
+        console.warn(`tarball over 32 MB with no content-length, not stored ${id}`);
         return;
       }
-      [digest] = await Promise.all([crypto.subtle.digest('SHA-512', buf), env.BUCKET.put(key, buf)]);
+      [digest] = await Promise.all([crypto.subtle.digest('SHA-512', buf), env.BUCKET.put(tmp, buf)]);
     } else {
       // One pump feeds both the digest and R2 (workerd can't pipeTo between two TransformStreams).
       const ds = new crypto.DigestStream('SHA-512');
       const fl = new FixedLengthStream(length);
-      const put = env.BUCKET.put(key, fl.readable);
-      const [, , d] = await Promise.all([pump(stream, [ds.getWriter(), fl.writable.getWriter()]), put, ds.digest]);
+      writers.push(ds.getWriter(), fl.writable.getWriter());
+      const put = env.BUCKET.put(tmp, fl.readable);
+      const [, , d] = await Promise.all([pump(reader, writers), put, ds.digest]);
       digest = d;
     }
     if (expected === null) {
       console.warn(`no sha512 integrity ${id}`);
     } else if (b64(digest) !== expected) {
-      await env.BUCKET.delete(key);
       console.error(`integrity mismatch ${id}`);
       return;
     }
+    // R2 has no rename: copy the verified temp object to the final key.
+    const obj = await env.BUCKET.get(tmp);
+    if (!obj) throw new Error('temp object missing');
+    await env.BUCKET.put(key, obj.body);
     await markStored(env, ref, now);
   } catch {
     console.error(`tarball store failed ${id}`);
+    // Stop reading so the unread tee branch doesn't buffer the rest of the tarball.
+    await Promise.allSettled([reader.cancel(), ...writers.map((w) => w.abort())]);
+  } finally {
     try {
-      await env.BUCKET.delete(key);
+      await env.BUCKET.delete(tmp);
     } catch {
-      // nothing else to do
+      // best effort
     }
   }
 }
@@ -258,7 +273,8 @@ async function handleTarball(
 
   const serve = () => ctx.waitUntil(logServe(env, rc.projectId, ref, now).catch(() => console.warn(`serve log failed ${id}`)));
   const key = `npm/tar/${name}/${file}`;
-  const obj = await env.BUCKET.get(key);
+  // Only a verified copy (stored_at set) is served from R2; anything else goes upstream again.
+  const obj = state?.storedAt ? await env.BUCKET.get(key) : null;
   if (obj) {
     serve();
     return tarballResponse(obj.body);
@@ -284,7 +300,14 @@ async function handleTarball(
   }
   const dist = full.versions?.[version]?.dist;
   const tarballUrl: unknown = dist?.tarball;
-  if (typeof tarballUrl !== 'string' || !tarballUrl.startsWith('https://')) return err(404, `${id} not found`);
+  if (typeof tarballUrl !== 'string') return err(404, `${id} not found`);
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(tarballUrl);
+  } catch {
+    return err(404, 'unexpected tarball host');
+  }
+  if (parsedUrl.protocol !== 'https:' || parsedUrl.host !== UPSTREAM_HOST) return err(404, 'unexpected tarball host');
 
   let res: Response;
   try {
