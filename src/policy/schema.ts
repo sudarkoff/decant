@@ -1,4 +1,4 @@
-import { parsePackageId } from '../ids';
+import { parsePackageId, PROJECT_ID_RE } from '../ids';
 
 export type Severity = 'critical' | 'high' | 'moderate' | 'low';
 export type ShipMode = 'auto' | 'approve';
@@ -72,6 +72,7 @@ export function parsePolicy(input: unknown): { ok: true; policy: Policy } | { ok
 
   let project = '';
   if (typeof input.project !== 'string' || input.project === '') errors.push('project must be a non-empty string');
+  else if (!PROJECT_ID_RE.test(input.project)) errors.push(`project must match ${PROJECT_ID_RE.source}`);
   else project = input.project;
 
   let cooldownDays = 7;

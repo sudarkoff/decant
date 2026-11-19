@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { PROJECT_ID_RE } from '../src/ids';
 import { parsePolicy } from '../src/policy/schema';
 import { decide } from '../src/policy/decide';
 import schema from '../schema/policy.json';
@@ -19,6 +20,14 @@ describe('parsePolicy', () => {
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.errors.join()).toContain('cooldownDays');
     }
+  });
+  it('validates project against the Worker project id rule (PROJECT_ID_RE)', () => {
+    for (const p of ['My-Repo', '_x', '.x', 'a b', 'a'.repeat(65)]) {
+      const r = parsePolicy({ project: p });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.errors).toContain(`project must match ${PROJECT_ID_RE.source}`);
+    }
+    for (const p of ['my-repo', 'a.b_c', '0', 'a'.repeat(64)]) expect(parsePolicy({ project: p }).ok).toBe(true);
   });
   it('rejects unknown top-level keys but allows $schema', () => {
     expect(parsePolicy({ project: 't', foo: 1 }).ok).toBe(false);

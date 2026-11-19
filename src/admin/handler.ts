@@ -3,10 +3,10 @@ import { json } from '../http';
 import { verifyAdvisoryFix } from '../osv';
 import { parsePolicy, type Policy } from '../policy/schema';
 import { globalBlockStmt } from '../policy/store';
+import { PROJECT_ID_RE as ID_RE } from '../ids';
 import { formatPackageId, parsePackageId, type Deps, type Env, type PackageRef } from '../types';
 
 const MAX_BODY = 1024 * 1024;
-const ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SCANNER_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const RESULTS = new Set(['clean', 'flagged', 'malicious']);

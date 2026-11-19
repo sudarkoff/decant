@@ -2,6 +2,8 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { PROJECT_ID_RE } from '../../src/ids';
+import { defaultProject } from '../src/modes/adopt';
 import { run } from '../src/main';
 import { fakeDeps, fakeFetch, jsonRes, memFs, type FetchCall } from './fakes';
 
@@ -223,11 +225,23 @@ describe('adopt', () => {
     expect(await h.run()).toBe(1);
   });
 
-  it('invalid final policy (empty project): exit 1, no commit', async () => {
+  it('invalid default project (empty repo name): exit 1, clear error, no commit', async () => {
     const h = harness({ ...THREE, repo: 'o/' });
     expect(await h.run()).toBe(1);
-    expect(h.log()).toContain('invalid policy');
+    expect(h.log()).toContain('project "" is not a valid decant project id (must match ^[a-z0-9][a-z0-9._-]{0,63}$); set the project input');
     expect(h.commits).toEqual([]);
+  });
+
+  it('a repo name the Worker cannot use as a project id fails before any network call', async () => {
+    const h = harness({ ...THREE, repo: 'o/_private' });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('project "_private" is not a valid decant project id');
+    expect(h.f.calls).toEqual([]);
+  });
+
+  it('default project is the repo name lowercased', () => {
+    expect(defaultProject('Owner/My.Repo')).toBe('my.repo');
+    expect(PROJECT_ID_RE.test(defaultProject('Owner/My.Repo'))).toBe(true);
   });
 
   it('stale branch (422 on create): force-resets via updateRef then commits', async () => {

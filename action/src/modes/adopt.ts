@@ -1,5 +1,5 @@
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { formatPackageId } from '../../../src/ids';
+import { formatPackageId, PROJECT_ID_RE } from '../../../src/ids';
 import { parsePolicy } from '../../../src/policy/schema';
 import { defaultHeadCheckout } from '../checkout';
 import { error, mask, notice, setOutput } from '../gh-io';
@@ -18,6 +18,11 @@ type Entry = { package: string; reason: string; added: string };
 
 const safe = (s: string) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, '?');
 const ymd = (d: Date) => d.toISOString().slice(0, 10);
+
+/** The project id adopt writes when none is given: the repo name, lowercased. */
+export function defaultProject(repo: string): string {
+  return repo.slice(repo.indexOf('/') + 1).toLowerCase();
+}
 
 export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const env = deps.env;
@@ -59,9 +64,15 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     cooldownDays = parsed.policy.cooldownDays;
     existing = parsed.policy.allow;
   } else {
+    const project = inputs.project || defaultProject(repo);
+    if (!PROJECT_ID_RE.test(project)) {
+      return stop(
+        `project ${JSON.stringify(project)} is not a valid decant project id (must match ${PROJECT_ID_RE.source}); set the project input to your decant project`,
+      );
+    }
     raw = {
       $schema: SCHEMA,
-      project: inputs.project || repo.slice(repo.indexOf('/') + 1),
+      project,
       cooldownDays,
       allow: [],
       block: [],

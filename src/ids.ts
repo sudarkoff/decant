@@ -21,3 +21,6 @@ export function parsePackageId(id: string): PackageRef | null {
   if (at <= 0 || at === rest.length - 1) return null;
   return { eco, name: rest.slice(0, at), version: rest.slice(at + 1) };
 }
+
+/** A decant project id: what the Worker accepts on project creation and in policy.project. */
+export const PROJECT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
