@@ -1,5 +1,6 @@
 import { handleAdmin } from './admin/handler';
 import { authenticate, type RequestCtx } from './auth';
+import { runScheduled } from './cron';
 import { handleGo } from './go/handler';
 import { notFound, text } from './http';
 import { handleNpm } from './npm/handler';
@@ -51,7 +52,7 @@ export default {
   fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return handle(req, env, defaultDeps(), ctx);
   },
-  async scheduled(_event: ScheduledController, _env: Env, _ctx: ExecutionContext): Promise<void> {
-    // Cron sweep arrives in a later task.
+  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runScheduled(env, defaultDeps()));
   },
 };
