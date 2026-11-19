@@ -20,7 +20,7 @@ npx wrangler r2 bucket create decant
 npx wrangler d1 create decant
 ```
 
-`d1 create` prints a `database_id`. Paste it into `wrangler.jsonc`, replacing the all-zeros placeholder:
+`d1 create` prints a `database_id`. Paste it into `wrangler.jsonc`, replacing the all-zeros placeholder. (If you deploy from a fork you also push publicly, copy `wrangler.jsonc` to `wrangler.local.jsonc`, which is gitignored, edit that instead, and add `-c wrangler.local.jsonc` to every `wrangler` command below.)
 
 ```jsonc
 "d1_databases": [
