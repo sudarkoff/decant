@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { parsePolicy } from '../../../src/policy/schema';
 import { decant } from '../decant-client';
+import { isForkPr, readPayload, type Payload } from '../event';
 import { error, mask, notice, setOutput } from '../gh-io';
 import type { ModeCtx } from '../inputs';
 
@@ -9,11 +10,6 @@ function fail(msg: string): number {
   process.stderr.write(`${msg}\n`);
   return 1;
 }
-
-type Payload = {
-  pull_request?: { number?: number; head?: { repo?: { full_name?: string } | null } };
-  repository?: { default_branch?: string; full_name?: string };
-};
 
 export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const env = deps.env;
@@ -31,13 +27,11 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const parsed = parsePolicy(raw);
   if (!parsed.ok) return fail(`invalid policy:\n${parsed.errors.map((m) => `- ${m}`).join('\n')}`);
 
-  let payload: Payload = {};
-  if (env.GITHUB_EVENT_PATH) {
-    try {
-      payload = JSON.parse(await deps.fs.readFile(env.GITHUB_EVENT_PATH)) as Payload;
-    } catch {
-      return fail(`cannot read event payload at ${env.GITHUB_EVENT_PATH}`);
-    }
+  let payload: Payload;
+  try {
+    payload = await readPayload(deps);
+  } catch (e) {
+    return fail((e as Error).message);
   }
 
   const event = env.GITHUB_EVENT_NAME ?? '';
@@ -49,9 +43,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     ref = `pr-${n}`;
     token = inputs.token;
     if (!token) {
-      const head = payload.pull_request?.head?.repo;
-      const fork = !head || head.full_name !== payload.repository?.full_name;
-      if (fork) {
+      if (isForkPr(payload)) {
         notice('fork PR has no secrets; decant sync skipped');
         return 0;
       }

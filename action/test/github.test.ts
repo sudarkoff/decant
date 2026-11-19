@@ -343,3 +343,16 @@ describe('PRs and branches', () => {
     expect(JSON.parse(f.calls[2]!.body!).variables).toEqual({ id: 'PR_n', method: 'SQUASH' });
   });
 });
+
+describe('removeLabel', () => {
+  it('DELETEs the encoded label and treats 404 (already gone) as success', async () => {
+    const f = route({
+      [`DELETE ${R}/issues/5/labels/decant%3Areviewed`]: () => jsonRes([]),
+      [`DELETE ${R}/issues/6/labels/decant%3Areviewed`]: () => jsonRes({ message: 'Label does not exist' }, 404),
+    });
+    const gh = github(f, TOKEN, 'o/r');
+    await gh.removeLabel(5, 'decant:reviewed');
+    await gh.removeLabel(6, 'decant:reviewed');
+    expect(f.calls.map((c) => c.method)).toEqual(['DELETE', 'DELETE']);
+  });
+});

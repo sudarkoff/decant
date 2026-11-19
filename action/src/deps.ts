@@ -4,6 +4,7 @@ import { defaultExec, type Exec } from './exec';
 export type Fs = {
   readFile(p: string): Promise<string>;
   writeFile(p: string, data: string, mode?: number): Promise<void>;
+  writeBytes(p: string, data: Uint8Array): Promise<void>;
   readdir(p: string): Promise<{ name: string; isDir: boolean; isSymlink: boolean }[]>;
   exists(p: string): Promise<boolean>;
   mkdir(p: string): Promise<void>;
@@ -21,6 +22,7 @@ export type ActionDeps = {
 export const defaultFs: Fs = {
   readFile: (p) => nodeFs.readFile(p, 'utf8'),
   writeFile: (p, data, mode) => nodeFs.writeFile(p, data, mode === undefined ? undefined : { mode }),
+  writeBytes: (p, data) => nodeFs.writeFile(p, data),
   async readdir(p) {
     const entries = await nodeFs.readdir(p, { withFileTypes: true });
     return entries.map((e) => ({ name: e.name, isDir: e.isDirectory(), isSymlink: e.isSymbolicLink() }));

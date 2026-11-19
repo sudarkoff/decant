@@ -165,6 +165,15 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
       return toPr(await json<RawPr>('GET', `${R}/pulls/${n}`));
     },
 
+    /** Removes `label` from issue/PR `n`; a label that is already gone (404) is not an error. */
+    async removeLabel(n: number, label: string): Promise<void> {
+      try {
+        await rest('DELETE', `${R}/issues/${n}/labels/${encodeURIComponent(label)}`);
+      } catch (e) {
+        if (!/HTTP 404/.test((e as Error).message)) throw e;
+      }
+    },
+
     async prLabels(n: number): Promise<string[]> {
       return (await paged<{ name: string }>(`${R}/issues/${n}/labels?per_page=100`)).map((l) => l.name);
     },

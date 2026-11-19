@@ -1,13 +1,18 @@
 import type { ActionDeps, Fs } from '../src/deps';
 import type { Exec } from '../src/exec';
 
-export function memFs(files: Record<string, string> = {}, symlinks: string[] = []): Fs & { files: Map<string, string>; modes: Map<string, number> } {
+export function memFs(files: Record<string, string> = {}, symlinks: string[] = []): Fs & { files: Map<string, string>; modes: Map<string, number>; bytes: Map<string, Uint8Array> } {
   const modes = new Map<string, number>();
+  const bytes = new Map<string, Uint8Array>();
   const m = new Map(Object.entries(files));
   const dirs = new Set<string>();
   return {
     files: m,
     modes,
+    bytes,
+    async writeBytes(p, data) {
+      bytes.set(p, data);
+    },
     async chmod(p, mode) {
       modes.set(p, mode);
     },

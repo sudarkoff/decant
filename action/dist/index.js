@@ -31,6 +31,7 @@ var defaultExec = (cmd, args, opts = {}) => new Promise((resolve) => {
 var defaultFs = {
   readFile: (p) => nodeFs.readFile(p, "utf8"),
   writeFile: (p, data, mode) => nodeFs.writeFile(p, data, mode === void 0 ? void 0 : { mode }),
+  writeBytes: (p, data) => nodeFs.writeFile(p, data),
   async readdir(p) {
     const entries = await nodeFs.readdir(p, { withFileTypes: true });
     return entries.map((e) => ({ name: e.name, isDir: e.isDirectory(), isSymlink: e.isSymbolicLink() }));
@@ -146,64 +147,16 @@ var run2 = (ctx) => notImplemented(ctx);
 // action/src/modes/scan.ts
 var scan_exports = {};
 __export(scan_exports, {
+  MARKER: () => MARKER,
   run: () => run3
 });
-var run3 = (ctx) => notImplemented(ctx);
-
-// action/src/modes/setup.ts
-var setup_exports = {};
-__export(setup_exports, {
-  run: () => run4
-});
-function fail(msg) {
-  error(msg);
-  process.stderr.write(`${msg}
-`);
-  return 1;
-}
-async function run4({ deps, inputs }) {
-  mask(inputs.token);
-  const env = deps.env;
-  const home = env.HOME;
-  if (!home) return fail("HOME is not set");
-  const npmrc = `${home}/.npmrc`;
-  const netrc = `${home}/.netrc`;
-  if (inputs.bypass) {
-    const reason = inputs.bypassReason.trim();
-    if (!reason) return fail("bypass requires bypass-reason");
-    await deps.fs.writeFile(npmrc, "registry=https://registry.npmjs.org/\nignore-scripts=true\n");
-    exportVar("GOPROXY", "https://proxy.golang.org", env);
-    const actor = env.GITHUB_ACTOR ?? "";
-    warning(`decant BYPASSED by ${actor}: ${reason}`);
-    const runUrl = `${env.GITHUB_SERVER_URL ?? ""}/${env.GITHUB_REPOSITORY ?? ""}/actions/runs/${env.GITHUB_RUN_ID ?? ""}`;
-    appendSummary(`## \u26A0\uFE0F decant bypassed
-
-Actor: ${actor} \xB7 Reason: ${reason} \xB7 Run: ${runUrl}`, env);
-    return 0;
-  }
-  if (!inputs.token) return fail("token is required (read token)");
-  const base = inputs.decantUrl.replace(/\/+$/, "");
-  const host = new URL(base).host;
-  await deps.fs.writeFile(npmrc, `registry=${base}/npm/
-//${host}/npm/:_authToken=${inputs.token}
-ignore-scripts=true
-`, 384);
-  await deps.fs.writeFile(netrc, `machine ${host} login decant password ${inputs.token}
-`, 384);
-  await deps.fs.chmod(npmrc, 384);
-  await deps.fs.chmod(netrc, 384);
-  exportVar("GOPROXY", `${base}/go`, env);
-  return 0;
-}
-
-// action/src/modes/sync.ts
-var sync_exports = {};
-__export(sync_exports, {
-  run: () => run5
-});
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 // src/ids.ts
+function formatPackageId(p) {
+  return `${p.eco}:${p.name}@${p.version}`;
+}
 function parsePackageId(id) {
   const colon = id.indexOf(":");
   if (colon < 0) return null;
@@ -282,15 +235,15 @@ function parsePolicy(input) {
   }
   const allow = [];
   const block = [];
-  for (const [key, withAdded] of [["allow", true], ["block", false]]) {
-    const raw = input[key];
+  for (const [key2, withAdded] of [["allow", true], ["block", false]]) {
+    const raw = input[key2];
     if (raw === void 0) continue;
     if (!Array.isArray(raw)) {
-      errors.push(`${key} must be an array`);
+      errors.push(`${key2} must be an array`);
       continue;
     }
     raw.forEach((r, i) => {
-      const e = entry(r, `${key}[${i}]`, withAdded, errors);
+      const e = entry(r, `${key2}[${i}]`, withAdded, errors);
       if (e) (withAdded ? allow : block).push(e);
     });
   }
@@ -305,6 +258,7 @@ function escapeModulePath(p) {
 
 // action/src/http.ts
 var TIMEOUT_MS = 3e4;
+var OSV_TIMEOUT_MS = 1e4;
 function redact(s, secrets) {
   let out = s;
   for (const sec of secrets) {
@@ -440,8 +394,1022 @@ function decant(f, url, token) {
   };
 }
 
-// action/src/modes/sync.ts
+// action/src/event.ts
+async function readPayload(deps) {
+  const p = deps.env.GITHUB_EVENT_PATH;
+  if (!p) return {};
+  try {
+    return JSON.parse(await deps.fs.readFile(p));
+  } catch {
+    throw new Error(`cannot read event payload at ${p}`);
+  }
+}
+function isForkPr(payload) {
+  const head = payload.pull_request?.head?.repo;
+  return !head || head.full_name !== payload.repository?.full_name;
+}
+
+// action/src/github.ts
+var API = "https://api.github.com";
+var MAX_PAGES = 10;
+var WRITE_ROLES = /* @__PURE__ */ new Set(["admin", "maintain", "write"]);
+function toPr(p) {
+  return {
+    number: p.number,
+    nodeId: p.node_id,
+    title: p.title,
+    body: p.body ?? "",
+    state: p.state,
+    draft: p.draft ?? false,
+    author: p.user?.login ?? "",
+    labels: (p.labels ?? []).map((l) => l.name),
+    headRef: p.head.ref,
+    headSha: p.head.sha,
+    baseRef: p.base.ref,
+    baseSha: p.base.sha
+  };
+}
+function nextLink(link) {
+  if (!link) return null;
+  for (const part of link.split(",")) {
+    const m = /<([^>]+)>\s*;\s*rel="?next"?/.exec(part);
+    if (m) return m[1];
+  }
+  return null;
+}
+function github(f, token, repo, opts = {}) {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error(`repo must be owner/name, got ${JSON.stringify(repo)}`);
+  const owner = repo.slice(0, repo.indexOf("/"));
+  const R = `/repos/${repo}`;
+  const secrets = [token];
+  const lc = (s) => (s ?? "").toLowerCase();
+  const isMine = (u) => opts.selfLogin ? u?.login === opts.selfLogin : u?.type === "Bot";
+  async function rest(method, pathOrUrl, body) {
+    const url = pathOrUrl.startsWith("https://") ? pathOrUrl : `${API}${pathOrUrl}`;
+    const u = new URL(url);
+    if (u.origin !== API) throw new Error(`GitHub: refusing to send credentials to another host (${u.host})`);
+    const headers = {
+      authorization: `Bearer ${token}`,
+      accept: "application/vnd.github+json",
+      "x-github-api-version": "2022-11-28",
+      "user-agent": "decant-action"
+    };
+    if (body !== void 0) headers["content-type"] = "application/json";
+    const label = `GitHub ${method} ${u.pathname}`;
+    const res = await request(f, url, { method, headers, body: body === void 0 ? void 0 : JSON.stringify(body) }, { label, timeoutMs: TIMEOUT_MS, secrets });
+    if (!res.ok) throw await httpError(res, { label, secrets });
+    return res;
+  }
+  async function json(method, path, body) {
+    return readJson(await rest(method, path, body), `GitHub ${method} ${path}`);
+  }
+  async function findPaged(path, match) {
+    let url = path;
+    for (let page = 0; url; page++) {
+      if (page >= MAX_PAGES) return { hit: null, capped: true };
+      const res = await rest("GET", url);
+      const hit = (await readJson(res, `GitHub GET ${path}`)).find(match);
+      if (hit) return { hit, capped: false };
+      url = nextLink(res.headers.get("link"));
+    }
+    return { hit: null, capped: false };
+  }
+  async function paged(path) {
+    const out = [];
+    let url = path;
+    for (let page = 0; url; page++) {
+      if (page >= MAX_PAGES) throw new Error(`GitHub GET ${path.split("?")[0]}: more than ${MAX_PAGES} pages`);
+      const res = await rest("GET", url);
+      out.push(...await readJson(res, `GitHub GET ${path}`));
+      url = nextLink(res.headers.get("link"));
+    }
+    return out;
+  }
+  async function graphql(query, variables) {
+    const r = await json("POST", "/graphql", { query, variables });
+    if (r.errors?.length) throw new Error(`GitHub GraphQL: ${r.errors.map((e) => e.message ?? "error").join("; ")}`.replaceAll(token, "***"));
+    if (!r.data) throw new Error("GitHub GraphQL: no data");
+    return r.data;
+  }
+  async function writerCanAct(login) {
+    let r;
+    try {
+      r = await json("GET", `${R}/collaborators/${encodeURIComponent(login)}/permission`);
+    } catch (e) {
+      if (/HTTP 404/.test(e.message)) return false;
+      throw e;
+    }
+    return WRITE_ROLES.has(r.permission ?? "") || WRITE_ROLES.has(r.role_name ?? "");
+  }
+  return {
+    graphql,
+    async defaultBranch() {
+      return (await json("GET", R)).default_branch;
+    },
+    async getPr(n) {
+      return toPr(await json("GET", `${R}/pulls/${n}`));
+    },
+    /** Removes `label` from issue/PR `n`; a label that is already gone (404) is not an error. */
+    async removeLabel(n, label) {
+      try {
+        await rest("DELETE", `${R}/issues/${n}/labels/${encodeURIComponent(label)}`);
+      } catch (e) {
+        if (!/HTTP 404/.test(e.message)) throw e;
+      }
+    },
+    async prLabels(n) {
+      return (await paged(`${R}/issues/${n}/labels?per_page=100`)).map((l) => l.name);
+    },
+    /**
+     * True if `label` is on the PR now, its most recent `labeled` event has no later `unlabeled`,
+     * and that event's actor has admin, maintain or write permission. Label names compare case-insensitively.
+     */
+    async labelAddedByWriter(n, label) {
+      const want = lc(label);
+      const current = await paged(`${R}/issues/${n}/labels?per_page=100`);
+      if (!current.some((l) => lc(l.name) === want)) return false;
+      const events = await paged(
+        `${R}/issues/${n}/timeline?per_page=100`
+      );
+      let adder = null;
+      for (const e of events) {
+        if (lc(e.label?.name) !== want) continue;
+        if (e.event === "labeled") adder = e.actor?.login ?? null;
+        else if (e.event === "unlabeled") adder = null;
+      }
+      return adder !== null && writerCanAct(adder);
+    },
+    /** Edits the first comment containing `marker`, else posts one. The body always carries the marker. */
+    async upsertComment(n, marker, body) {
+      const text = body.includes(marker) ? body : `${marker}
+${body}`;
+      const { hit, capped } = await findPaged(
+        `${R}/issues/${n}/comments?per_page=100`,
+        (c2) => isMine(c2.user) && (c2.body ?? "").includes(marker)
+      );
+      if (capped) warning(`decant: #${n} has more than ${MAX_PAGES} pages of comments; posting a new report comment`);
+      if (hit) {
+        await rest("PATCH", `${R}/issues/comments/${hit.id}`, { body: text });
+        return { id: hit.id, created: false };
+      }
+      const c = await json("POST", `${R}/issues/${n}/comments`, { body: text });
+      return { id: c.id, created: true };
+    },
+    async findOpenPr(head) {
+      const q = `head=${encodeURIComponent(`${owner}:${head}`)}`;
+      const prs = await json("GET", `${R}/pulls?state=open&${q}&per_page=100`);
+      return prs[0] ? toPr(prs[0]) : null;
+    },
+    async createBranch(name, fromSha) {
+      await rest("POST", `${R}/git/refs`, { ref: `refs/heads/${name}`, sha: fromSha });
+    },
+    /** One signed commit via createCommitOnBranch. Fails if the branch head is not expectedHeadOid. Returns the new oid. */
+    async commitFiles(branch, expectedHeadOid, message, files) {
+      const nl = message.indexOf("\n");
+      const headline = nl < 0 ? message : message.slice(0, nl);
+      const rest_ = nl < 0 ? "" : message.slice(nl + 1).replace(/^\n+/, "");
+      const input = {
+        branch: { repositoryNameWithOwner: repo, branchName: branch },
+        expectedHeadOid,
+        message: rest_ ? { headline, body: rest_ } : { headline },
+        fileChanges: { additions: files.map((x) => ({ path: x.path, contents: Buffer.from(x.contents, "utf8").toString("base64") })) }
+      };
+      const d = await graphql(
+        "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+        { input }
+      );
+      return d.createCommitOnBranch.commit.oid;
+    },
+    async openPr(p) {
+      const pr = await json("POST", `${R}/pulls`, {
+        head: p.head,
+        base: p.base,
+        title: p.title,
+        body: p.body
+      });
+      if (p.labels?.length) await rest("POST", `${R}/issues/${pr.number}/labels`, { labels: p.labels });
+      return { number: pr.number, nodeId: pr.node_id, url: pr.html_url };
+    },
+    async enableAutoMerge(prNodeId, method = "SQUASH") {
+      await graphql(
+        "mutation($id: ID!, $method: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method }) { clientMutationId } }",
+        { id: prNodeId, method }
+      );
+    },
+    /**
+     * Updates the body of our open issue titled exactly `title`, else creates it with `labels`.
+     * Matches on title and author only (not labels), so a removed label never causes a duplicate.
+     */
+    async upsertIssue(title, body, labels) {
+      const match = (i2) => i2.pull_request === void 0 && i2.title === title && isMine(i2.user);
+      const list = `${R}/issues?state=open&per_page=100`;
+      const queries = opts.selfLogin ? [`${list}&creator=${encodeURIComponent(opts.selfLogin)}`] : labels.length ? [`${list}&labels=${encodeURIComponent(labels.join(","))}`, list] : [list];
+      let hit = null;
+      for (const q of queries) {
+        const r = await findPaged(q, match);
+        if (r.capped) warning(`decant: more than ${MAX_PAGES} pages of open issues; may create a duplicate of "${title}"`);
+        if (hit = r.hit) break;
+      }
+      if (hit) {
+        await rest("PATCH", `${R}/issues/${hit.number}`, { body });
+        return { number: hit.number, created: false };
+      }
+      const i = await json("POST", `${R}/issues`, { title, body, labels });
+      return { number: i.number, created: true };
+    },
+    async closeIssue(n) {
+      await rest("PATCH", `${R}/issues/${n}`, { state: "closed", state_reason: "completed" });
+    }
+  };
+}
+
+// action/src/guarddog.ts
+var GUARDDOG_VERSION = "3.2.0";
+function tail(s) {
+  return s.trim().split("\n").slice(-5).join(" ").slice(0, 500);
+}
+async function installGuardDog(exec, dir, actionPath) {
+  const venv = await exec("python3", ["-m", "venv", dir]);
+  if (venv.code !== 0) throw new Error(`python3 -m venv failed: ${tail(venv.stderr)}`);
+  const req = `${actionPath.replace(/\/+$/, "")}/guarddog-requirements.txt`;
+  const pip = await exec(`${dir}/bin/pip`, [
+    "install",
+    "--disable-pip-version-check",
+    "--require-hashes",
+    "--no-deps",
+    "--only-binary",
+    ":all:",
+    "-r",
+    req
+  ]);
+  if (pip.code !== 0) throw new Error(`pip install of GuardDog failed: ${tail(pip.stderr)}`);
+  return { bin: `${dir}/bin/guarddog` };
+}
+var hasFindings = (v) => Array.isArray(v) ? v.length > 0 : typeof v === "object" && v !== null ? Object.keys(v).length > 0 : typeof v === "string" ? v !== "" : !!v;
+function parseGuardDogJson(stdout) {
+  let doc;
+  try {
+    doc = JSON.parse(stdout);
+  } catch {
+    throw new Error("guarddog: invalid JSON output");
+  }
+  if (doc.errors && typeof doc.errors === "object" && Object.keys(doc.errors).length > 0) {
+    throw new Error(`guarddog reported errors: ${Object.keys(doc.errors).join(", ")}`);
+  }
+  if (!doc.results || typeof doc.results !== "object") throw new Error("guarddog: no results in output");
+  const details = [];
+  for (const [rule, v] of Object.entries(doc.results).sort(([a], [b]) => a < b ? -1 : 1)) {
+    if (rule.startsWith("capability-") || !hasFindings(v)) continue;
+    details.push(Array.isArray(v) ? `${rule} (${v.length})` : rule);
+  }
+  if (Array.isArray(doc.risks) && doc.risks.length > 0) {
+    const label = typeof doc.risk_score?.label === "string" ? doc.risk_score.label : "unlabelled";
+    details.push(`risk: ${label}`);
+  }
+  return { result: details.length > 0 ? "flagged" : "clean", details };
+}
+async function scan(exec, bin, eco, path) {
+  const r = await exec(bin, [eco, "scan", path, "--output-format", "json", "--sandbox"]);
+  if (r.code !== 0) throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+  return parseGuardDogJson(r.stdout);
+}
+var scanNpm = (exec, bin, tgzPath) => scan(exec, bin, "npm", tgzPath);
+var scanGo = (exec, bin, zipPath) => scan(exec, bin, "go", zipPath);
+
+// action/src/lockfiles.ts
+var NPM_REGISTRY = "https://registry.npmjs.org/";
+var SKIP_DIRS = /* @__PURE__ */ new Set(["node_modules", ".git", "vendor"]);
+var LOCKFILES = /* @__PURE__ */ new Set(["package-lock.json", "go.sum"]);
+async function findLockfiles(root, fs) {
+  const out = [];
+  const base = root.replace(/\/+$/, "");
+  async function walk(rel) {
+    const entries = await fs.readdir(rel ? `${base}/${rel}` : base);
+    for (const e of entries) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isSymlink) continue;
+      if (e.isDir) {
+        if (!SKIP_DIRS.has(e.name)) await walk(r);
+      } else if (LOCKFILES.has(e.name)) {
+        out.push(r);
+      }
+    }
+  }
+  await walk("");
+  return out.sort();
+}
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\\/]/g, "\\$&");
+}
+function decantPrefix(decantUrl) {
+  return new RegExp(`^${escapeRe(decantUrl.replace(/\/+$/, ""))}(/r/[A-Za-z0-9._-]{1,64})?/npm/`);
+}
+function tarballMatches(resolved, name, version) {
+  let path;
+  try {
+    path = decodeURIComponent(new URL(resolved).pathname);
+  } catch {
+    return false;
+  }
+  const base = name.slice(name.lastIndexOf("/") + 1);
+  return path === `/${name}/-/${base}-${version}.tgz`;
+}
+function parsePackageLock(text, file, decantUrl) {
+  const lock = JSON.parse(text);
+  if (!lock.packages || (lock.lockfileVersion ?? 1) < 2) {
+    throw new Error("regenerate package-lock.json with npm 7 or newer");
+  }
+  const prefix = decantUrl ? decantPrefix(decantUrl) : null;
+  const deps = [];
+  for (const [key2, entry2] of Object.entries(lock.packages)) {
+    if (key2 === "" || entry2.link || entry2.inBundle) continue;
+    const idx = key2.lastIndexOf("node_modules/");
+    if (idx < 0) continue;
+    const name = entry2.name ?? key2.slice(idx + "node_modules/".length);
+    const resolved = entry2.resolved;
+    const registry = !!entry2.version && (resolved === void 0 || resolved.startsWith(NPM_REGISTRY) || (prefix?.test(resolved) ?? false));
+    const dep = { eco: "npm", name, version: entry2.version ?? "", file, source: registry ? "registry" : "other" };
+    if (resolved !== void 0) dep.resolved = prefix ? resolved.replace(prefix, NPM_REGISTRY) : resolved;
+    if (entry2.integrity !== void 0) dep.integrity = entry2.integrity;
+    if (dep.source === "registry" && dep.resolved !== void 0 && !tarballMatches(dep.resolved, name, dep.version)) {
+      dep.source = "other";
+      dep.mismatch = true;
+    }
+    deps.push(dep);
+  }
+  return deps;
+}
+function parseGoSum(text, file) {
+  const seen = /* @__PURE__ */ new Set();
+  const deps = [];
+  for (const line of text.split(/\r?\n/)) {
+    const parts = line.trim().split(/\s+/);
+    if (parts.length !== 3) continue;
+    const [name, version, hash] = parts;
+    if (version.endsWith("/go.mod") || !version.startsWith("v") || !hash.startsWith("h1:")) continue;
+    const k = `${name}@${version}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    deps.push({ eco: "go", name, version, file, source: "registry" });
+  }
+  return deps;
+}
+var key = (d) => d.eco === "npm" ? `npm:${d.name}@${d.version}|${d.source}|${d.resolved ?? ""}|${d.integrity ?? ""}` : `${d.eco}:${d.name}@${d.version}`;
+function diffDeps(base, head) {
+  const have = new Set(base.map(key));
+  const out = /* @__PURE__ */ new Map();
+  for (const d of head) {
+    const k = key(d);
+    if (!have.has(k) && !out.has(k)) out.set(k, d);
+  }
+  return [...out].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, d]) => d);
+}
+function resolvedRe(decantUrl) {
+  return new RegExp(`("resolved"\\s*:\\s*")${escapeRe(decantUrl.replace(/\/+$/, ""))}(?:/r/[A-Za-z0-9._-]{1,64})?/npm/`, "g");
+}
+function containsDecantUrls(text, decantUrl) {
+  return new RegExp(resolvedRe(decantUrl).source).test(text);
+}
+
+// src/semver.ts
+var NUM = "(0|[1-9]\\d*)";
+var PRE_ID = "(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)";
+var RE = new RegExp(
+  `^${NUM}\\.${NUM}\\.${NUM}(?:-(${PRE_ID}(?:\\.${PRE_ID})*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`
+);
+function parseVersion(v, eco) {
+  let s = v;
+  if (eco === "go") {
+    if (!s.startsWith("v")) return null;
+    s = s.slice(1);
+  }
+  const m = RE.exec(s);
+  if (!m) return null;
+  const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (![major, minor, patch].every(Number.isSafeInteger)) return null;
+  return { major, minor, patch, pre: m[4] ? m[4].split(".") : [] };
+}
+var isNum = (s) => /^\d+$/.test(s);
+function cmpId(a, b) {
+  const an = isNum(a);
+  const bn = isNum(b);
+  if (an && bn) {
+    const x = BigInt(a);
+    const y = BigInt(b);
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
+  if (an) return -1;
+  if (bn) return 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+function cmpParsed(a, b) {
+  if (a.major !== b.major) return a.major < b.major ? -1 : 1;
+  if (a.minor !== b.minor) return a.minor < b.minor ? -1 : 1;
+  if (a.patch !== b.patch) return a.patch < b.patch ? -1 : 1;
+  if (a.pre.length === 0 || b.pre.length === 0) {
+    return a.pre.length === b.pre.length ? 0 : a.pre.length === 0 ? 1 : -1;
+  }
+  const n = Math.min(a.pre.length, b.pre.length);
+  for (let i = 0; i < n; i++) {
+    const c = cmpId(a.pre[i], b.pre[i]);
+    if (c !== 0) return c;
+  }
+  return a.pre.length === b.pre.length ? 0 : a.pre.length < b.pre.length ? -1 : 1;
+}
+function compareVersions(a, b, eco) {
+  const pa = parseVersion(a, eco);
+  const pb = parseVersion(b, eco);
+  if (!pa || !pb) return pa ? 1 : pb ? -1 : 0;
+  return cmpParsed(pa, pb);
+}
+
+// action/src/osv.ts
+var OSV = "https://api.osv.dev";
+var OSV_ECO = { npm: "npm", go: "Go" };
+var BATCH = 1e3;
+var MAX_PAGES2 = 10;
+var DETAIL_CONCURRENCY = 8;
+function depKey(d) {
+  return `${d.eco}:${d.name}@${d.version}`;
+}
+var GHSA_SEVERITY = { CRITICAL: "critical", HIGH: "high", MODERATE: "moderate", MEDIUM: "moderate", LOW: "low" };
+var RANK = { unknown: 0, low: 1, moderate: 2, high: 3, critical: 4 };
+function maxSeverity(...s) {
+  return s.reduce((a, b) => RANK[b] > RANK[a] ? b : a, "unknown");
+}
+var CVSS_W = {
+  AV: { N: 0.85, A: 0.62, L: 0.55, P: 0.2 },
+  AC: { L: 0.77, H: 0.44 },
+  UI: { N: 0.85, R: 0.62 },
+  CIA: { H: 0.56, L: 0.22, N: 0 }
+};
+function roundup(x) {
+  const i = Math.round(x * 1e5);
+  return i % 1e4 === 0 ? i / 1e5 : (Math.floor(i / 1e4) + 1) / 10;
+}
+function cvss31BaseScore(vector) {
+  const parts = vector.split("/");
+  if (parts[0] !== "CVSS:3.1" && parts[0] !== "CVSS:3.0") return null;
+  const m = {};
+  for (const p of parts.slice(1)) {
+    const [k, v] = p.split(":");
+    if (k && v) m[k] = v;
+  }
+  const S = m.S;
+  if (S !== "U" && S !== "C") return null;
+  const av = CVSS_W.AV[m.AV];
+  const ac = CVSS_W.AC[m.AC];
+  const ui = CVSS_W.UI[m.UI];
+  const pr = { N: 0.85, L: S === "C" ? 0.68 : 0.62, H: S === "C" ? 0.5 : 0.27 }[m.PR];
+  const [c, i, a] = [m.C, m.I, m.A].map((x) => CVSS_W.CIA[x]);
+  if ([av, ac, ui, pr, c, i, a].some((x) => x === void 0)) return null;
+  const iss = 1 - (1 - c) * (1 - i) * (1 - a);
+  const impact = S === "U" ? 6.42 * iss : 7.52 * (iss - 0.029) - 3.25 * Math.pow(iss - 0.02, 15);
+  const expl = 8.22 * av * ac * pr * ui;
+  if (impact <= 0) return 0;
+  return roundup(Math.min((S === "U" ? 1 : 1.08) * (impact + expl), 10));
+}
+function scoreSeverity(score) {
+  return score >= 9 ? "critical" : score >= 7 ? "high" : score >= 4 ? "moderate" : score > 0 ? "low" : "unknown";
+}
+function ownSeverity(r) {
+  const sev = r.database_specific?.severity;
+  const db = typeof sev === "string" ? GHSA_SEVERITY[sev.toUpperCase()] ?? "unknown" : "unknown";
+  const cvss = (r.severity ?? []).filter((x) => x.type === "CVSS_V3" && typeof x.score === "string").map((x) => cvss31BaseScore(x.score)).map((n) => n === null ? "unknown" : scoreSeverity(n));
+  return maxSeverity(db, ...cvss);
+}
+var withV = (eco, v) => eco === "go" && !v.startsWith("v") ? `v${v}` : v;
+function rangeCover(events, eco, version) {
+  const cmp = (a, b) => compareVersions(a, b, eco);
+  const pos = (e) => {
+    const raw = e.introduced ?? e.fixed ?? e.last_affected ?? e.limit;
+    if (raw === void 0) return null;
+    return raw === "0" && e.introduced !== void 0 ? null : withV(eco, raw);
+  };
+  const sorted = [...events].sort((a, b) => {
+    const pa = pos(a);
+    const pb = pos(b);
+    if (pa === null || pb === null) return pa === pb ? 0 : pa === null ? -1 : 1;
+    return cmp(pa, pb);
+  });
+  let start;
+  let best = { covered: false };
+  const inside = (lo) => lo === null || cmp(version, lo) >= 0;
+  for (const e of sorted) {
+    if (e.introduced !== void 0) {
+      if (start === void 0) start = e.introduced === "0" ? null : withV(eco, e.introduced);
+      continue;
+    }
+    if (start === void 0) continue;
+    if (e.fixed !== void 0 || e.limit !== void 0) {
+      const end = withV(eco, e.fixed ?? e.limit);
+      if (inside(start) && cmp(version, end) < 0) {
+        if (e.fixed !== void 0) return { covered: true, fixed: end };
+        best = { covered: true, fixed: null };
+      }
+      start = void 0;
+    } else if (e.last_affected !== void 0) {
+      if (inside(start) && cmp(version, withV(eco, e.last_affected)) <= 0) best = { covered: true, fixed: null };
+      start = void 0;
+    }
+  }
+  if (start !== void 0 && inside(start)) best = { covered: true, fixed: null };
+  return best;
+}
+function toVuln(r) {
+  const entries = (eco, name) => (r.affected ?? []).filter((a) => a.package?.ecosystem === OSV_ECO[eco] && a.package?.name === name);
+  function cover(eco, name, version) {
+    let covered = false;
+    const parsable = parseVersion(version, eco) !== null;
+    for (const a of entries(eco, name)) {
+      for (const rg of parsable ? a.ranges ?? [] : []) {
+        if (rg.type !== "SEMVER" && rg.type !== "ECOSYSTEM") continue;
+        const c = rangeCover(rg.events ?? [], eco, version);
+        if (c.covered && c.fixed !== null) return c;
+        covered ||= c.covered;
+      }
+      if ((a.versions ?? []).some((v) => withV(eco, v) === version)) covered = true;
+    }
+    return covered ? { covered: true, fixed: null } : { covered: false };
+  }
+  return {
+    id: r.id,
+    aliases: r.aliases ?? [],
+    severity: ownSeverity(r),
+    summary: r.summary ?? r.details?.split("\n")[0] ?? "",
+    malicious: r.id.startsWith("MAL-"),
+    fixedFor(eco, name, version) {
+      const c = cover(eco, name, version);
+      return c.covered ? c.fixed : null;
+    },
+    affects: (eco, name, version) => cover(eco, name, version).covered
+  };
+}
+function mergeAliases(vulns) {
+  const parent = vulns.map((_, i) => i);
+  const find = (i) => parent[i] === i ? i : parent[i] = find(parent[i]);
+  const owner = /* @__PURE__ */ new Map();
+  vulns.forEach((v, i) => {
+    for (const name of [v.id, ...v.aliases]) {
+      const j = owner.get(name);
+      if (j === void 0) owner.set(name, i);
+      else parent[find(i)] = find(j);
+    }
+  });
+  const groups = /* @__PURE__ */ new Map();
+  vulns.forEach((v, i) => {
+    const g = groups.get(find(i)) ?? [];
+    g.push(v);
+    groups.set(find(i), g);
+  });
+  return [...groups.values()].map((g) => {
+    if (g.length === 1) return g[0];
+    const primary = g.find((v) => v.id.startsWith("GHSA-")) ?? g[0];
+    const names = new Set(g.flatMap((v) => [v.id, ...v.aliases]));
+    names.delete(primary.id);
+    return {
+      id: primary.id,
+      aliases: [...names],
+      severity: maxSeverity(...g.map((v) => v.severity)),
+      summary: primary.summary || (g.find((v) => v.summary)?.summary ?? ""),
+      malicious: g.some((v) => v.malicious),
+      // Highest fix across the group: a lower one would leave another member's advisory open.
+      fixedFor: (eco, name, version) => {
+        let best = null;
+        for (const v of g) {
+          const x = v.fixedFor(eco, name, version);
+          if (x !== null && (best === null || compareVersions(x, best, eco) > 0)) best = x;
+        }
+        return best;
+      },
+      affects: (eco, name, version) => g.some((v) => v.affects(eco, name, version))
+    };
+  });
+}
+function createOsv(f) {
+  const details = /* @__PURE__ */ new Map();
+  async function post(path, body) {
+    const label = `OSV POST ${path}`;
+    const res = await request(
+      f,
+      `${OSV}${path}`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) },
+      { label, timeoutMs: OSV_TIMEOUT_MS }
+    );
+    if (!res.ok) throw await httpError(res, { label });
+    return readJson(res, label);
+  }
+  function vuln(id) {
+    let p = details.get(id);
+    if (!p) {
+      const label = `OSV GET /v1/vulns/${id}`;
+      p = (async () => {
+        const res = await request(f, `${OSV}/v1/vulns/${encodeURIComponent(id)}`, {}, { label, timeoutMs: OSV_TIMEOUT_MS });
+        if (res.status === 404) return null;
+        if (!res.ok) throw await httpError(res, { label });
+        return toVuln(await readJson(res, label));
+      })();
+      p.catch(() => details.delete(id));
+      details.set(id, p);
+    }
+    return p;
+  }
+  async function queryVulns(deps) {
+    const unique = /* @__PURE__ */ new Map();
+    for (const d of deps) unique.set(depKey(d), d);
+    const keys = [...unique.keys()];
+    const ids = new Map(keys.map((k) => [k, /* @__PURE__ */ new Set()]));
+    for (let i = 0; i < keys.length; i += BATCH) {
+      let pending = keys.slice(i, i + BATCH).map((k) => {
+        const d = unique.get(k);
+        const q = { package: { ecosystem: OSV_ECO[d.eco], name: d.name }, version: d.eco === "go" ? d.version.replace(/^v/, "") : d.version };
+        return { k, q };
+      });
+      for (let page = 0; pending.length > 0; page++) {
+        if (page >= MAX_PAGES2) throw new Error(`OSV: more than ${MAX_PAGES2} pages of results`);
+        const r = await post("/v1/querybatch", { queries: pending.map((p) => p.q) });
+        const next = [];
+        pending.forEach((p, j) => {
+          const res = r.results?.[j];
+          for (const v of res?.vulns ?? []) ids.get(p.k).add(v.id);
+          if (res?.next_page_token) next.push({ k: p.k, q: { ...p.q, page_token: res.next_page_token } });
+        });
+        pending = next;
+      }
+    }
+    const all = [...new Set([...ids.values()].flatMap((s) => [...s]))];
+    for (let i = 0; i < all.length; i += DETAIL_CONCURRENCY) await Promise.all(all.slice(i, i + DETAIL_CONCURRENCY).map(vuln));
+    const resolved = /* @__PURE__ */ new Map();
+    for (const id of all) {
+      const v = await vuln(id);
+      if (!v) continue;
+      const ghsa = v.aliases.filter((a) => a.startsWith("GHSA-") && a !== v.id);
+      const alts = await Promise.all(ghsa.map((a) => vuln(a)));
+      const severity = maxSeverity(v.severity, ...alts.map((a) => a?.severity ?? "unknown"));
+      resolved.set(id, severity === v.severity ? v : { ...v, severity });
+    }
+    const out = /* @__PURE__ */ new Map();
+    for (const [k, s] of ids) {
+      out.set(k, mergeAliases([...s].flatMap((id) => resolved.get(id) ?? [])));
+    }
+    return out;
+  }
+  return { queryVulns, vuln };
+}
+
+// action/src/registries.ts
+var NPM = "https://registry.npmjs.org";
+var GOPROXY = "https://proxy.golang.org";
+function toDate(v) {
+  if (typeof v !== "string") return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+async function npmPublishTime(f, name, version) {
+  const label = `npm registry GET ${name}`;
+  const res = await request(f, `${NPM}/${name.replace("/", "%2f")}`, { headers: { accept: "application/json" } }, { label, timeoutMs: TIMEOUT_MS });
+  if (res.status === 404) return null;
+  if (!res.ok) throw await httpError(res, { label });
+  const doc = await readJson(res, label);
+  return toDate(doc.time?.[version]);
+}
+async function goPublishTime(f, module, version) {
+  const label = `Go proxy GET ${module}@${version}.info`;
+  const url = `${GOPROXY}/${escapeModulePath(module)}/@v/${escapeModulePath(version)}.info`;
+  const res = await request(f, url, {}, { label, timeoutMs: TIMEOUT_MS });
+  if (res.status === 404 || res.status === 410) return null;
+  if (!res.ok) throw await httpError(res, { label });
+  const info = await readJson(res, label);
+  return toDate(info.Time);
+}
+
+// action/src/modes/scan.ts
+var MARKER = "<!-- decant-scan -->";
+var MAX_DEPS = 500;
+var CONCURRENCY = 4;
+var REVIEWED = "decant:reviewed";
+var OSV_SCANNER_VERSION = "api.osv.dev/v1";
+var COMMENT_LIMIT = 6e4;
+var SEV_RANK = { low: 1, moderate: 2, unknown: 2, high: 3, critical: 4 };
+var RESULT_RANK = { clean: 0, flagged: 1, malicious: 2 };
+function fail(msg) {
+  error(msg);
+  process.stderr.write(`${msg}
+`);
+  return 1;
+}
+var safe = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var isPackageLock = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
+var fmtTime = (d) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+async function pool(items, n, fn) {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      await fn(items[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+}
+async function baseFile(deps, wd, sha, rel) {
+  const r = await deps.exec("git", ["show", `${sha}:./${rel}`], { cwd: wd });
+  if (r.code === 0) return r.stdout;
+  if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null;
+  throw new Error(
+    `git show ${sha.slice(0, 12)}:${rel} failed: ${r.stderr.trim().slice(0, 300)} (actions/checkout needs fetch-depth: 0)`
+  );
+}
+function parseLock(rel, text, decantUrl) {
+  return isPackageLock(rel) ? parsePackageLock(text, rel, decantUrl) : parseGoSum(text, rel);
+}
+async function cooldownNote(deps, dep, cooldownDays) {
+  try {
+    const t = dep.eco === "npm" ? await npmPublishTime(deps.fetch, dep.name, dep.version) : await goPublishTime(deps.fetch, dep.name, dep.version);
+    if (t) return `waiting for cooldown until ${fmtTime(new Date(t.getTime() + cooldownDays * 864e5))}`;
+  } catch {
+  }
+  return "waiting for cooldown (publish time unknown)";
+}
+function render(rows, pass, failOn, ref, limit = Infinity) {
+  const head = [
+    MARKER,
+    `## decant scan: ${pass ? "\u2705 pass" : "\u274C fail"}`,
+    "",
+    `${rows.length} new dependency version${rows.length === 1 ? "" : "s"} (ref \`${ref}\`, fail-on \`${failOn}\`).`,
+    "",
+    "| Package | Source | OSV | GuardDog | Vulns | Status |",
+    "|---|---|---|---|---|---|"
+  ].join("\n");
+  const lines = [];
+  let size = head.length;
+  for (const [i, r] of rows.entries()) {
+    const vulns = r.vulns.length ? r.vulns.map((v) => `${safe(v.id)} (${v.malicious ? "malicious" : v.severity})`).join(", ") : "\u2014";
+    const status = r.problems.length ? `\u274C ${r.problems.join("; ")}` : r.warn ? `\u26A0\uFE0F ${r.notes.join("; ")}` : `\u2705 ${r.notes.length ? r.notes.join("; ") : "ok"}`;
+    const source = r.dep.source === "registry" ? r.dep.eco : "other";
+    const line = `| \`${safe(r.dep.name)}@${safe(r.dep.version)}\` | ${source} | ${r.osv} | ${r.guarddog} | ${vulns} | ${status} |`;
+    if (size + line.length + 1 > limit) {
+      lines.push(`
+\u2026 and ${rows.length - i} more (see the job summary).`);
+      break;
+    }
+    lines.push(line);
+    size += line.length + 1;
+  }
+  return `${head}
+${lines.join("\n")}
+`;
+}
+async function run3({ deps, inputs }) {
+  const env = deps.env;
+  mask(inputs.token);
+  mask(inputs.githubToken);
+  if (env.GITHUB_EVENT_NAME !== "pull_request") return fail(`scan runs on pull_request events, not ${env.GITHUB_EVENT_NAME ?? "(none)"}`);
+  let payload;
+  try {
+    payload = await readPayload(deps);
+  } catch (e) {
+    return fail(e.message);
+  }
+  const n = payload.pull_request?.number;
+  if (typeof n !== "number") return fail("event payload has no pull_request.number");
+  if (!inputs.token) {
+    if (isForkPr(payload)) {
+      notice("fork PR has no secrets; decant scan skipped");
+      return 0;
+    }
+    return fail("token is required on pull requests (ci token)");
+  }
+  if (!inputs.githubToken) return fail("github-token is required");
+  const baseSha = payload.pull_request?.base?.sha ?? "";
+  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(baseSha)) return fail("event payload has no valid pull_request.base.sha");
+  if (!SEVERITIES.includes(inputs.failOn)) return fail(`fail-on must be one of ${SEVERITIES.join(", ")}`);
+  const failOn = inputs.failOn;
+  const wd = inputs.workingDirectory;
+  let cooldownDays = 7;
+  const policyFile = join(wd, inputs.policyPath);
+  if (await deps.fs.exists(policyFile)) {
+    let parsed;
+    try {
+      parsed = parsePolicy(JSON.parse(await deps.fs.readFile(policyFile)));
+    } catch (e) {
+      return fail(`${policyFile} is not valid JSON: ${e.message}`);
+    }
+    if (!parsed.ok) return fail(`invalid policy:
+${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
+    cooldownDays = parsed.policy.cooldownDays;
+  }
+  const ref = `pr-${n}`;
+  const gh = github(deps.fetch, inputs.githubToken, env.GITHUB_REPOSITORY ?? "", {
+    selfLogin: env.DECANT_GITHUB_LOGIN || "github-actions[bot]"
+  });
+  const stop = (msg) => {
+    setOutput("result", "fail", env);
+    return fail(msg);
+  };
+  try {
+    if (payload.action === "synchronize") {
+      const hit = (await gh.prLabels(n)).find((l) => l.toLowerCase() === REVIEWED);
+      if (hit) {
+        await gh.removeLabel(n, hit);
+        notice(`new commits: ${REVIEWED} removed; re-review required`);
+      }
+    }
+    const added = [];
+    const withDecantUrls = [];
+    for (const rel of await findLockfiles(wd, deps.fs)) {
+      const abs = join(wd, rel);
+      const head = await deps.fs.readFile(abs);
+      const base = await baseFile(deps, wd, baseSha, rel);
+      if (base === head) continue;
+      if (isPackageLock(rel) && containsDecantUrls(head, inputs.decantUrl)) {
+        withDecantUrls.push(abs);
+        continue;
+      }
+      let headDeps;
+      try {
+        headDeps = parseLock(rel, head, inputs.decantUrl);
+      } catch (e) {
+        return stop(`${abs}: ${e.message}`);
+      }
+      let baseDeps = [];
+      try {
+        if (base !== null) baseDeps = parseLock(rel, base, inputs.decantUrl);
+      } catch {
+      }
+      added.push(...diffDeps(baseDeps, headDeps));
+    }
+    if (withDecantUrls.length) {
+      const url = inputs.decantUrl.replace(/\/+$/, "");
+      for (const f of withDecantUrls) {
+        error(`${f} contains decant URLs`, f);
+        process.stderr.write(`${f} contains decant URLs; run: sed -i.bak -E 's#${url}(/r/[^/]+)?/npm/#https://registry.npmjs.org/#g' ${f} && rm ${f}.bak
+`);
+      }
+      setOutput("result", "fail", env);
+      return 1;
+    }
+    const registry = /* @__PURE__ */ new Map();
+    const rows = [];
+    const row = (dep) => ({ dep, osv: "\u2014", guarddog: "\u2014", vulns: [], problems: [], notes: [], warn: false, flagged: false });
+    for (const d of added) {
+      if (d.source === "registry") {
+        if (!registry.has(formatPackageId(d))) registry.set(formatPackageId(d), d);
+        continue;
+      }
+      const r = row(d);
+      if (d.mismatch) r.problems.push("resolved URL does not match package");
+      else {
+        r.warn = true;
+        r.notes.push("not from the registry; not scanned");
+        warning(`${safe(d.name)}@${safe(d.version)} in ${d.file} is not from the registry and was not scanned`, d.file);
+      }
+      rows.push(r);
+    }
+    if (registry.size > MAX_DEPS) return stop(`too many new dependencies (${registry.size}); split the change`);
+    const regDeps = [...registry.values()];
+    const vulnsByKey = regDeps.length ? await createOsv(deps.fetch).queryVulns(regDeps) : /* @__PURE__ */ new Map();
+    const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
+    const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
+    let gd = null;
+    const guarddog = () => {
+      if (!gd) {
+        const actionPath = env.GITHUB_ACTION_PATH;
+        gd = actionPath ? installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionPath) : Promise.reject(new Error("GITHUB_ACTION_PATH is not set"));
+      }
+      return gd;
+    };
+    if (regDeps.length) await deps.fs.mkdir(scratch);
+    const regRows = regDeps.map(row);
+    await pool(regRows, CONCURRENCY, async (r, i) => {
+      try {
+        await evaluate(r, i);
+      } catch (e) {
+        const msg = e.message;
+        error(`${safe(r.dep.name)}@${safe(r.dep.version)}: ${msg}`);
+        r.problems.push("scan error (see log)");
+      }
+    });
+    async function evaluate(r, i) {
+      const d = r.dep;
+      const id = formatPackageId(d);
+      const cached = await client.getVerdicts(id);
+      const of = (s) => cached.find((v) => v.scanner === s);
+      if (cached.some((v) => v.result === "malicious")) r.problems.push(`malicious (${cached.filter((v) => v.result === "malicious").map((v) => safe(v.scanner)).join(", ")})`);
+      r.vulns = vulnsByKey.get(depKey(d)) ?? [];
+      const mal = r.vulns.filter((v) => v.malicious).map((v) => v.id);
+      const osvResult = mal.length ? "malicious" : "clean";
+      const cOsv = of("osv");
+      if (!cOsv || RESULT_RANK[osvResult] > RESULT_RANK[cOsv.result]) {
+        await client.putVerdict({ package: id, scanner: "osv", scannerVersion: OSV_SCANNER_VERSION, result: osvResult, details: mal.length ? { malicious: mal } : void 0 });
+      }
+      const osvWorst = cOsv && RESULT_RANK[cOsv.result] > RESULT_RANK[osvResult] ? cOsv.result : osvResult;
+      r.osv = osvWorst;
+      if (osvResult === "malicious" && !r.problems.some((p) => p.startsWith("malicious"))) r.problems.push("malicious (osv)");
+      const bad = r.vulns.filter((v) => !v.malicious && SEV_RANK[v.severity] >= SEV_RANK[failOn]);
+      if (bad.length) r.problems.push(`vulnerable (\u2265 ${failOn})`);
+      const cGd = of("guarddog");
+      let gdResult = null;
+      if (cGd) {
+        gdResult = cGd.result;
+        r.guarddog = `${cGd.result} (cached)`;
+      } else {
+        const dl = d.eco === "npm" ? await client.downloadNpm(d.name, d.version, ref) : await client.downloadGo(d.name, d.version, ref);
+        if (dl.status !== "ok") {
+          if (dl.status === "cooldown") r.problems.push(await cooldownNote(deps, d, cooldownDays));
+          else r.problems.push(dl.status === "blocked" ? "blocked by decant" : "not found in decant");
+        } else {
+          const path = `${scratch}/${i}.${d.eco === "npm" ? "tgz" : "zip"}`;
+          await deps.fs.writeBytes(path, dl.bytes);
+          const { bin } = await guarddog();
+          const res = d.eco === "npm" ? await scanNpm(deps.exec, bin, path) : await scanGo(deps.exec, bin, path);
+          await client.putVerdict({ package: id, scanner: "guarddog", scannerVersion: GUARDDOG_VERSION, result: res.result, details: res.details });
+          gdResult = res.result;
+          r.guarddog = res.result;
+          if (res.details.length) r.notes.push(`GuardDog: ${res.details.map(safe).join(", ")}`);
+        }
+      }
+      if (gdResult === "flagged") r.flagged = true;
+    }
+    const anyFlagged = regRows.some((r) => r.flagged);
+    const reviewed = anyFlagged ? await gh.labelAddedByWriter(n, REVIEWED) : false;
+    for (const r of regRows) {
+      if (!r.flagged) continue;
+      if (reviewed) r.notes.unshift(`flagged; ${REVIEWED} by a writer`);
+      else r.problems.push(`flagged by GuardDog (needs ${REVIEWED} from a writer)`);
+    }
+    const all = [...regRows, ...rows];
+    const pass = all.every((r) => r.problems.length === 0);
+    setOutput("result", pass ? "pass" : "fail", env);
+    setOutput("flagged", anyFlagged ? "true" : "false", env);
+    if (all.length === 0) {
+      appendSummary(`${MARKER}
+## decant scan: \u2705 pass
+
+No new dependency versions.`, env);
+      return 0;
+    }
+    appendSummary(render(all, pass, failOn, ref), env);
+    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT));
+    if (!pass) return fail(`decant scan failed: ${all.filter((r) => r.problems.length).length} dependency version(s) need attention`);
+    return 0;
+  } catch (e) {
+    return stop(`decant scan: ${e.message}`);
+  }
+}
+
+// action/src/modes/setup.ts
+var setup_exports = {};
+__export(setup_exports, {
+  run: () => run4
+});
 function fail2(msg) {
+  error(msg);
+  process.stderr.write(`${msg}
+`);
+  return 1;
+}
+async function run4({ deps, inputs }) {
+  mask(inputs.token);
+  const env = deps.env;
+  const home = env.HOME;
+  if (!home) return fail2("HOME is not set");
+  const npmrc = `${home}/.npmrc`;
+  const netrc = `${home}/.netrc`;
+  if (inputs.bypass) {
+    const reason = inputs.bypassReason.trim();
+    if (!reason) return fail2("bypass requires bypass-reason");
+    await deps.fs.writeFile(npmrc, "registry=https://registry.npmjs.org/\nignore-scripts=true\n");
+    exportVar("GOPROXY", "https://proxy.golang.org", env);
+    const actor = env.GITHUB_ACTOR ?? "";
+    warning(`decant BYPASSED by ${actor}: ${reason}`);
+    const runUrl = `${env.GITHUB_SERVER_URL ?? ""}/${env.GITHUB_REPOSITORY ?? ""}/actions/runs/${env.GITHUB_RUN_ID ?? ""}`;
+    appendSummary(`## \u26A0\uFE0F decant bypassed
+
+Actor: ${actor} \xB7 Reason: ${reason} \xB7 Run: ${runUrl}`, env);
+    return 0;
+  }
+  if (!inputs.token) return fail2("token is required (read token)");
+  const base = inputs.decantUrl.replace(/\/+$/, "");
+  const host = new URL(base).host;
+  await deps.fs.writeFile(npmrc, `registry=${base}/npm/
+//${host}/npm/:_authToken=${inputs.token}
+ignore-scripts=true
+`, 384);
+  await deps.fs.writeFile(netrc, `machine ${host} login decant password ${inputs.token}
+`, 384);
+  await deps.fs.chmod(npmrc, 384);
+  await deps.fs.chmod(netrc, 384);
+  exportVar("GOPROXY", `${base}/go`, env);
+  return 0;
+}
+
+// action/src/modes/sync.ts
+var sync_exports = {};
+__export(sync_exports, {
+  run: () => run5
+});
+import { join as join2 } from "node:path";
+function fail3(msg) {
   error(msg);
   process.stderr.write(`${msg}
 `);
@@ -451,41 +1419,37 @@ async function run5({ deps, inputs }) {
   const env = deps.env;
   mask(inputs.token);
   mask(inputs.syncToken);
-  const policyFile = join(inputs.workingDirectory, inputs.policyPath);
-  if (!await deps.fs.exists(policyFile)) return fail2(`decant.json not found at ${policyFile}`);
+  const policyFile = join2(inputs.workingDirectory, inputs.policyPath);
+  if (!await deps.fs.exists(policyFile)) return fail3(`decant.json not found at ${policyFile}`);
   let raw;
   try {
     raw = JSON.parse(await deps.fs.readFile(policyFile));
   } catch (e) {
-    return fail2(`${policyFile} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
+    return fail3(`${policyFile} is not valid JSON: ${e instanceof Error ? e.message : String(e)}`);
   }
   const parsed = parsePolicy(raw);
-  if (!parsed.ok) return fail2(`invalid policy:
+  if (!parsed.ok) return fail3(`invalid policy:
 ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
-  let payload = {};
-  if (env.GITHUB_EVENT_PATH) {
-    try {
-      payload = JSON.parse(await deps.fs.readFile(env.GITHUB_EVENT_PATH));
-    } catch {
-      return fail2(`cannot read event payload at ${env.GITHUB_EVENT_PATH}`);
-    }
+  let payload;
+  try {
+    payload = await readPayload(deps);
+  } catch (e) {
+    return fail3(e.message);
   }
   const event = env.GITHUB_EVENT_NAME ?? "";
   let ref;
   let token;
   if (event === "pull_request") {
     const n = payload.pull_request?.number;
-    if (typeof n !== "number") return fail2("event payload has no pull_request.number");
+    if (typeof n !== "number") return fail3("event payload has no pull_request.number");
     ref = `pr-${n}`;
     token = inputs.token;
     if (!token) {
-      const head = payload.pull_request?.head?.repo;
-      const fork = !head || head.full_name !== payload.repository?.full_name;
-      if (fork) {
+      if (isForkPr(payload)) {
         notice("fork PR has no secrets; decant sync skipped");
         return 0;
       }
-      return fail2("token is required on pull requests");
+      return fail3("token is required on pull requests");
     }
   } else if (event === "push") {
     const branch = env.GITHUB_REF_NAME || (env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "");
@@ -495,16 +1459,16 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     }
     ref = branch;
     token = inputs.syncToken;
-    if (!token) return fail2("sync-token is required on the default branch");
+    if (!token) return fail3("sync-token is required on the default branch");
   } else {
-    return fail2(`unsupported event ${event}`);
+    return fail3(`unsupported event ${event}`);
   }
   const project = inputs.project || parsed.policy.project;
   const res = await decant(deps.fetch, inputs.decantUrl, token).syncPolicy(project, raw, env.GITHUB_SHA ?? "", ref);
   if (res.status < 200 || res.status >= 300) {
     const b = res.body;
     const msg = typeof b === "object" && b !== null && typeof b.error === "string" ? b.error : typeof b === "string" ? b : JSON.stringify(b);
-    return fail2(`decant rejected the policy (HTTP ${res.status}): ${msg}`);
+    return fail3(`decant rejected the policy (HTTP ${res.status}): ${msg}`);
   }
   setOutput("ref", ref, env);
   return 0;
