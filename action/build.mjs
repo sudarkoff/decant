@@ -2,7 +2,7 @@ import { build } from 'esbuild';
 import { pathToFileURL } from 'node:url';
 
 export const buildOptions = {
-  entryPoints: ['action/src/main.ts'],
+  entryPoints: ['action/src/entry.ts'],
   outfile: 'action/dist/index.js',
   bundle: true,
   platform: 'node',

@@ -4,9 +4,6 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
-// action/src/main.ts
-import { pathToFileURL } from "node:url";
-
 // action/src/deps.ts
 import * as nodeFs from "node:fs/promises";
 
@@ -152,18 +149,14 @@ async function run6(deps) {
   }
   return mode.run({ deps, inputs });
 }
-var entry = process.argv[1];
-if (entry && import.meta.url === pathToFileURL(entry).href) {
-  run6(defaultDeps()).then(
-    (code) => {
-      process.exitCode = code;
-    },
-    (e) => {
-      error(e instanceof Error ? e.message : String(e));
-      process.exitCode = 1;
-    }
-  );
-}
-export {
-  run6 as run
-};
+
+// action/src/entry.ts
+run6(defaultDeps()).then(
+  (code) => {
+    process.exitCode = code;
+  },
+  (e) => {
+    error(e instanceof Error ? e.message : String(e));
+    process.exitCode = 1;
+  }
+);

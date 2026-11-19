@@ -1,5 +1,4 @@
-import { pathToFileURL } from 'node:url';
-import { defaultDeps, type ActionDeps } from './deps';
+import type { ActionDeps } from './deps';
 import { error } from './gh-io';
 import { readInputs, type ModeCtx } from './inputs';
 import * as adopt from './modes/adopt';
@@ -20,18 +19,4 @@ export async function run(deps: ActionDeps): Promise<number> {
     return 1;
   }
   return mode.run({ deps, inputs });
-}
-
-// Only when executed as the entry (bundle or `node main.ts`), never when imported by tests.
-const entry = process.argv[1];
-if (entry && import.meta.url === pathToFileURL(entry).href) {
-  run(defaultDeps()).then(
-    (code) => {
-      process.exitCode = code;
-    },
-    (e) => {
-      error(e instanceof Error ? e.message : String(e));
-      process.exitCode = 1;
-    },
-  );
 }
