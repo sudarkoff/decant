@@ -57,7 +57,7 @@ it('valid ref routes with auth', async () => {
   expect((await get('/r/pr-12/npm/x', bearer(tokens.read))).status).toBe(501);
 });
 
-it('anything else -> 404; /api/* is stub 404 for operator', async () => {
+it('anything else -> 404; unknown /api/* is 404 for operator', async () => {
   expect((await get('/nope')).status).toBe(404);
   expect((await get('/api/x', bearer(opToken))).status).toBe(404);
 });
@@ -66,8 +66,8 @@ it('/api/* requires authentication; per-route authz is the admin handler', async
   const res = await get('/api/x');
   expect(res.status).toBe(401);
   expect(res.headers.get('www-authenticate')).toBe('Basic realm="decant"');
-  expect((await get('/api/x', bearer(tokens.read))).status).toBe(404); // reaches stub
-  expect((await get('/api/x', bearer(tokens.ci))).status).toBe(404); // CI not rejected at router
+  expect((await get('/api/x', bearer(tokens.read))).status).toBe(403); // read tokens never reach admin routes
+  expect((await get('/api/x', bearer(tokens.ci))).status).toBe(404); // CI not rejected at router; unknown route
 });
 
 it('empty OPERATOR_TOKEN_HASH never authenticates', async () => {
