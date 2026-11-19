@@ -82,9 +82,9 @@ describe('blocks and serve log', () => {
 
 describe('loadPolicyView', () => {
   it('defaults when no policy exists', async () => {
-    const v = await loadPolicyView(e, 'nobody', null);
+    const v = await loadPolicyView(e, 'nobody', null, 'npm', 'x');
     expect(v.cooldownDays).toBe(7);
-    expect(v.allowedFor('npm', 'x')).toEqual(new Set());
+    expect(v.allowed).toEqual(new Set());
   });
 
   it('ignores unverified advisory rows', async () => {
@@ -96,9 +96,21 @@ describe('loadPolicyView', () => {
       e.DB.prepare("INSERT INTO allows VALUES ('lv','main','npm','a','1.0.0',NULL,'r',NULL)"),
       e.DB.prepare("INSERT INTO allows VALUES ('lv','main','npm','a','2.0.0','GHSA-aaaa-bbbb-cccc','r',NULL)"),
       e.DB.prepare("INSERT INTO allows VALUES ('lv','main','npm','a','3.0.0','GHSA-aaaa-bbbb-cccc','r','x')"),
+      e.DB.prepare("INSERT INTO allows VALUES ('lv','main','npm','b','1.0.0',NULL,'r',NULL)"),
+      e.DB.prepare("INSERT INTO allows VALUES ('lv','main','go','a','1.5.0',NULL,'r',NULL)"),
     ]);
-    const v = await loadPolicyView(e, 'lv', null);
+    const v = await loadPolicyView(e, 'lv', null, 'npm', 'a');
     expect(v.cooldownDays).toBe(3);
-    expect(v.allowedFor('npm', 'a')).toEqual(new Set(['1.0.0', '3.0.0']));
+    expect(v.allowed).toEqual(new Set(['1.0.0', '3.0.0']));
+  });
+
+  it('includes the overlay ref and is scoped to one package', async () => {
+    await e.DB.batch([
+      e.DB.prepare("INSERT INTO allows VALUES ('lv','pr-9','npm','a','4.0.0',NULL,'r',NULL)"),
+      e.DB.prepare("INSERT INTO allows VALUES ('lv','pr-8','npm','a','5.0.0',NULL,'r',NULL)"),
+    ]);
+    expect((await loadPolicyView(e, 'lv', 'pr-9', 'npm', 'a')).allowed).toEqual(new Set(['1.0.0', '3.0.0', '4.0.0']));
+    expect((await loadPolicyView(e, 'lv', null, 'npm', 'b')).allowed).toEqual(new Set(['1.0.0']));
+    expect((await loadPolicyView(e, 'lv', null, 'go', 'a')).allowed).toEqual(new Set(['1.5.0']));
   });
 });
