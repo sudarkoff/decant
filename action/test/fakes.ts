@@ -62,3 +62,27 @@ export function fakeDeps(over: Partial<ActionDeps> = {}): ActionDeps {
     ...over,
   };
 }
+
+export type FetchCall = { url: string; method: string; headers: Headers; body: string | undefined; signal: AbortSignal | undefined };
+
+/** A fake fetch that records calls and answers from `handler`; unmatched calls get a 599. */
+export function fakeFetch(handler: (call: FetchCall) => Response | undefined): typeof fetch & { calls: FetchCall[] } {
+  const calls: FetchCall[] = [];
+  const fn = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const call: FetchCall = {
+      url,
+      method: (init?.method ?? 'GET').toUpperCase(),
+      headers: new Headers(init?.headers),
+      body: typeof init?.body === 'string' ? init.body : undefined,
+      signal: init?.signal ?? undefined,
+    };
+    calls.push(call);
+    return handler(call) ?? new Response('not stubbed', { status: 599 });
+  }) as typeof fetch & { calls: FetchCall[] };
+  fn.calls = calls;
+  return fn;
+}
+
+export const jsonRes = (body: unknown, status = 200, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } });
