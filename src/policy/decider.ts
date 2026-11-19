@@ -5,8 +5,8 @@ import { blockedVersions, loadPolicyView, type PinnedTime } from './store';
 
 /** Loads blocks and the policy view once; returns a per-version decision function. */
 export async function decider(env: Env, deps: Deps, rc: RequestCtx, eco: Ecosystem, name: string) {
-  const [blocks, view] = await Promise.all([blockedVersions(env, eco, name), loadPolicyView(env, rc.projectId, rc.ref)]);
-  const allowed = view.allowedFor(eco, name);
+  const [blocks, view] = await Promise.all([blockedVersions(env, eco, name), loadPolicyView(env, rc.projectId, rc.ref, eco, name)]);
+  const allowed = view.allowed;
   const now = deps.now();
   return (version: string, pin: PinnedTime | null | undefined): Decision =>
     decide({

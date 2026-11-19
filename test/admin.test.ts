@@ -172,11 +172,11 @@ describe('policy sync', () => {
     expect(r.status).toBe(200);
     expect(await r.json()).toEqual({ ref: 'main', allows: 1, blocks: 1 });
     expect(await blockedVersions(e, 'npm', 'evil')).toEqual(new Set(['1.0.0']));
-    expect((await loadPolicyView(e, 'pa', null)).allowedFor('npm', 'fast')).toEqual(new Set(['1.0.0']));
+    expect((await loadPolicyView(e, 'pa', null, 'npm', 'fast')).allowed).toEqual(new Set(['1.0.0']));
 
     expect((await sync(A.sync, 'pa', policy('pa'))).status).toBe(200);
     expect(await blockedVersions(e, 'npm', 'evil')).toEqual(new Set());
-    expect((await loadPolicyView(e, 'pa', null)).allowedFor('npm', 'fast')).toEqual(new Set());
+    expect((await loadPolicyView(e, 'pa', null, 'npm', 'fast')).allowed).toEqual(new Set());
   });
 
   it('overlay before any main sync -> 409', async () => {
@@ -201,9 +201,9 @@ describe('policy sync', () => {
     const ok = await sync(A.ci, 'pa', policy('pa', { ...base, allow: [allow('npm:x@2.0.0')] }), 'pr-1');
     expect(ok.status).toBe(200);
     expect(await ok.json()).toEqual({ ref: 'pr-1', allows: 1, blocks: 1 });
-    expect((await loadPolicyView(e, 'pa', 'pr-1')).allowedFor('npm', 'x')).toEqual(new Set(['2.0.0']));
-    expect((await loadPolicyView(e, 'pa', null)).allowedFor('npm', 'x')).toEqual(new Set());
-    expect((await loadPolicyView(e, 'pb', 'pr-1')).allowedFor('npm', 'x')).toEqual(new Set());
+    expect((await loadPolicyView(e, 'pa', 'pr-1', 'npm', 'x')).allowed).toEqual(new Set(['2.0.0']));
+    expect((await loadPolicyView(e, 'pa', null, 'npm', 'x')).allowed).toEqual(new Set());
+    expect((await loadPolicyView(e, 'pb', 'pr-1', 'npm', 'x')).allowed).toEqual(new Set());
 
     const st = await call('GET', '/api/projects/pa/status', A.ci);
     const body = (await st.json()) as { mainSha: string; syncedAt: string; overlays: unknown[]; globalBlocks: number };
@@ -246,9 +246,8 @@ describe('policy sync', () => {
       { name: 'lodash', verified_at: '2026-11-19T12:00:00.000Z' },
       { name: 'plain', verified_at: null },
     ]);
-    const v = await loadPolicyView(e, 'pb', null);
-    expect(v.allowedFor('npm', 'lodash')).toEqual(new Set(['4.17.21']));
-    expect(v.allowedFor('npm', 'plain')).toEqual(new Set(['1.0.0']));
+    expect((await loadPolicyView(e, 'pb', null, 'npm', 'lodash')).allowed).toEqual(new Set(['4.17.21']));
+    expect((await loadPolicyView(e, 'pb', null, 'npm', 'plain')).allowed).toEqual(new Set(['1.0.0']));
   });
 
   it('syncs a large policy (200 plain allows, 100 blocks) in a handful of statements', async () => {
@@ -289,7 +288,7 @@ describe('policy sync', () => {
     expect(r.status).toBe(200);
     expect(statements).toBeLessThanOrEqual(10);
     expect(await r.json()).toEqual({ ref: 'main', allows: 200, blocks: 100 });
-    expect((await loadPolicyView(e, 'pd', null)).allowedFor('npm', 'many').size).toBe(200);
+    expect((await loadPolicyView(e, 'pd', null, 'npm', 'many')).allowed.size).toBe(200);
     expect((await blockedVersions(e, 'npm', 'bad-many')).size).toBe(100);
     const row = await e.DB.prepare("SELECT reason, verified_at, advisory FROM allows WHERE project_id = 'pd' AND version = '1.0.7'").first();
     expect(row).toEqual({ reason: 'r', verified_at: null, advisory: null });
