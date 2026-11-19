@@ -13,6 +13,10 @@ export function memFs(files: Record<string, string> = {}, symlinks: string[] = [
     async writeBytes(p, data) {
       bytes.set(p, data);
     },
+    async rm(p) {
+      m.delete(p);
+      modes.delete(p);
+    },
     async chmod(p, mode) {
       modes.set(p, mode);
     },

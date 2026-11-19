@@ -166,6 +166,24 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
     return hit.id;
   }
 
+  async function findIssue(title: string, labels: string[] = []): Promise<number | null> {
+    type Issue = { number: number; title: string; pull_request?: unknown; user?: Author };
+    const match = (i: Issue) => i.pull_request === undefined && i.title === title && isMine(i.user);
+    const list = `${R}/issues?state=open&per_page=100`;
+    // Narrowest query first: our own issues (selfLogin), else our labels, falling back to all open issues.
+    const queries = opts.selfLogin
+      ? [`${list}&creator=${encodeURIComponent(opts.selfLogin)}`]
+      : labels.length
+        ? [`${list}&labels=${encodeURIComponent(labels.join(','))}`, list]
+        : [list];
+    for (const q of queries) {
+      const r = await findPaged<Issue>(q, match);
+      if (r.capped) warning(`decant: more than ${MAX_PAGES} pages of open issues; may create a duplicate of "${title}"`);
+      if (r.hit) return r.hit.number;
+    }
+    return null;
+  }
+
   return {
     graphql,
 
@@ -297,29 +315,18 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
       );
     },
 
+    /** Our open issue titled exactly `title` (see upsertIssue for the search order); null if none. */
+    findIssue,
+
     /**
      * Updates the body of our open issue titled exactly `title`, else creates it with `labels`.
      * Matches on title and author only (not labels), so a removed label never causes a duplicate.
      */
     async upsertIssue(title: string, body: string, labels: string[]): Promise<{ number: number; created: boolean }> {
-      type Issue = { number: number; title: string; pull_request?: unknown; user?: Author };
-      const match = (i: Issue) => i.pull_request === undefined && i.title === title && isMine(i.user);
-      const list = `${R}/issues?state=open&per_page=100`;
-      // Narrowest query first: our own issues (selfLogin), else our labels, falling back to all open issues.
-      const queries = opts.selfLogin
-        ? [`${list}&creator=${encodeURIComponent(opts.selfLogin)}`]
-        : labels.length
-          ? [`${list}&labels=${encodeURIComponent(labels.join(','))}`, list]
-          : [list];
-      let hit: Issue | null = null;
-      for (const q of queries) {
-        const r = await findPaged<Issue>(q, match);
-        if (r.capped) warning(`decant: more than ${MAX_PAGES} pages of open issues; may create a duplicate of "${title}"`);
-        if ((hit = r.hit)) break;
-      }
-      if (hit) {
-        await rest('PATCH', `${R}/issues/${hit.number}`, { body });
-        return { number: hit.number, created: false };
+      const hit = await findIssue(title, labels);
+      if (hit !== null) {
+        await rest('PATCH', `${R}/issues/${hit}`, { body });
+        return { number: hit, created: false };
       }
       const i = await json<{ number: number }>('POST', `${R}/issues`, { title, body, labels });
       return { number: i.number, created: true };

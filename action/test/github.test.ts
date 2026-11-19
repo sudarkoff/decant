@@ -188,6 +188,17 @@ describe('upsertIssue', () => {
     warn.mockRestore();
   });
 
+  it('findIssue returns our issue number, or null (no create)', async () => {
+    const f = route({
+      [`GET ${R}/issues?state=open&per_page=100&creator=decant-app%5Bbot%5D`]: () =>
+        jsonRes([{ number: 6, title: 'T', user: { login: 'decant-app[bot]', type: 'Bot' } }]),
+    });
+    const gh = github(f, TOKEN, 'o/r', { selfLogin: 'decant-app[bot]' });
+    expect(await gh.findIssue('T')).toBe(6);
+    expect(await gh.findIssue('U')).toBeNull();
+    expect(f.calls.every((c) => c.method === 'GET')).toBe(true);
+  });
+
   it('closeIssue PATCHes state closed', async () => {
     const f = route({ [`PATCH ${R}/issues/4`]: () => jsonRes({ number: 4 }) });
     await github(f, TOKEN, 'o/r').closeIssue(4);

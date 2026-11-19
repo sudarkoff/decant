@@ -19,7 +19,7 @@ function scrubEnv(env) {
   }
   return out;
 }
-var defaultExec = (cmd, args, opts = {}) => new Promise((resolve2) => {
+var defaultExec = (cmd, args, opts = {}) => new Promise((resolve3) => {
   const child = spawn(cmd, args, {
     cwd: opts.cwd,
     env: { ...scrubEnv(process.env), ...opts.env },
@@ -30,8 +30,8 @@ var defaultExec = (cmd, args, opts = {}) => new Promise((resolve2) => {
   let stderr = "";
   child.stdout.setEncoding("utf8").on("data", (d) => stdout += d);
   child.stderr.setEncoding("utf8").on("data", (d) => stderr += d);
-  child.on("error", (e) => resolve2({ code: 127, stdout, stderr: stderr + String(e.message) }));
-  child.on("close", (code) => resolve2({ code: code ?? 1, stdout, stderr }));
+  child.on("error", (e) => resolve3({ code: 127, stdout, stderr: stderr + String(e.message) }));
+  child.on("close", (code) => resolve3({ code: code ?? 1, stdout, stderr }));
   child.stdin.on("error", () => {
   });
   child.stdin.end(opts.input ?? "");
@@ -62,6 +62,7 @@ var defaultFs = {
     }
   },
   chmod: (p, mode) => nodeFs.chmod(p, mode),
+  rm: (p) => nodeFs.rm(p, { force: true }),
   async mkdir(p) {
     await nodeFs.mkdir(p, { recursive: true });
   }
@@ -382,6 +383,17 @@ function github(f, token, repo, opts = {}) {
     await rest("PATCH", `${R}/issues/comments/${hit.id}`, { body: text });
     return hit.id;
   }
+  async function findIssue(title, labels = []) {
+    const match = (i) => i.pull_request === void 0 && i.title === title && isMine(i.user);
+    const list = `${R}/issues?state=open&per_page=100`;
+    const queries = opts.selfLogin ? [`${list}&creator=${encodeURIComponent(opts.selfLogin)}`] : labels.length ? [`${list}&labels=${encodeURIComponent(labels.join(","))}`, list] : [list];
+    for (const q of queries) {
+      const r = await findPaged(q, match);
+      if (r.capped) warning(`decant: more than ${MAX_PAGES} pages of open issues; may create a duplicate of "${title}"`);
+      if (r.hit) return r.hit.number;
+    }
+    return null;
+  }
   return {
     graphql,
     async defaultBranch() {
@@ -498,23 +510,17 @@ ${body}`) !== null;
         { id: prNodeId, method }
       );
     },
+    /** Our open issue titled exactly `title` (see upsertIssue for the search order); null if none. */
+    findIssue,
     /**
      * Updates the body of our open issue titled exactly `title`, else creates it with `labels`.
      * Matches on title and author only (not labels), so a removed label never causes a duplicate.
      */
     async upsertIssue(title, body, labels) {
-      const match = (i2) => i2.pull_request === void 0 && i2.title === title && isMine(i2.user);
-      const list = `${R}/issues?state=open&per_page=100`;
-      const queries = opts.selfLogin ? [`${list}&creator=${encodeURIComponent(opts.selfLogin)}`] : labels.length ? [`${list}&labels=${encodeURIComponent(labels.join(","))}`, list] : [list];
-      let hit = null;
-      for (const q of queries) {
-        const r = await findPaged(q, match);
-        if (r.capped) warning(`decant: more than ${MAX_PAGES} pages of open issues; may create a duplicate of "${title}"`);
-        if (hit = r.hit) break;
-      }
-      if (hit) {
-        await rest("PATCH", `${R}/issues/${hit.number}`, { body });
-        return { number: hit.number, created: false };
+      const hit = await findIssue(title, labels);
+      if (hit !== null) {
+        await rest("PATCH", `${R}/issues/${hit}`, { body });
+        return { number: hit, created: false };
       }
       const i = await json("POST", `${R}/issues`, { title, body, labels });
       return { number: i.number, created: true };
@@ -860,26 +866,64 @@ function prBody(added, cooldownDays, notGated, normalized) {
 // action/src/modes/audit.ts
 var audit_exports = {};
 __export(audit_exports, {
+  fixBranch: () => fixBranch,
+  overlayRef: () => overlayRef,
   run: () => run2
 });
-
-// action/src/modes/stub.ts
-async function notImplemented(_ctx) {
-  process.stderr.write("not implemented\n");
-  return 1;
-}
-
-// action/src/modes/audit.ts
-var run2 = (ctx) => notImplemented(ctx);
-
-// action/src/modes/scan.ts
-var scan_exports = {};
-__export(scan_exports, {
-  MARKER: () => MARKER,
-  run: () => run3
-});
-import { join as join2 } from "node:path";
 import { tmpdir } from "node:os";
+import { dirname, isAbsolute as isAbsolute2, join as join2, relative as relative2, resolve as resolve2 } from "node:path";
+
+// src/semver.ts
+var NUM = "(0|[1-9]\\d*)";
+var PRE_ID = "(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)";
+var RE = new RegExp(
+  `^${NUM}\\.${NUM}\\.${NUM}(?:-(${PRE_ID}(?:\\.${PRE_ID})*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`
+);
+function parseVersion(v, eco) {
+  let s = v;
+  if (eco === "go") {
+    if (!s.startsWith("v")) return null;
+    s = s.slice(1);
+  }
+  const m = RE.exec(s);
+  if (!m) return null;
+  const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  if (![major, minor, patch].every(Number.isSafeInteger)) return null;
+  return { major, minor, patch, pre: m[4] ? m[4].split(".") : [] };
+}
+var isNum = (s) => /^\d+$/.test(s);
+function cmpId(a, b) {
+  const an = isNum(a);
+  const bn = isNum(b);
+  if (an && bn) {
+    const x = BigInt(a);
+    const y = BigInt(b);
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
+  if (an) return -1;
+  if (bn) return 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+function cmpParsed(a, b) {
+  if (a.major !== b.major) return a.major < b.major ? -1 : 1;
+  if (a.minor !== b.minor) return a.minor < b.minor ? -1 : 1;
+  if (a.patch !== b.patch) return a.patch < b.patch ? -1 : 1;
+  if (a.pre.length === 0 || b.pre.length === 0) {
+    return a.pre.length === b.pre.length ? 0 : a.pre.length === 0 ? 1 : -1;
+  }
+  const n = Math.min(a.pre.length, b.pre.length);
+  for (let i = 0; i < n; i++) {
+    const c = cmpId(a.pre[i], b.pre[i]);
+    if (c !== 0) return c;
+  }
+  return a.pre.length === b.pre.length ? 0 : a.pre.length < b.pre.length ? -1 : 1;
+}
+function compareVersions(a, b, eco) {
+  const pa = parseVersion(a, eco);
+  const pb = parseVersion(b, eco);
+  if (!pa || !pb) return pa ? 1 : pb ? -1 : 0;
+  return cmpParsed(pa, pb);
+}
 
 // action/src/decant-client.ts
 function classify404(body) {
@@ -1005,126 +1049,6 @@ function decant(f, url, token) {
       return bytesOr404(res, `decant GET ${path}`);
     }
   };
-}
-
-// action/src/event.ts
-async function readPayload(deps) {
-  const p = deps.env.GITHUB_EVENT_PATH;
-  if (!p) return {};
-  try {
-    return JSON.parse(await deps.fs.readFile(p));
-  } catch {
-    throw new Error(`cannot read event payload at ${p}`);
-  }
-}
-function isForkPr(payload) {
-  const head = payload.pull_request?.head?.repo;
-  return !head || head.full_name !== payload.repository?.full_name;
-}
-
-// action/src/guarddog.ts
-var GUARDDOG_VERSION = "3.2.0";
-function tail(s) {
-  return s.trim().split("\n").slice(-5).join(" ").slice(0, 500);
-}
-async function installGuardDog(exec, dir, actionPath) {
-  const venv = await exec("python3", ["-m", "venv", dir]);
-  if (venv.code !== 0) throw new Error(`python3 -m venv failed: ${tail(venv.stderr)}`);
-  const req = `${actionPath.replace(/\/+$/, "")}/guarddog-requirements.txt`;
-  const pip = await exec(`${dir}/bin/pip`, [
-    "install",
-    "--disable-pip-version-check",
-    "--require-hashes",
-    "--no-deps",
-    "--only-binary",
-    ":all:",
-    "-r",
-    req
-  ]);
-  if (pip.code !== 0) throw new Error(`pip install of GuardDog failed: ${tail(pip.stderr)}`);
-  return { bin: `${dir}/bin/guarddog` };
-}
-var hasFindings = (v) => Array.isArray(v) ? v.length > 0 : typeof v === "object" && v !== null ? Object.keys(v).length > 0 : typeof v === "string" ? v !== "" : !!v;
-function parseGuardDogJson(stdout) {
-  let doc;
-  try {
-    doc = JSON.parse(stdout);
-  } catch {
-    throw new Error("guarddog: invalid JSON output");
-  }
-  if (doc.errors && typeof doc.errors === "object" && Object.keys(doc.errors).length > 0) {
-    throw new Error(`guarddog reported errors: ${Object.keys(doc.errors).join(", ")}`);
-  }
-  if (!doc.results || typeof doc.results !== "object") throw new Error("guarddog: no results in output");
-  const details = [];
-  for (const [rule, v] of Object.entries(doc.results).sort(([a], [b]) => a < b ? -1 : 1)) {
-    if (rule.startsWith("capability-") || !hasFindings(v)) continue;
-    details.push(Array.isArray(v) ? `${rule} (${v.length})` : rule);
-  }
-  if (Array.isArray(doc.risks) && doc.risks.length > 0) {
-    const label = typeof doc.risk_score?.label === "string" ? doc.risk_score.label : "unlabelled";
-    details.push(`risk: ${label}`);
-  }
-  return { result: details.length > 0 ? "flagged" : "clean", details };
-}
-async function scan(exec, bin, eco, path) {
-  const r = await exec(bin, [eco, "scan", path, "--output-format", "json", "--sandbox"]);
-  if (r.code !== 0) throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
-  return parseGuardDogJson(r.stdout);
-}
-var scanNpm = (exec, bin, tgzPath) => scan(exec, bin, "npm", tgzPath);
-var scanGo = (exec, bin, zipPath) => scan(exec, bin, "go", zipPath);
-
-// src/semver.ts
-var NUM = "(0|[1-9]\\d*)";
-var PRE_ID = "(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)";
-var RE = new RegExp(
-  `^${NUM}\\.${NUM}\\.${NUM}(?:-(${PRE_ID}(?:\\.${PRE_ID})*))?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$`
-);
-function parseVersion(v, eco) {
-  let s = v;
-  if (eco === "go") {
-    if (!s.startsWith("v")) return null;
-    s = s.slice(1);
-  }
-  const m = RE.exec(s);
-  if (!m) return null;
-  const [major, minor, patch] = [Number(m[1]), Number(m[2]), Number(m[3])];
-  if (![major, minor, patch].every(Number.isSafeInteger)) return null;
-  return { major, minor, patch, pre: m[4] ? m[4].split(".") : [] };
-}
-var isNum = (s) => /^\d+$/.test(s);
-function cmpId(a, b) {
-  const an = isNum(a);
-  const bn = isNum(b);
-  if (an && bn) {
-    const x = BigInt(a);
-    const y = BigInt(b);
-    return x < y ? -1 : x > y ? 1 : 0;
-  }
-  if (an) return -1;
-  if (bn) return 1;
-  return a < b ? -1 : a > b ? 1 : 0;
-}
-function cmpParsed(a, b) {
-  if (a.major !== b.major) return a.major < b.major ? -1 : 1;
-  if (a.minor !== b.minor) return a.minor < b.minor ? -1 : 1;
-  if (a.patch !== b.patch) return a.patch < b.patch ? -1 : 1;
-  if (a.pre.length === 0 || b.pre.length === 0) {
-    return a.pre.length === b.pre.length ? 0 : a.pre.length === 0 ? 1 : -1;
-  }
-  const n = Math.min(a.pre.length, b.pre.length);
-  for (let i = 0; i < n; i++) {
-    const c = cmpId(a.pre[i], b.pre[i]);
-    if (c !== 0) return c;
-  }
-  return a.pre.length === b.pre.length ? 0 : a.pre.length < b.pre.length ? -1 : 1;
-}
-function compareVersions(a, b, eco) {
-  const pa = parseVersion(a, eco);
-  const pb = parseVersion(b, eco);
-  if (!pa || !pb) return pa ? 1 : pb ? -1 : 0;
-  return cmpParsed(pa, pb);
 }
 
 // action/src/osv.ts
@@ -1364,6 +1288,520 @@ function createOsv(f) {
   return { queryVulns, vuln };
 }
 
+// action/src/modes/audit.ts
+var DAY2 = 864e5;
+var MAX_BRANCH = 100;
+var PRUNE_BRANCH = "decant/prune";
+var UNFIXED_TITLE = "decant: unfixed advisories";
+var BLOCKED_TITLE = "decant: blocked versions in lockfiles";
+var ISSUE_LABELS = ["decant:security"];
+var safe2 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var ymd2 = (d) => d.toISOString().slice(0, 10);
+var isPackageLock = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
+var slug = (s) => s.toLowerCase().replace(/@/g, "").replace(/\//g, "-").replace(/[^a-z0-9.-]/g, "-").replace(/\.{2,}/g, ".");
+function fixBranch(id, name) {
+  const prefix = `decant/fix-${slug(id)}-`;
+  const tail2 = slug(name).slice(0, Math.max(1, MAX_BRANCH - prefix.length)).replace(/\.lock$/, "").replace(/[.-]+$/, "");
+  return `${prefix}${tail2 || "pkg"}`;
+}
+function overlayRef(id) {
+  return `audit-${slug(id)}`.slice(0, 64).replace(/[.-]+$/, "");
+}
+function advisoryUrl(id) {
+  return id.startsWith("GHSA-") ? `https://github.com/advisories/${id}` : `https://osv.dev/vulnerability/${encodeURIComponent(id)}`;
+}
+var systemic = (e) => /^(GitHub|decant) [A-Z]+ \S+: HTTP 40[13]\b/.test(e?.message ?? "");
+var GroupError = class extends Error {
+  constructor(result, msg) {
+    super(msg);
+    this.result = result;
+  }
+  result;
+};
+async function run2({ deps, inputs }) {
+  const env = deps.env;
+  mask(inputs.token);
+  mask(inputs.githubToken);
+  const stop = (msg) => {
+    setOutput("result", "fail", env);
+    error(msg);
+    process.stderr.write(`${msg}
+`);
+    return 1;
+  };
+  if (!inputs.githubToken) return stop("github-token is required");
+  if (!inputs.token) return stop("token is required (ci token)");
+  if (!inputs.decantUrl) return stop("decant-url is required");
+  const repo = env.GITHUB_REPOSITORY ?? "";
+  const wd = inputs.workingDirectory;
+  const policyAbs = join2(wd, inputs.policyPath);
+  const root = env.GITHUB_WORKSPACE || (isAbsolute2(wd) ? wd : process.cwd());
+  const repoPath = (abs) => relative2(resolve2(root), resolve2(root, abs)).split("\\").join("/");
+  const policyRel = repoPath(policyAbs);
+  if (policyRel.startsWith("..")) return stop(`${policyAbs} is outside the repository`);
+  if (!await deps.fs.exists(policyAbs)) return stop(`decant.json not found at ${policyAbs}`);
+  let raw;
+  try {
+    raw = JSON.parse(await deps.fs.readFile(policyAbs));
+  } catch (e) {
+    return stop(`${policyAbs} is not valid JSON: ${e.message}`);
+  }
+  const parsed = parsePolicy(raw);
+  if (!parsed.ok) return stop(`invalid policy:
+${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
+  const policy = parsed.policy;
+  const project = inputs.project || policy.project;
+  const tree = await findLockfileTree(wd, deps.fs);
+  if (tree.symlinks.length) {
+    for (const l of tree.symlinks) {
+      const msg = `${join2(wd, l.path)}: ${l.dir ? "symlinked directory" : "lockfile is a symlink"}; not supported`;
+      error(msg);
+      process.stderr.write(`${msg}
+`);
+    }
+    return stop(`${tree.symlinks.length} symlink(s) in ${wd}; decant does not audit through symlinks`);
+  }
+  const all = [];
+  for (const rel of tree.files) {
+    const abs = join2(wd, rel);
+    try {
+      const text = await deps.fs.readFile(abs);
+      all.push(...isPackageLock(rel) ? parsePackageLock(text, rel, inputs.decantUrl) : parseGoSum(text, rel));
+    } catch (e) {
+      return stop(`${abs}: ${e.message}`);
+    }
+  }
+  const registry = all.filter((d) => d.source === "registry" && d.version);
+  const now = deps.now();
+  const today = ymd2(now);
+  const outcomes = [];
+  const lines = [];
+  try {
+    const vulnsByKey = registry.length ? await createOsv(deps.fetch).queryVulns(registry) : /* @__PURE__ */ new Map();
+    const groups = /* @__PURE__ */ new Map();
+    const unfixed = [];
+    for (const d of registry) {
+      for (const v of vulnsByKey.get(depKey(d)) ?? []) {
+        const fixed = v.fixedFor(d.eco, d.name, d.version);
+        if (fixed === null) {
+          unfixed.push({ vuln: v, dep: d });
+          continue;
+        }
+        const k = `${v.id.toLowerCase()}|${d.eco}|${d.name}`;
+        const g = groups.get(k);
+        if (!g) groups.set(k, { vuln: v, eco: d.eco, name: d.name, fixed, copies: [d] });
+        else {
+          g.copies.push(d);
+          if (compareVersions(fixed, g.fixed, d.eco) > 0) g.fixed = fixed;
+        }
+      }
+    }
+    const gh = github(deps.fetch, inputs.githubToken, repo, { selfLogin: env.DECANT_GITHUB_LOGIN || "github-actions[bot]" });
+    const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
+    const ctx = { deps, inputs, gh, client, raw, policy, project, today, wd, repoPath, policyRel };
+    const sorted = [...groups.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, g]) => g);
+    for (const g of sorted) {
+      try {
+        outcomes.push(await fixGroup(ctx, g));
+      } catch (e) {
+        if (systemic(e)) throw e;
+        const msg = redact(e.message, [inputs.token, inputs.githubToken]);
+        const result = e instanceof GroupError ? e.result : "failed";
+        if (result === "failed") warning(`${g.vuln.id} ${safe2(g.name)}: ${msg}`);
+        outcomes.push({ group: g, result, detail: msg });
+      }
+    }
+    const unfixedIssue = await syncIssue(gh, UNFIXED_TITLE, unfixed.length ? unfixedBody(unfixed) : null);
+    const blocks = await client.blocks();
+    const byId = /* @__PURE__ */ new Map();
+    for (const d of all) {
+      if (!d.version) continue;
+      const id = formatPackageId(d);
+      byId.set(id, [...byId.get(id) ?? [], d]);
+    }
+    const hits = blocks.filter((b) => byId.has(b.package));
+    const blockedIssue = await syncIssue(gh, BLOCKED_TITLE, hits.length ? blockedBody(hits.map((b) => ({ ...b, files: [...new Set(byId.get(b.package).map((d) => d.file))] }))) : null);
+    let prune;
+    try {
+      prune = await pruneAllow(ctx, now);
+    } catch (e) {
+      if (systemic(e)) throw e;
+      prune = `failed: ${redact(e.message, [inputs.token, inputs.githubToken])}`;
+      warning(`prune ${prune}`);
+    }
+    lines.push("## decant audit", "");
+    if (outcomes.length) {
+      lines.push("| Advisory | Package | Fix | Result |", "|---|---|---|---|");
+      for (const o of outcomes) {
+        const detail = o.detail.replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, 200);
+        lines.push(`| ${safe2(o.group.vuln.id)} | \`${safe2(o.group.name)}\` | ${safe2(o.group.fixed)} | ${o.result}${detail ? `: ${detail}` : ""} |`);
+      }
+    } else lines.push("No fixable advisories.");
+    const count = (r) => outcomes.filter((o) => o.result === r).length;
+    lines.push(
+      "",
+      `Fixes opened: ${count("opened")} \xB7 skipped: ${count("skipped")} \xB7 unverified: ${count("unverified")} \xB7 unresolvable: ${count("unresolvable")} \xB7 failed: ${count("failed")}`,
+      `Unfixed advisories: ${unfixed.length}${unfixedIssue ? ` (issue #${unfixedIssue})` : ""}`,
+      `Blocked versions in lockfiles: ${hits.length}${blockedIssue ? ` (issue #${blockedIssue})` : ""}`,
+      `Prune: ${prune}`
+    );
+  } catch (e) {
+    return stop(`decant audit: ${redact(e.message, [inputs.token, inputs.githubToken])}`);
+  }
+  appendSummary(lines.join("\n"), env);
+  setOutput("result", "pass", env);
+  return 0;
+}
+async function fixGroup(ctx, g) {
+  const { deps, inputs, gh, client } = ctx;
+  const id = g.vuln.id;
+  const branch = fixBranch(id, g.name);
+  const open = await gh.findOpenPr(branch);
+  if (open) return { group: g, result: "skipped", detail: `PR #${open.number} open` };
+  const pkgId = formatPackageId({ eco: g.eco, name: g.name, version: g.fixed });
+  const entry2 = { package: pkgId, advisory: id, reason: "security fix", added: ctx.today };
+  const allow = ctx.raw.allow ?? [];
+  const has = allow.some((a) => a.package === pkgId && a.advisory === id);
+  const next = { ...ctx.raw, allow: has ? allow : [...allow, entry2] };
+  const check = parsePolicy(next);
+  if (!check.ok) return { group: g, result: "failed", detail: `allow entry invalid: ${check.errors.join("; ")}` };
+  const ref = overlayRef(id);
+  const res = await client.syncPolicy(ctx.project, next, deps.env.GITHUB_SHA ?? "", ref);
+  if (res.status === 401 || res.status === 403) throw new Error(`decant PUT /api/projects/${ctx.project}/policy: HTTP ${res.status}`);
+  if (res.status < 200 || res.status >= 300) {
+    const b = res.body;
+    const why = typeof b === "object" && b && typeof b.error === "string" ? b.error : typeof b === "string" ? b : JSON.stringify(b);
+    return { group: g, result: "unverified", detail: `overlay sync HTTP ${res.status}: ${why.slice(0, 200)}` };
+  }
+  const snapshot = /* @__PURE__ */ new Map();
+  const track = async (abs) => {
+    if (!snapshot.has(abs)) snapshot.set(abs, await deps.fs.exists(abs) ? await deps.fs.readFile(abs) : null);
+  };
+  const files = [];
+  try {
+    const dirs = [...new Set(g.copies.map((d) => dirname(join2(ctx.wd, d.file))))].sort();
+    for (const dir of dirs) {
+      if (g.eco === "npm") await fixNpm(ctx, g, ref, dir, track);
+      else await fixGo(ctx, g, ref, dir, track);
+    }
+    for (const [abs, before] of snapshot) {
+      const after = await deps.fs.exists(abs) ? await deps.fs.readFile(abs) : null;
+      if (after !== null && after !== before) files.push({ path: ctx.repoPath(abs), contents: after });
+    }
+  } finally {
+    for (const [abs, before] of snapshot) {
+      if (before === null) await deps.fs.rm(abs);
+      else await deps.fs.writeFile(abs, before);
+    }
+  }
+  if (!files.length) throw new GroupError("unresolvable", "no lockfile changes");
+  if (!has) files.push({ path: ctx.policyRel, contents: `${JSON.stringify(next, null, 2)}
+` });
+  const base = await gh.defaultBranch();
+  const head = await gh.branchHead(base);
+  try {
+    await gh.createBranch(branch, head);
+  } catch (e) {
+    if (!/HTTP 422/.test(e.message)) throw e;
+    await gh.updateRef(branch, head);
+  }
+  const old = [...new Set(g.copies.map((d) => d.version))].sort((a, b) => compareVersions(a, b, g.eco)).join(", ");
+  const title = `decant: ${g.name} ${old} \u2192 ${g.fixed} (${id})`;
+  await gh.commitFiles(branch, head, title, files);
+  const sev = g.vuln.severity === "unknown" ? "moderate" : g.vuln.severity;
+  const auto = ctx.policy.autoShip[sev] === "auto";
+  const pr = await gh.openPr({
+    head: branch,
+    base,
+    title,
+    body: fixBody(g, old, sev, auto, ctx.policy.cooldownDays, files.map((f) => f.path)),
+    labels: ["decant:security", `decant:${sev}`]
+  });
+  let detail = `opened #${pr.number}`;
+  if (auto) {
+    try {
+      await gh.enableAutoMerge(pr.nodeId, "SQUASH");
+      detail += " (auto-merge)";
+    } catch (e) {
+      warning(`${pr.url}: could not enable auto-merge: ${e.message}`);
+      detail += " (auto-merge unavailable)";
+    }
+  }
+  notice(`${title}: ${pr.url}`);
+  return { group: g, result: "opened", detail };
+}
+function baseEnv(env, names) {
+  const out = {};
+  for (const n of names) if (env[n] !== void 0) out[n] = env[n];
+  return out;
+}
+var tmpDir = (deps) => deps.env.RUNNER_TEMP || tmpdir();
+async function run1(deps, cmd, args, cwd, env, secrets) {
+  const r = await deps.exec(cmd, args, { cwd, env });
+  if (r.code !== 0) {
+    const why = redact((r.stderr || r.stdout).trim().split("\n").slice(-3).join(" "), secrets).slice(0, 300);
+    throw new GroupError("failed", `${cmd} ${args[0]}${args[1] && !args[1].startsWith("-") ? ` ${args[1]}` : ""} exited ${r.code}: ${why}`);
+  }
+}
+async function stale(ctx, abs, g) {
+  const deps = parsePackageLock(await ctx.deps.fs.readFile(abs), abs, ctx.inputs.decantUrl);
+  return deps.filter((d) => d.name === g.name && compareVersions(d.version, g.fixed, "npm") < 0 && g.vuln.affects("npm", d.name, d.version));
+}
+async function fixNpm(ctx, g, ref, dir, track) {
+  const { deps, inputs } = ctx;
+  const lockAbs = `${dir}/package-lock.json`;
+  const pkgAbs = `${dir}/package.json`;
+  await track(lockAbs);
+  await track(pkgAbs);
+  const base = inputs.decantUrl.replace(/\/+$/, "");
+  const url = new URL(base);
+  const registry = `${base}/r/${ref}/npm/`;
+  const userconfig = `${tmpDir(deps)}/decant-${ref}.npmrc`;
+  const env = baseEnv(deps.env, ["PATH", "HOME", "RUNNER_TEMP"]);
+  const common = ["--userconfig", userconfig, "--registry", registry, "--ignore-scripts", "--package-lock-only", "--no-audit", "--no-fund"];
+  const npm = (args) => run1(deps, "npm", [...args, ...common], dir, env, [inputs.token]);
+  await deps.fs.writeFile(userconfig, `registry=${registry}
+//${url.host}${url.pathname.replace(/\/+$/, "")}/r/${ref}/npm/:_authToken=${inputs.token}
+ignore-scripts=true
+`, 384);
+  try {
+    await deps.fs.chmod(userconfig, 384);
+    const pkgText = await deps.fs.exists(pkgAbs) ? await deps.fs.readFile(pkgAbs) : null;
+    const pkg = pkgText === null ? null : JSON.parse(pkgText);
+    const direct = !!pkg && ["dependencies", "devDependencies", "optionalDependencies"].some((k) => pkg[k]?.[g.name] !== void 0);
+    if (direct) {
+      await npm(["install", `${g.name}@${g.fixed}`]);
+    } else {
+      await npm(["update", g.name]);
+      if ((await stale(ctx, lockAbs, g)).length) {
+        if (!pkg || pkgText === null) throw new GroupError("unresolvable", `${ctx.repoPath(lockAbs)}: no package.json for an override`);
+        pkg.overrides = { ...pkg.overrides ?? {}, [g.name]: g.fixed };
+        const indent = /^\{\n(\s+)/.exec(pkgText)?.[1] ?? "  ";
+        await deps.fs.writeFile(pkgAbs, `${JSON.stringify(pkg, null, indent)}${pkgText.endsWith("\n") ? "\n" : ""}`);
+        await npm(["install"]);
+      }
+    }
+  } finally {
+    await deps.fs.rm(userconfig);
+  }
+  const n = normalizeLockfile(await deps.fs.readFile(lockAbs), inputs.decantUrl);
+  if (n.changed) await deps.fs.writeFile(lockAbs, n.text);
+  const left = await stale(ctx, lockAbs, g);
+  if (left.length) {
+    throw new GroupError("unresolvable", `${ctx.repoPath(lockAbs)} still locks ${[...new Set(left.map((d) => d.version))].map(safe2).join(", ")}`);
+  }
+}
+async function fixGo(ctx, g, ref, dir, track) {
+  const { deps, inputs } = ctx;
+  const sumAbs = `${dir}/go.sum`;
+  await track(`${dir}/go.mod`);
+  await track(sumAbs);
+  const base = inputs.decantUrl.replace(/\/+$/, "");
+  const netrc = `${tmpDir(deps)}/decant-${ref}.netrc`;
+  const env = {
+    ...baseEnv(deps.env, ["PATH", "HOME", "GOPATH", "GOCACHE"]),
+    NETRC: netrc,
+    GOPROXY: `${base}/r/${ref}/go`,
+    GOFLAGS: "-mod=mod"
+  };
+  await deps.fs.writeFile(netrc, `machine ${new URL(base).hostname} login decant password ${inputs.token}
+`, 384);
+  try {
+    await deps.fs.chmod(netrc, 384);
+    await run1(deps, "go", ["get", `${g.name}@${g.fixed}`], dir, env, [inputs.token]);
+    await run1(deps, "go", ["mod", "tidy"], dir, env, [inputs.token]);
+  } finally {
+    await deps.fs.rm(netrc);
+  }
+  const left = parseGoSum(await deps.fs.readFile(sumAbs), sumAbs).filter(
+    (d) => d.name === g.name && compareVersions(d.version, g.fixed, "go") < 0 && g.vuln.affects("go", d.name, d.version)
+  );
+  if (left.length) throw new GroupError("unresolvable", `${ctx.repoPath(sumAbs)} still has ${left.map((d) => safe2(d.version)).join(", ")}`);
+}
+async function syncIssue(gh, title, body) {
+  if (body !== null) return (await gh.upsertIssue(title, body, ISSUE_LABELS)).number;
+  const n = await gh.findIssue(title, ISSUE_LABELS);
+  if (n !== null) {
+    await gh.closeIssue(n);
+    notice(`closed #${n} (${title})`);
+  }
+  return null;
+}
+function fixBody(g, old, sev, auto, cooldownDays, paths) {
+  const v = g.vuln;
+  const summary = v.summary.replace(/\s+/g, " ").replace(/[<>]/g, "").slice(0, 300);
+  return [
+    `Security fix for **${safe2(v.id)}** (${sev}) in \`${safe2(g.name)}\`: ${safe2(old)} \u2192 ${safe2(g.fixed)}.`,
+    "",
+    summary ? `> ${summary}` : "",
+    "",
+    `Advisory: ${advisoryUrl(v.id)}${v.aliases.length ? ` (aliases: ${v.aliases.map(safe2).join(", ")})` : ""}`,
+    "",
+    `**Cooldown skip:** this PR adds an \`allow\` entry for \`${safe2(formatPackageId({ eco: g.eco, name: g.name, version: g.fixed }))}\` citing ${safe2(v.id)}, so the fixed version ships without waiting out the ${cooldownDays}-day cooldown. decant honors it only while OSV lists this version as fixed; it is never exempt from the scan.`,
+    "",
+    "Files:",
+    ...paths.map((p) => `- \`${p}\``),
+    "",
+    auto ? `autoShip.${sev} is \`auto\`: auto-merge is on; it merges once the required checks (including the decant scan) pass.` : `autoShip.${sev} is \`approve\`: review and merge.`
+  ].filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
+}
+function unfixedBody(items) {
+  const rows = [...new Map(items.map((i) => [`${i.vuln.id}|${depKey(i.dep)}|${i.dep.file}`, i])).values()].sort(
+    (a, b) => a.vuln.id < b.vuln.id ? -1 : a.vuln.id > b.vuln.id ? 1 : 0
+  );
+  return [
+    "Advisories affecting locked versions with no fixed release yet. decant updates this issue daily and closes it when none remain.",
+    "",
+    "| Advisory | Severity | Package | Lockfile |",
+    "|---|---|---|---|",
+    ...rows.map((i) => `| [${safe2(i.vuln.id)}](${advisoryUrl(i.vuln.id)}) | ${i.vuln.malicious ? "malicious" : i.vuln.severity} | \`${safe2(i.dep.name)}@${safe2(i.dep.version)}\` | ${safe2(i.dep.file)} |`)
+  ].join("\n");
+}
+function blockedBody(hits) {
+  return [
+    "Versions in the lockfiles that decant blocks globally. Installs of these fail; upgrade or remove them. decant closes this issue when none remain.",
+    "",
+    "| Package | Source | Reason | Lockfiles |",
+    "|---|---|---|---|",
+    ...hits.map((h) => `| \`${safe2(h.package)}\` | ${safe2(h.source)} | ${h.reason.replace(/[|\n<>]/g, " ").slice(0, 200)} | ${h.files.map(safe2).join(", ")} |`)
+  ].join("\n");
+}
+async function pruneAllow(ctx, now) {
+  const { deps, gh } = ctx;
+  const allow = ctx.raw.allow ?? [];
+  const expired = [];
+  let unknown = 0;
+  for (const e of allow) {
+    const p = parsePackageId(e.package);
+    if (!p) continue;
+    let at = null;
+    try {
+      at = p.eco === "npm" ? await npmPublishTime(deps.fetch, p.name, p.version) : await goPublishTime(deps.fetch, p.name, p.version);
+    } catch (err) {
+      warning(`prune: ${safe2(e.package)}: ${err.message}`);
+    }
+    if (!at) {
+      unknown++;
+      continue;
+    }
+    if (at.getTime() + ctx.policy.cooldownDays * DAY2 <= now.getTime()) expired.push({ e, at });
+  }
+  if (!expired.length) return `nothing expired${unknown ? ` (${unknown} publish time(s) unknown)` : ""}`;
+  const gone = new Set(expired.map((x) => x.e));
+  const next = { ...ctx.raw, allow: allow.filter((e) => !gone.has(e)) };
+  const contents = `${JSON.stringify(next, null, 2)}
+`;
+  const files = [{ path: ctx.policyRel, contents }];
+  const body = [
+    `These \`allow\` entries have aged past the ${ctx.policy.cooldownDays}-day cooldown and no longer do anything. Review, then merge (never auto-merged).`,
+    "",
+    "| package | reason | published |",
+    "| --- | --- | --- |",
+    ...expired.map((x) => `| ${safe2(x.e.package)} | ${x.e.reason.replace(/[|\n<>]/g, " ").slice(0, 100)} | ${ymd2(x.at)} |`)
+  ].join("\n");
+  const title = "decant: prune allow entries";
+  const open = await gh.findOpenPr(PRUNE_BRANCH);
+  const base = await gh.defaultBranch();
+  let head;
+  if (open) {
+    head = open.headSha;
+    if (await gh.fileAt(ctx.policyRel, head) === contents) return `PR #${open.number} up to date (${expired.length} entr${expired.length === 1 ? "y" : "ies"})`;
+  } else {
+    head = await gh.branchHead(base);
+    try {
+      await gh.createBranch(PRUNE_BRANCH, head);
+    } catch (e) {
+      if (!/HTTP 422/.test(e.message)) throw e;
+      await gh.updateRef(PRUNE_BRANCH, head);
+    }
+  }
+  await gh.commitFiles(PRUNE_BRANCH, head, title, files);
+  if (open) {
+    await gh.updatePr(open.number, { body });
+    return `updated PR #${open.number} (${expired.length} expired)`;
+  }
+  const pr = await gh.openPr({ head: PRUNE_BRANCH, base, title, body, labels: ["decant:prune"] });
+  notice(`${title}: ${pr.url}`);
+  return `opened PR #${pr.number} (${expired.length} expired)`;
+}
+
+// action/src/modes/scan.ts
+var scan_exports = {};
+__export(scan_exports, {
+  MARKER: () => MARKER,
+  run: () => run3
+});
+import { join as join3 } from "node:path";
+import { tmpdir as tmpdir2 } from "node:os";
+
+// action/src/event.ts
+async function readPayload(deps) {
+  const p = deps.env.GITHUB_EVENT_PATH;
+  if (!p) return {};
+  try {
+    return JSON.parse(await deps.fs.readFile(p));
+  } catch {
+    throw new Error(`cannot read event payload at ${p}`);
+  }
+}
+function isForkPr(payload) {
+  const head = payload.pull_request?.head?.repo;
+  return !head || head.full_name !== payload.repository?.full_name;
+}
+
+// action/src/guarddog.ts
+var GUARDDOG_VERSION = "3.2.0";
+function tail(s) {
+  return s.trim().split("\n").slice(-5).join(" ").slice(0, 500);
+}
+async function installGuardDog(exec, dir, actionPath) {
+  const venv = await exec("python3", ["-m", "venv", dir]);
+  if (venv.code !== 0) throw new Error(`python3 -m venv failed: ${tail(venv.stderr)}`);
+  const req = `${actionPath.replace(/\/+$/, "")}/guarddog-requirements.txt`;
+  const pip = await exec(`${dir}/bin/pip`, [
+    "install",
+    "--disable-pip-version-check",
+    "--require-hashes",
+    "--no-deps",
+    "--only-binary",
+    ":all:",
+    "-r",
+    req
+  ]);
+  if (pip.code !== 0) throw new Error(`pip install of GuardDog failed: ${tail(pip.stderr)}`);
+  return { bin: `${dir}/bin/guarddog` };
+}
+var hasFindings = (v) => Array.isArray(v) ? v.length > 0 : typeof v === "object" && v !== null ? Object.keys(v).length > 0 : typeof v === "string" ? v !== "" : !!v;
+function parseGuardDogJson(stdout) {
+  let doc;
+  try {
+    doc = JSON.parse(stdout);
+  } catch {
+    throw new Error("guarddog: invalid JSON output");
+  }
+  if (doc.errors && typeof doc.errors === "object" && Object.keys(doc.errors).length > 0) {
+    throw new Error(`guarddog reported errors: ${Object.keys(doc.errors).join(", ")}`);
+  }
+  if (!doc.results || typeof doc.results !== "object") throw new Error("guarddog: no results in output");
+  const details = [];
+  for (const [rule, v] of Object.entries(doc.results).sort(([a], [b]) => a < b ? -1 : 1)) {
+    if (rule.startsWith("capability-") || !hasFindings(v)) continue;
+    details.push(Array.isArray(v) ? `${rule} (${v.length})` : rule);
+  }
+  if (Array.isArray(doc.risks) && doc.risks.length > 0) {
+    const label = typeof doc.risk_score?.label === "string" ? doc.risk_score.label : "unlabelled";
+    details.push(`risk: ${label}`);
+  }
+  return { result: details.length > 0 ? "flagged" : "clean", details };
+}
+async function scan(exec, bin, eco, path) {
+  const r = await exec(bin, [eco, "scan", path, "--output-format", "json", "--sandbox"]);
+  if (r.code !== 0) throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+  return parseGuardDogJson(r.stdout);
+}
+var scanNpm = (exec, bin, tgzPath) => scan(exec, bin, "npm", tgzPath);
+var scanGo = (exec, bin, zipPath) => scan(exec, bin, "go", zipPath);
+
 // action/src/modes/scan.ts
 var MARKER = "<!-- decant-scan -->";
 var MAX_DEPS2 = 500;
@@ -1379,8 +1817,8 @@ function fail(msg) {
 `);
   return 1;
 }
-var safe2 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
-var isPackageLock = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
+var safe3 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var isPackageLock2 = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
 var shellQuote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
 function newReviewScope(p) {
   return p.action === "synchronize" || p.action === "reopened" || p.action === "edited" && !!p.changes?.base;
@@ -1405,7 +1843,7 @@ async function baseFile(deps, wd, sha, rel) {
   );
 }
 function parseLock(rel, text, decantUrl) {
-  return isPackageLock(rel) ? parsePackageLock(text, rel, decantUrl) : parseGoSum(text, rel);
+  return isPackageLock2(rel) ? parsePackageLock(text, rel, decantUrl) : parseGoSum(text, rel);
 }
 async function cooldownNote(deps, dep, cooldownDays) {
   try {
@@ -1428,10 +1866,10 @@ function render(rows, pass, failOn, ref, limit = Infinity) {
   const lines = [];
   let size = head.length;
   for (const [i, r] of rows.entries()) {
-    const vulns = r.vulns.length ? r.vulns.map((v) => `${safe2(v.id)} (${v.malicious ? "malicious" : v.severity})`).join(", ") : "\u2014";
+    const vulns = r.vulns.length ? r.vulns.map((v) => `${safe3(v.id)} (${v.malicious ? "malicious" : v.severity})`).join(", ") : "\u2014";
     const status = r.problems.length ? `\u274C ${r.problems.join("; ")}` : r.warn ? `\u26A0\uFE0F ${r.notes.join("; ")}` : `\u2705 ${r.notes.length ? r.notes.join("; ") : "ok"}`;
     const source = r.dep.source === "registry" ? r.dep.eco : "other";
-    const line = `| \`${safe2(r.dep.name)}@${safe2(r.dep.version)}\` | ${source} | ${r.osv} | ${r.guarddog} | ${vulns} | ${status} |`;
+    const line = `| \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` | ${source} | ${r.osv} | ${r.guarddog} | ${vulns} | ${status} |`;
     if (size + line.length + 1 > limit) {
       lines.push(`
 \u2026 and ${rows.length - i} more (see the job summary).`);
@@ -1475,7 +1913,7 @@ async function run3({ deps, inputs }) {
   const failOn = inputs.failOn;
   const wd = inputs.workingDirectory;
   let cooldownDays = 7;
-  const policyFile = join2(wd, inputs.policyPath);
+  const policyFile = join3(wd, inputs.policyPath);
   if (await deps.fs.exists(policyFile)) {
     let parsed;
     try {
@@ -1504,7 +1942,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     const tree = await findLockfileTree(wd, deps.fs);
     if (tree.symlinks.length) {
       for (const l of tree.symlinks) {
-        const msg = `${join2(wd, l.path)}: ${l.dir ? "symlinked directory" : "lockfile is a symlink"}; not supported`;
+        const msg = `${join3(wd, l.path)}: ${l.dir ? "symlinked directory" : "lockfile is a symlink"}; not supported`;
         error(msg);
         process.stderr.write(`${msg}
 `);
@@ -1512,11 +1950,11 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       return stop(`${tree.symlinks.length} symlink(s) in ${wd}; decant does not scan through symlinks`);
     }
     for (const rel of tree.files) {
-      const abs = join2(wd, rel);
+      const abs = join3(wd, rel);
       const head = await deps.fs.readFile(abs);
       const base = await baseFile(deps, wd, baseSha, rel);
       if (base === head) continue;
-      if (isPackageLock(rel) && containsDecantUrls(head, inputs.decantUrl)) {
+      if (isPackageLock2(rel) && containsDecantUrls(head, inputs.decantUrl)) {
         withDecantUrls.push(abs);
         continue;
       }
@@ -1558,7 +1996,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       else {
         r.warn = true;
         r.notes.push("not from the registry; not scanned");
-        warning(`${safe2(d.name)}@${safe2(d.version)} in ${d.file} is not from the registry and was not scanned`, d.file);
+        warning(`${safe3(d.name)}@${safe3(d.version)} in ${d.file} is not from the registry and was not scanned`, d.file);
       }
       rows.push(r);
     }
@@ -1566,12 +2004,12 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     const regDeps = [...registry.values()];
     const vulnsByKey = regDeps.length ? await createOsv(deps.fetch).queryVulns(regDeps) : /* @__PURE__ */ new Map();
     const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
-    const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
+    const scratch = `${env.RUNNER_TEMP || tmpdir2()}/decant-scan`;
     let gd = null;
     const guarddog = () => {
       if (!gd) {
         const actionPath = env.GITHUB_ACTION_PATH;
-        gd = actionPath ? installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionPath) : Promise.reject(new Error("GITHUB_ACTION_PATH is not set"));
+        gd = actionPath ? installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir2()}/decant-guarddog`, actionPath) : Promise.reject(new Error("GITHUB_ACTION_PATH is not set"));
       }
       return gd;
     };
@@ -1583,7 +2021,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
         await evaluate(r, i);
       } catch (e) {
         const msg = e.message;
-        error(`${safe2(r.dep.name)}@${safe2(r.dep.version)}: ${msg}`);
+        error(`${safe3(r.dep.name)}@${safe3(r.dep.version)}: ${msg}`);
         r.problems.push("scan error (see log)");
       }
     });
@@ -1596,7 +2034,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       if (blocked.has(id)) problem("blocked by decant");
       const cached = await client.getVerdicts(id);
       const of = (s) => cached.find((v) => v.scanner === s);
-      if (cached.some((v) => v.result === "malicious")) r.problems.push(`malicious (${cached.filter((v) => v.result === "malicious").map((v) => safe2(v.scanner)).join(", ")})`);
+      if (cached.some((v) => v.result === "malicious")) r.problems.push(`malicious (${cached.filter((v) => v.result === "malicious").map((v) => safe3(v.scanner)).join(", ")})`);
       r.vulns = vulnsByKey.get(depKey(d)) ?? [];
       const mal = r.vulns.filter((v) => v.malicious).map((v) => v.id);
       const osvResult = mal.length ? "malicious" : "clean";
@@ -1632,7 +2070,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
           await client.putVerdict({ package: id, scanner: "guarddog", scannerVersion: GUARDDOG_VERSION, result: res.result, details: res.details });
           gdResult = res.result;
           r.guarddog = res.result;
-          if (res.details.length) r.notes.push(`GuardDog: ${res.details.map(safe2).join(", ")}`);
+          if (res.details.length) r.notes.push(`GuardDog: ${res.details.map(safe3).join(", ")}`);
         }
       }
       if (gdResult === "flagged") r.flagged = true;
@@ -1717,7 +2155,7 @@ var sync_exports = {};
 __export(sync_exports, {
   run: () => run5
 });
-import { join as join3 } from "node:path";
+import { join as join4 } from "node:path";
 function fail3(msg) {
   error(msg);
   process.stderr.write(`${msg}
@@ -1728,7 +2166,7 @@ async function run5({ deps, inputs }) {
   const env = deps.env;
   mask(inputs.token);
   mask(inputs.syncToken);
-  const policyFile = join3(inputs.workingDirectory, inputs.policyPath);
+  const policyFile = join4(inputs.workingDirectory, inputs.policyPath);
   if (!await deps.fs.exists(policyFile)) return fail3(`decant.json not found at ${policyFile}`);
   let raw;
   try {
