@@ -1,3 +1,4 @@
+import { handleAdmin } from './admin/handler';
 import { authenticate, type RequestCtx } from './auth';
 import { handleGo } from './go/handler';
 import { notFound, text } from './http';
@@ -18,8 +19,7 @@ export async function handle(req: Request, env: Env, deps: Deps, ctx: ExecutionC
   if (p === '/api' || p.startsWith('/api/')) {
     const auth = await authenticate(req, env);
     if (!auth) return unauthorized();
-    if (auth.kind !== 'operator') return text('forbidden', 403);
-    return notFound(); // stub: Task 5 replaces with the admin handler
+    return handleAdmin(req, env, deps, ctx, auth, p);
   }
 
   // /(r/<ref>/)?(npm|go)(/...)?

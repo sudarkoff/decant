@@ -62,9 +62,12 @@ it('anything else -> 404; /api/* is stub 404 for operator', async () => {
   expect((await get('/api/x', bearer(opToken))).status).toBe(404);
 });
 
-it('/api/* requires operator', async () => {
-  expect((await get('/api/x')).status).toBe(401);
-  expect((await get('/api/x', bearer(tokens.read))).status).toBe(403);
+it('/api/* requires authentication; per-route authz is the admin handler', async () => {
+  const res = await get('/api/x');
+  expect(res.status).toBe(401);
+  expect(res.headers.get('www-authenticate')).toBe('Basic realm="decant"');
+  expect((await get('/api/x', bearer(tokens.read))).status).toBe(404); // reaches stub
+  expect((await get('/api/x', bearer(tokens.ci))).status).toBe(404); // CI not rejected at router
 });
 
 it('empty OPERATOR_TOKEN_HASH never authenticates', async () => {
