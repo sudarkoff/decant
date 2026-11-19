@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/sudarkoff/decant/main/schema/policy.json",
+  "title": "decant policy",
+  "type": "object",
+  "required": ["project"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "project": { "type": "string", "minLength": 1 },
+    "cooldownDays": { "type": "integer", "minimum": 0, "maximum": 365, "default": 7 },
+    "autoShip": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "critical": { "enum": ["auto", "approve"], "default": "auto" },
+        "high": { "enum": ["auto", "approve"], "default": "auto" },
+        "moderate": { "enum": ["auto", "approve"], "default": "approve" },
+        "low": { "enum": ["auto", "approve"], "default": "approve" }
+      }
+    },
+    "allow": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["package", "reason", "added"],
+        "additionalProperties": false,
+        "properties": {
+          "package": { "type": "string", "pattern": "^(npm|go):.+@.+$" },
+          "reason": { "type": "string", "minLength": 1 },
+          "advisory": { "$ref": "#/$defs/advisory" },
+          "added": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$", "format": "date" }
+        }
+      }
+    },
+    "block": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["package", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "package": { "type": "string", "pattern": "^(npm|go):.+@.+$" },
+          "reason": { "type": "string", "minLength": 1 },
+          "advisory": { "$ref": "#/$defs/advisory" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "advisory": {
+      "type": "string",
+      "pattern": "^(GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}|CVE-\\d{4}-\\d{4,}|[A-Z]+-\\d{4}-[A-Za-z0-9-]+)$"
+    }
+  }
+}
