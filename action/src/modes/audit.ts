@@ -1,8 +1,9 @@
-import { tmpdir } from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { formatPackageId, parsePackageId } from '../../../src/ids';
 import { parsePolicy, type AllowEntry, type Policy, type Severity } from '../../../src/policy/schema';
-import { compareVersions } from '../../../src/semver';
+import { compareVersions, parseVersion } from '../../../src/semver';
+import { defaultHeadCheckout } from '../checkout';
 import { decant, type DecantClient } from '../decant-client';
 import type { ActionDeps } from '../deps';
 import { appendSummary, error, mask, notice, setOutput, warning } from '../gh-io';
@@ -19,6 +20,10 @@ const PRUNE_BRANCH = 'decant/prune';
 const UNFIXED_TITLE = 'decant: unfixed advisories';
 const BLOCKED_TITLE = 'decant: blocked versions in lockfiles';
 const ISSUE_LABELS = ['decant:security'];
+/** npm package names (legacy uppercase allowed); never starting with '-', '.' or '_'. */
+const NPM_NAME = /^(?:@[A-Za-z0-9~][A-Za-z0-9._~-]*\/)?[A-Za-z0-9~][A-Za-z0-9._~-]*$/;
+/** Go module paths; never starting with '-'. */
+const GO_MODULE = /^[A-Za-z0-9][A-Za-z0-9._~+/-]*$/;
 
 const safe = (s: string) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, '?');
 const ymd = (d: Date) => d.toISOString().slice(0, 10);
@@ -48,6 +53,20 @@ export function overlayRef(id: string): string {
   return `audit-${slug(id)}`.slice(0, 64).replace(/[.-]+$/, '');
 }
 
+/** The compatibility line of a version: its major, or 0.<minor> below 1.0.0. */
+function line(v: string, eco: 'npm' | 'go'): string {
+  const p = parseVersion(v, eco);
+  if (!p) return `?${v}`;
+  return p.major > 0 ? String(p.major) : `0.${p.minor}`;
+}
+
+/** npm override selector for the copies on `version`'s line: name@^M, or name@~0.m for 0.x. */
+export function overrideKey(name: string, version: string): string {
+  const p = parseVersion(version, 'npm');
+  if (!p) throw new GroupError('unresolvable', `cannot build an override for ${safe(name)}@${safe(version)}`);
+  return p.major > 0 ? `${name}@^${p.major}` : `${name}@~0.${p.minor}`;
+}
+
 function advisoryUrl(id: string): string {
   return id.startsWith('GHSA-') ? `https://github.com/advisories/${id}` : `https://osv.dev/vulnerability/${encodeURIComponent(id)}`;
 }
@@ -55,16 +74,18 @@ function advisoryUrl(id: string): string {
 /** A GitHub/decant failure that no later group can survive (bad credentials). */
 const systemic = (e: unknown) => /^(GitHub|decant) [A-Z]+ \S+: HTTP 40[13]\b/.test((e as Error)?.message ?? '');
 
+/** One vulnerable locked copy and the fix for its own version line. */
+type Copy = { dep: Dep; fix: string };
+
 type Group = {
   vuln: Vuln;
   eco: 'npm' | 'go';
   name: string;
-  fixed: string;
-  /** Vulnerable copies (lockfile + version). */
-  copies: Dep[];
+  copies: Copy[];
 };
 
-type Outcome = { group: Group; result: 'opened' | 'skipped' | 'unverified' | 'unresolvable' | 'failed'; detail: string };
+type Result = 'opened' | 'skipped' | 'declined' | 'unverified' | 'unresolvable' | 'failed';
+type Outcome = { group: Group; result: Result; detail: string };
 
 class GroupError extends Error {
   constructor(
@@ -73,6 +94,16 @@ class GroupError extends Error {
   ) {
     super(msg);
   }
+}
+
+const uniqSorted = (vs: string[], eco: 'npm' | 'go') => [...new Set(vs)].sort((a, b) => compareVersions(a, b, eco));
+const fixesOf = (g: Group) => uniqSorted(g.copies.map((c) => c.fix), g.eco);
+const oldsOf = (g: Group) => uniqSorted(g.copies.map((c) => c.dep.version), g.eco);
+
+/** The fix for `version` if the advisory affects it and names a valid fixed version; else null. */
+function validFix(v: Vuln, eco: 'npm' | 'go', name: string, version: string): string | null {
+  const f = v.fixedFor(eco, name, version);
+  return f !== null && parseVersion(f, eco) !== null ? f : null;
 }
 
 export async function run({ deps, inputs }: ModeCtx): Promise<number> {
@@ -89,6 +120,8 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   if (!inputs.githubToken) return stop('github-token is required');
   if (!inputs.token) return stop('token is required (ci token)');
   if (!inputs.decantUrl) return stop('decant-url is required');
+  // Credential files go in a private directory under the runner's per-job temp dir, never a shared /tmp.
+  if (!env.RUNNER_TEMP) return stop('RUNNER_TEMP is not set; decant audit runs on GitHub Actions runners');
   const repo = env.GITHUB_REPOSITORY ?? '';
   const wd = inputs.workingDirectory;
   const policyAbs = join(wd, inputs.policyPath);
@@ -136,33 +169,51 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const today = ymd(now);
   const outcomes: Outcome[] = [];
   const lines: string[] = [];
+  let tmp: Promise<string> | null = null;
 
   try {
+    const gh = github(deps.fetch, inputs.githubToken, repo, { selfLogin: env.DECANT_GITHUB_LOGIN || undefined });
+    // Commits carry checkout content, so the checkout must be the live default-branch head.
+    const co = await defaultHeadCheckout(gh, env, 'audit');
+    if (!co.ok) return stop(co.message);
+
     // 3. OSV (fails the run if unavailable).
     const vulnsByKey = registry.length ? await createOsv(deps.fetch).queryVulns(registry) : new Map<string, Vuln[]>();
 
     const groups = new Map<string, Group>();
-    const unfixed: { vuln: Vuln; dep: Dep }[] = [];
+    const unfixed: { vuln: Vuln; dep: Dep; reason: string }[] = [];
     for (const d of registry) {
       for (const v of vulnsByKey.get(depKey(d)) ?? []) {
-        const fixed = v.fixedFor(d.eco, d.name, d.version);
-        if (fixed === null) {
-          unfixed.push({ vuln: v, dep: d });
+        const raw = v.fixedFor(d.eco, d.name, d.version);
+        const fix = validFix(v, d.eco, d.name, d.version);
+        if (fix === null) {
+          unfixed.push({ vuln: v, dep: d, reason: raw === null ? 'no fixed version' : 'invalid fixed version' });
           continue;
         }
         const k = `${v.id.toLowerCase()}|${d.eco}|${d.name}`;
         const g = groups.get(k);
-        if (!g) groups.set(k, { vuln: v, eco: d.eco, name: d.name, fixed, copies: [d] });
-        else {
-          g.copies.push(d);
-          if (compareVersions(fixed, g.fixed, d.eco) > 0) g.fixed = fixed;
-        }
+        if (!g) groups.set(k, { vuln: v, eco: d.eco, name: d.name, copies: [{ dep: d, fix }] });
+        else g.copies.push({ dep: d, fix });
       }
     }
 
-    const gh = github(deps.fetch, inputs.githubToken, repo, { selfLogin: env.DECANT_GITHUB_LOGIN || 'github-actions[bot]' });
     const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
-    const ctx: FixCtx = { deps, inputs, gh, client, raw, policy, project, today, wd, repoPath, policyRel };
+    const ctx: FixCtx = {
+      deps,
+      inputs,
+      gh,
+      client,
+      raw,
+      policy,
+      project,
+      today,
+      wd,
+      repoPath,
+      policyRel,
+      base: co.base,
+      sha: co.sha,
+      tmpFile: async (ext) => `${await (tmp ??= deps.fs.mkdtemp(`${env.RUNNER_TEMP}/decant-audit-`))}/${randomUUID()}.${ext}`,
+    };
 
     // 4. One PR per (advisory group, package).
     const sorted = [...groups.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, g]) => g);
@@ -207,19 +258,21 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       lines.push('| Advisory | Package | Fix | Result |', '|---|---|---|---|');
       for (const o of outcomes) {
         const detail = o.detail.replace(/\s+/g, ' ').replace(/\|/g, '\\|').slice(0, 200);
-        lines.push(`| ${safe(o.group.vuln.id)} | \`${safe(o.group.name)}\` | ${safe(o.group.fixed)} | ${o.result}${detail ? `: ${detail}` : ''} |`);
+        lines.push(`| ${safe(o.group.vuln.id)} | \`${safe(o.group.name)}\` | ${fixesOf(o.group).map(safe).join(', ')} | ${o.result}${detail ? `: ${detail}` : ''} |`);
       }
     } else lines.push('No fixable advisories.');
-    const count = (r: Outcome['result']) => outcomes.filter((o) => o.result === r).length;
+    const count = (r: Result) => outcomes.filter((o) => o.result === r).length;
     lines.push(
       '',
-      `Fixes opened: ${count('opened')} · skipped: ${count('skipped')} · unverified: ${count('unverified')} · unresolvable: ${count('unresolvable')} · failed: ${count('failed')}`,
+      `Fixes opened: ${count('opened')} · skipped: ${count('skipped')} · declined: ${count('declined')} · unverified: ${count('unverified')} · unresolvable: ${count('unresolvable')} · failed: ${count('failed')}`,
       `Unfixed advisories: ${unfixed.length}${unfixedIssue ? ` (issue #${unfixedIssue})` : ''}`,
       `Blocked versions in lockfiles: ${hits.length}${blockedIssue ? ` (issue #${blockedIssue})` : ''}`,
       `Prune: ${prune}`,
     );
   } catch (e) {
     return stop(`decant audit: ${redact((e as Error).message, [inputs.token, inputs.githubToken])}`);
+  } finally {
+    if (tmp) await deps.fs.rm(await tmp.catch(() => '')).catch(() => {});
   }
   appendSummary(lines.join('\n'), env);
   setOutput('result', 'pass', env);
@@ -238,25 +291,38 @@ type FixCtx = {
   wd: string;
   repoPath: (abs: string) => string;
   policyRel: string;
+  /** Default branch and the checked-out sha it pointed at (base for new branches). */
+  base: string;
+  sha: string;
+  /** A fresh randomly named path inside this run's private temp dir. */
+  tmpFile: (ext: string) => Promise<string>;
 };
 
 async function fixGroup(ctx: FixCtx, g: Group): Promise<Outcome> {
   const { deps, inputs, gh, client } = ctx;
   const id = g.vuln.id;
+  if (!(g.eco === 'npm' ? NPM_NAME : GO_MODULE).test(g.name) || g.name.includes('..')) {
+    return { group: g, result: 'failed', detail: `invalid package name ${safe(g.name)}` };
+  }
   const branch = fixBranch(id, g.name);
   const open = await gh.findOpenPr(branch);
   if (open) return { group: g, result: 'skipped', detail: `PR #${open.number} open` };
+  const closed = await gh.findClosedUnmergedPr(branch);
+  if (closed !== null) return { group: g, result: 'declined', detail: `PR #${closed} was closed without merging` };
 
-  // Overlay: main policy + the advisory's allow entry, verified by decant (OSV) at sync time.
-  const pkgId = formatPackageId({ eco: g.eco, name: g.name, version: g.fixed });
-  const entry: AllowEntry = { package: pkgId, advisory: id, reason: 'security fix', added: ctx.today };
+  // Overlay: main policy + one allow entry per fixed version, verified by decant (OSV) at sync time.
+  const fixes = fixesOf(g);
   const allow = (ctx.raw.allow as AllowEntry[] | undefined) ?? [];
-  const has = allow.some((a) => a.package === pkgId && a.advisory === id);
-  const next = { ...ctx.raw, allow: has ? allow : [...allow, entry] };
+  const added: AllowEntry[] = [];
+  for (const fix of fixes) {
+    const pkgId = formatPackageId({ eco: g.eco, name: g.name, version: fix });
+    if (!allow.some((a) => a.package === pkgId && a.advisory === id)) added.push({ package: pkgId, advisory: id, reason: 'security fix', added: ctx.today });
+  }
+  const next = { ...ctx.raw, allow: [...allow, ...added] };
   const check = parsePolicy(next);
   if (!check.ok) return { group: g, result: 'failed', detail: `allow entry invalid: ${check.errors.join('; ')}` };
   const ref = overlayRef(id);
-  const res = await client.syncPolicy(ctx.project, next, deps.env.GITHUB_SHA ?? '', ref);
+  const res = await client.syncPolicy(ctx.project, next, ctx.sha, ref);
   if (res.status === 401 || res.status === 403) throw new Error(`decant PUT /api/projects/${ctx.project}/policy: HTTP ${res.status}`);
   if (res.status < 200 || res.status >= 300) {
     const b = res.body as { error?: unknown } | string;
@@ -271,7 +337,7 @@ async function fixGroup(ctx: FixCtx, g: Group): Promise<Outcome> {
   };
   const files: { path: string; contents: string }[] = [];
   try {
-    const dirs = [...new Set(g.copies.map((d) => dirname(join(ctx.wd, d.file))))].sort();
+    const dirs = [...new Set(g.copies.map((c) => dirname(join(ctx.wd, c.dep.file))))].sort();
     for (const dir of dirs) {
       if (g.eco === 'npm') await fixNpm(ctx, g, ref, dir, track);
       else await fixGo(ctx, g, ref, dir, track);
@@ -287,28 +353,28 @@ async function fixGroup(ctx: FixCtx, g: Group): Promise<Outcome> {
     }
   }
   if (!files.length) throw new GroupError('unresolvable', 'no lockfile changes');
-  if (!has) files.push({ path: ctx.policyRel, contents: `${JSON.stringify(next, null, 2)}\n` });
+  if (added.length) files.push({ path: ctx.policyRel, contents: `${JSON.stringify(next, null, 2)}\n` });
 
-  // Branch from the default head, one commit, PR.
-  const base = await gh.defaultBranch();
-  const head = await gh.branchHead(base);
+  // Branch from the checked-out default head, one commit, PR.
   try {
-    await gh.createBranch(branch, head);
+    await gh.createBranch(branch, ctx.sha);
   } catch (e) {
-    // A stale branch with no open PR (merged or closed earlier): reset it to the default head.
+    // A stale branch with no open PR (merged earlier): reset it to the default head.
     if (!/HTTP 422/.test((e as Error).message)) throw e;
-    await gh.updateRef(branch, head);
+    await gh.updateRef(branch, ctx.sha);
   }
-  const old = [...new Set(g.copies.map((d) => d.version))].sort((a, b) => compareVersions(a, b, g.eco)).join(', ');
-  const title = `decant: ${g.name} ${old} → ${g.fixed} (${id})`;
-  await gh.commitFiles(branch, head, title, files);
+  const olds = oldsOf(g);
+  const title = `decant: ${g.name} ${olds.join(', ')} → ${fixes.join(', ')} (${id})`;
+  await gh.commitFiles(branch, ctx.sha, title, files);
   const sev: Severity = g.vuln.severity === 'unknown' ? 'moderate' : g.vuln.severity;
-  const auto = ctx.policy.autoShip[sev] === 'auto';
+  // Crossing a major (or 0.x minor) line may break callers: never merge that unattended.
+  const major = g.copies.some((c) => line(c.dep.version, g.eco) !== line(c.fix, g.eco));
+  const auto = ctx.policy.autoShip[sev] === 'auto' && !major;
   const pr = await gh.openPr({
     head: branch,
-    base,
+    base: ctx.base,
     title,
-    body: fixBody(g, old, sev, auto, ctx.policy.cooldownDays, files.map((f) => f.path)),
+    body: fixBody(g, sev, auto, major, ctx.policy.cooldownDays, files.map((f) => f.path)),
     labels: ['decant:security', `decant:${sev}`],
   });
   let detail = `opened #${pr.number}`;
@@ -320,7 +386,7 @@ async function fixGroup(ctx: FixCtx, g: Group): Promise<Outcome> {
       warning(`${pr.url}: could not enable auto-merge: ${(e as Error).message}`);
       detail += ' (auto-merge unavailable)';
     }
-  }
+  } else if (major) detail += ' (major upgrade: auto-merge disabled)';
   notice(`${title}: ${pr.url}`);
   return { group: g, result: 'opened', detail };
 }
@@ -331,20 +397,25 @@ function baseEnv(env: ActionDeps['env'], names: string[]): Record<string, string
   return out;
 }
 
-const tmpDir = (deps: ActionDeps) => deps.env.RUNNER_TEMP || tmpdir();
-
 async function run1(deps: ActionDeps, cmd: string, args: string[], cwd: string, env: Record<string, string>, secrets: string[]): Promise<void> {
   const r = await deps.exec(cmd, args, { cwd, env });
   if (r.code !== 0) {
+    const what = [args[0], ...args.slice(args.indexOf('--') + 1 || args.length)].join(' ');
     const why = redact((r.stderr || r.stdout).trim().split('\n').slice(-3).join(' '), secrets).slice(0, 300);
-    throw new GroupError('failed', `${cmd} ${args[0]}${args[1] && !args[1].startsWith('-') ? ` ${args[1]}` : ''} exited ${r.code}: ${why}`);
+    throw new GroupError('failed', `${cmd} ${what} exited ${r.code}: ${why}`);
   }
 }
 
-/** npm copies of `name` below `fixed` that the advisory still affects, in the lockfile at `abs`. */
-async function stale(ctx: FixCtx, abs: string, g: Group): Promise<Dep[]> {
+/** Copies of the group's package in the lockfile at `abs` that the advisory still affects (and that have a fix). */
+async function stale(ctx: FixCtx, abs: string, g: Group): Promise<Copy[]> {
   const deps = parsePackageLock(await ctx.deps.fs.readFile(abs), abs, ctx.inputs.decantUrl);
-  return deps.filter((d) => d.name === g.name && compareVersions(d.version, g.fixed, 'npm') < 0 && g.vuln.affects('npm', d.name, d.version));
+  const out: Copy[] = [];
+  for (const d of deps) {
+    if (d.name !== g.name) continue;
+    const fix = validFix(g.vuln, 'npm', d.name, d.version);
+    if (fix !== null) out.push({ dep: d, fix });
+  }
+  return out;
 }
 
 async function fixNpm(ctx: FixCtx, g: Group, ref: string, dir: string, track: (abs: string) => Promise<void>): Promise<void> {
@@ -356,27 +427,41 @@ async function fixNpm(ctx: FixCtx, g: Group, ref: string, dir: string, track: (a
   const base = inputs.decantUrl.replace(/\/+$/, '');
   const url = new URL(base);
   const registry = `${base}/r/${ref}/npm/`;
-  const userconfig = `${tmpDir(deps)}/decant-${ref}.npmrc`;
+  const userconfig = await ctx.tmpFile('npmrc');
   const env = baseEnv(deps.env, ['PATH', 'HOME', 'RUNNER_TEMP']);
   // --registry on the command line beats any project .npmrc; the token lives only in the 0600 userconfig.
   const common = ['--userconfig', userconfig, '--registry', registry, '--ignore-scripts', '--package-lock-only', '--no-audit', '--no-fund'];
-  const npm = (args: string[]) => run1(deps, 'npm', [...args, ...common], dir, env, [inputs.token]);
+  const npm = (cmd: string, specs: string[]) => run1(deps, 'npm', [cmd, ...common, ...(specs.length ? ['--', ...specs] : [])], dir, env, [inputs.token]);
   await deps.fs.writeFile(userconfig, `registry=${registry}\n//${url.host}${url.pathname.replace(/\/+$/, '')}/r/${ref}/npm/:_authToken=${inputs.token}\nignore-scripts=true\n`, 0o600);
   try {
     await deps.fs.chmod(userconfig, 0o600);
     const pkgText = (await deps.fs.exists(pkgAbs)) ? await deps.fs.readFile(pkgAbs) : null;
     const pkg = pkgText === null ? null : (JSON.parse(pkgText) as Record<string, Record<string, string> | undefined>);
-    const direct = !!pkg && ['dependencies', 'devDependencies', 'optionalDependencies'].some((k) => pkg[k]?.[g.name] !== undefined);
-    if (direct) {
-      await npm(['install', `${g.name}@${g.fixed}`]);
+    const declared = !!pkg && ['dependencies', 'devDependencies', 'optionalDependencies'].some((k) => pkg[k]?.[g.name] !== undefined);
+    // The direct dependency's own copy is the top-level node_modules/<name> entry.
+    const lock = JSON.parse(await deps.fs.readFile(lockAbs)) as { packages?: Record<string, { version?: string }> };
+    const topVersion = lock.packages?.[`node_modules/${g.name}`]?.version;
+    const topFix = declared && topVersion ? validFix(g.vuln, 'npm', g.name, topVersion) : null;
+    if (topFix !== null) {
+      await npm('install', [`${g.name}@${topFix}`]);
     } else {
-      await npm(['update', g.name]);
-      if ((await stale(ctx, lockAbs, g)).length) {
+      await npm('update', [g.name]);
+      const left = await stale(ctx, lockAbs, g);
+      if (left.length) {
         if (!pkg || pkgText === null) throw new GroupError('unresolvable', `${ctx.repoPath(lockAbs)}: no package.json for an override`);
-        pkg.overrides = { ...(pkg.overrides ?? {}), [g.name]: g.fixed };
+        // One selector per version line, each pinned to that line's fix.
+        const overrides: Record<string, string> = { ...(pkg.overrides ?? {}) };
+        const byKey = new Map<string, string>();
+        for (const c of left) {
+          const k = overrideKey(g.name, c.dep.version);
+          const prev = byKey.get(k);
+          if (!prev || compareVersions(c.fix, prev, 'npm') > 0) byKey.set(k, c.fix);
+        }
+        for (const [k, v] of [...byKey].sort(([a], [b]) => (a < b ? -1 : 1))) overrides[k] = v;
+        pkg.overrides = overrides;
         const indent = /^\{\n(\s+)/.exec(pkgText)?.[1] ?? '  ';
         await deps.fs.writeFile(pkgAbs, `${JSON.stringify(pkg, null, indent)}${pkgText.endsWith('\n') ? '\n' : ''}`);
-        await npm(['install']);
+        await npm('install', []);
       }
     }
   } finally {
@@ -386,7 +471,7 @@ async function fixNpm(ctx: FixCtx, g: Group, ref: string, dir: string, track: (a
   if (n.changed) await deps.fs.writeFile(lockAbs, n.text);
   const left = await stale(ctx, lockAbs, g);
   if (left.length) {
-    throw new GroupError('unresolvable', `${ctx.repoPath(lockAbs)} still locks ${[...new Set(left.map((d) => d.version))].map(safe).join(', ')}`);
+    throw new GroupError('unresolvable', `${ctx.repoPath(lockAbs)} still locks ${uniqSorted(left.map((c) => c.dep.version), 'npm').map(safe).join(', ')}`);
   }
 }
 
@@ -395,8 +480,11 @@ async function fixGo(ctx: FixCtx, g: Group, ref: string, dir: string, track: (ab
   const sumAbs = `${dir}/go.sum`;
   await track(`${dir}/go.mod`);
   await track(sumAbs);
+  // MVS selects one version per module: the highest fix needed by any copy in this module.
+  const here = g.copies.filter((c) => dirname(join(ctx.wd, c.dep.file)) === dir).map((c) => c.fix);
+  const target = uniqSorted(here.length ? here : fixesOf(g), 'go').at(-1)!;
   const base = inputs.decantUrl.replace(/\/+$/, '');
-  const netrc = `${tmpDir(deps)}/decant-${ref}.netrc`;
+  const netrc = await ctx.tmpFile('netrc');
   const env = {
     ...baseEnv(deps.env, ['PATH', 'HOME', 'GOPATH', 'GOCACHE']),
     NETRC: netrc,
@@ -406,18 +494,15 @@ async function fixGo(ctx: FixCtx, g: Group, ref: string, dir: string, track: (ab
   await deps.fs.writeFile(netrc, `machine ${new URL(base).hostname} login decant password ${inputs.token}\n`, 0o600);
   try {
     await deps.fs.chmod(netrc, 0o600);
-    await run1(deps, 'go', ['get', `${g.name}@${g.fixed}`], dir, env, [inputs.token]);
+    await run1(deps, 'go', ['get', '--', `${g.name}@${target}`], dir, env, [inputs.token]);
     await run1(deps, 'go', ['mod', 'tidy'], dir, env, [inputs.token]);
   } finally {
     await deps.fs.rm(netrc);
   }
-  const left = parseGoSum(await deps.fs.readFile(sumAbs), sumAbs).filter(
-    (d) => d.name === g.name && compareVersions(d.version, g.fixed, 'go') < 0 && g.vuln.affects('go', d.name, d.version),
-  );
+  const left = parseGoSum(await deps.fs.readFile(sumAbs), sumAbs).filter((d) => d.name === g.name && validFix(g.vuln, 'go', d.name, d.version) !== null);
   if (left.length) throw new GroupError('unresolvable', `${ctx.repoPath(sumAbs)} still has ${left.map((d) => safe(d.version)).join(', ')}`);
 }
 
-/** Upserts our issue when `body` is set; otherwise closes our open one if any. Returns the open issue number. */
 async function syncIssue(gh: GitHubClient, title: string, body: string | null): Promise<number | null> {
   if (body !== null) return (await gh.upsertIssue(title, body, ISSUE_LABELS)).number;
   const n = await gh.findIssue(title, ISSUE_LABELS);
@@ -428,37 +513,43 @@ async function syncIssue(gh: GitHubClient, title: string, body: string | null): 
   return null;
 }
 
-function fixBody(g: Group, old: string, sev: Severity, auto: boolean, cooldownDays: number, paths: string[]): string {
+function fixBody(g: Group, sev: Severity, auto: boolean, major: boolean, cooldownDays: number, paths: string[]): string {
   const v = g.vuln;
+  const fixes = fixesOf(g);
+  const ids = fixes.map((f) => `\`${safe(formatPackageId({ eco: g.eco, name: g.name, version: f }))}\``).join(', ');
   const summary = v.summary.replace(/\s+/g, ' ').replace(/[<>]/g, '').slice(0, 300);
   return [
-    `Security fix for **${safe(v.id)}** (${sev}) in \`${safe(g.name)}\`: ${safe(old)} → ${safe(g.fixed)}.`,
+    `Security fix for **${safe(v.id)}** (${sev}) in \`${safe(g.name)}\`: ${oldsOf(g).map(safe).join(', ')} → ${fixes.map(safe).join(', ')}.`,
     '',
     summary ? `> ${summary}` : '',
     '',
     `Advisory: ${advisoryUrl(v.id)}${v.aliases.length ? ` (aliases: ${v.aliases.map(safe).join(', ')})` : ''}`,
     '',
-    `**Cooldown skip:** this PR adds an \`allow\` entry for \`${safe(formatPackageId({ eco: g.eco, name: g.name, version: g.fixed }))}\` citing ${safe(v.id)}, so the fixed version ships without waiting out the ${cooldownDays}-day cooldown. decant honors it only while OSV lists this version as fixed; it is never exempt from the scan.`,
+    `**Cooldown skip:** this PR adds \`allow\` entries for ${ids} citing ${safe(v.id)}, so the fixed version ships without waiting out the ${cooldownDays}-day cooldown. decant honors it only while OSV lists this version as fixed; it is never exempt from the scan.`,
     '',
     'Files:',
     ...paths.map((p) => `- \`${p}\``),
     '',
-    auto ? `autoShip.${sev} is \`auto\`: auto-merge is on; it merges once the required checks (including the decant scan) pass.` : `autoShip.${sev} is \`approve\`: review and merge.`,
+    major
+      ? '**major upgrade: auto-merge disabled.** A fix crosses a major (or 0.x minor) version line; review and merge.'
+      : auto
+        ? `autoShip.${sev} is \`auto\`: auto-merge is on; it merges once the required checks (including the decant scan) pass.`
+        : `autoShip.${sev} is \`approve\`: review and merge.`,
   ]
     .filter((l, i, a) => !(l === '' && a[i - 1] === ''))
     .join('\n');
 }
 
-function unfixedBody(items: { vuln: Vuln; dep: Dep }[]): string {
+function unfixedBody(items: { vuln: Vuln; dep: Dep; reason: string }[]): string {
   const rows = [...new Map(items.map((i) => [`${i.vuln.id}|${depKey(i.dep)}|${i.dep.file}`, i])).values()].sort((a, b) =>
     a.vuln.id < b.vuln.id ? -1 : a.vuln.id > b.vuln.id ? 1 : 0,
   );
   return [
-    'Advisories affecting locked versions with no fixed release yet. decant updates this issue daily and closes it when none remain.',
+    'Advisories affecting locked versions with no usable fixed release. decant updates this issue daily and closes it when none remain.',
     '',
-    '| Advisory | Severity | Package | Lockfile |',
-    '|---|---|---|---|',
-    ...rows.map((i) => `| [${safe(i.vuln.id)}](${advisoryUrl(i.vuln.id)}) | ${i.vuln.malicious ? 'malicious' : i.vuln.severity} | \`${safe(i.dep.name)}@${safe(i.dep.version)}\` | ${safe(i.dep.file)} |`),
+    '| Advisory | Severity | Package | Lockfile | Reason |',
+    '|---|---|---|---|---|',
+    ...rows.map((i) => `| [${safe(i.vuln.id)}](${advisoryUrl(i.vuln.id)}) | ${i.vuln.malicious ? 'malicious' : i.vuln.severity} | \`${safe(i.dep.name)}@${safe(i.dep.version)}\` | ${safe(i.dep.file)} | ${i.reason} |`),
   ].join('\n');
 }
 
@@ -509,13 +600,13 @@ async function pruneAllow(ctx: FixCtx, now: Date): Promise<string> {
   const title = 'decant: prune allow entries';
 
   const open = await gh.findOpenPr(PRUNE_BRANCH);
-  const base = await gh.defaultBranch();
+  const base = ctx.base;
   let head: string;
   if (open) {
     head = open.headSha;
     if ((await gh.fileAt(ctx.policyRel, head)) === contents) return `PR #${open.number} up to date (${expired.length} entr${expired.length === 1 ? 'y' : 'ies'})`;
   } else {
-    head = await gh.branchHead(base);
+    head = ctx.sha;
     try {
       await gh.createBranch(PRUNE_BRANCH, head);
     } catch (e) {

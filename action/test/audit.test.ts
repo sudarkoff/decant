@@ -49,6 +49,10 @@ type World = {
   issues?: { number: number; title: string; user: { login: string; type: string } }[];
   autoMergeFails?: boolean;
   createBranchStatus?: number;
+  closedPrs?: string[];
+  ref?: string;
+  mainHead?: string;
+  env?: Record<string, string | undefined>;
   exec?: (c: ExecCall, fs: ReturnType<typeof memFs>) => { code?: number; stdout?: string; stderr?: string } | void;
 };
 
@@ -99,9 +103,12 @@ function harness(w: World) {
     }
     if (key === `GET ${D}/api/blocks`) return jsonRes({ blocks: w.blocks ?? [] });
     if (key === `GET ${R}`) return jsonRes({ default_branch: 'main' });
-    if (key === `GET ${R}/git/ref/heads/main`) return jsonRes({ object: { sha: HEAD } });
+    if (key === `GET ${R}/git/ref/heads/main`) return jsonRes({ object: { sha: w.mainHead ?? HEAD } });
     if (c.method === 'GET' && c.url.startsWith(`${R}/pulls?`)) {
       const head = decodeURIComponent(u.searchParams.get('head') ?? '').replace(/^o:/, '');
+      if (u.searchParams.get('state') === 'closed') {
+        return jsonRes((w.closedPrs ?? []).includes(head) ? [{ number: 4, merged_at: null }, { number: 2, merged_at: '2026-01-01T00:00:00Z' }] : []);
+      }
       return jsonRes(
         (w.openPrs ?? []).includes(head)
           ? [{ number: 3, node_id: 'OPEN', title: 't', body: '', state: 'open', head: { ref: head, sha: 'd'.repeat(40) }, base: { ref: 'main', sha: HEAD } }]
@@ -171,6 +178,7 @@ function harness(w: World) {
     GITHUB_REPOSITORY: 'o/r',
     GITHUB_WORKSPACE: '/w',
     GITHUB_SHA: HEAD,
+    GITHUB_REF: w.ref ?? 'refs/heads/main',
     GITHUB_OUTPUT: output,
     GITHUB_STEP_SUMMARY: summary,
     RUNNER_TEMP: '/rt',
@@ -180,6 +188,10 @@ function harness(w: World) {
   const out: string[] = [];
   vi.spyOn(process.stdout, 'write').mockImplementation(((s: string) => (out.push(String(s)), true)) as typeof process.stdout.write);
   vi.spyOn(process.stderr, 'write').mockImplementation(((s: string) => (out.push(String(s)), true)) as typeof process.stderr.write);
+  for (const [k, v] of Object.entries(w.env ?? {})) {
+    if (v === undefined) delete env[k];
+    else env[k] = v;
+  }
   const deps = fakeDeps({ env, fetch: f, fs, exec });
   const written = (i = 0) => {
     const additions = commits[i]!.fileChanges.additions as { path: string; contents: string }[];
@@ -215,7 +227,7 @@ function npmFake(opts: { update?: 'fixes' | 'noop'; overrideFixes?: boolean; ins
   return (c: ExecCall, fs: ReturnType<typeof memFs>) => {
     if (c.cmd !== 'npm') return;
     const fixed = () => fs.files.set('/w/package-lock.json', lock([{ name: 'lodash', version: '4.17.21', resolved: overlayResolved('lodash', '4.17.21') }]));
-    if (c.args[0] === 'install' && c.args[1] === 'lodash@4.17.21') {
+    if (c.args[0] === 'install' && c.args.at(-1) === 'lodash@4.17.21') {
       if (opts.installFixes !== false) {
         fixed();
         const pkg = JSON.parse(fs.files.get('/w/package.json')!);
@@ -226,7 +238,7 @@ function npmFake(opts: { update?: 'fixes' | 'noop'; overrideFixes?: boolean; ins
       if (opts.update === 'fixes') fixed();
     } else if (c.args[0] === 'install') {
       const pkg = JSON.parse(fs.files.get('/w/package.json')!);
-      if (opts.overrideFixes && pkg.overrides?.lodash === '4.17.21') {
+      if (opts.overrideFixes && pkg.overrides?.['lodash@^4'] === '4.17.21') {
         fs.files.set(
           '/w/package-lock.json',
           lock([
@@ -288,11 +300,13 @@ describe('audit: npm fix PRs', () => {
     const npm = h.exec.calls.filter((c) => c.cmd === 'npm');
     expect(npm).toHaveLength(1);
     const a = npm[0]!.args;
-    expect(a.slice(0, 2)).toEqual(['install', 'lodash@4.17.21']);
+    expect(a[0]).toBe('install');
+    expect(a.slice(-2)).toEqual(['--', 'lodash@4.17.21']);
     for (const flag of ['--ignore-scripts', '--package-lock-only', '--no-audit', '--no-fund']) expect(a).toContain(flag);
     expect(a[a.indexOf('--registry') + 1]).toBe(`${D}/r/${REF}/npm/`);
     const cfg = a[a.indexOf('--userconfig') + 1]!;
-    expect(cfg.startsWith('/rt/')).toBe(true);
+    expect(cfg).toMatch(/^\/rt\/decant-audit-\w+\/[0-9a-f-]{36}\.npmrc$/);
+    expect(h.fs.dirs.has(cfg.slice(0, cfg.lastIndexOf('/')))).toBe(false); // private dir removed
     expect(npm[0]!.opts?.cwd).toBe('/w');
     expect(Object.keys(npm[0]!.opts?.env ?? {}).sort()).toEqual(['HOME', 'PATH', 'RUNNER_TEMP']);
     expect(JSON.stringify(npm[0])).not.toContain('ci-secret');
@@ -358,7 +372,7 @@ describe('audit: npm fix PRs', () => {
     expect(npm).toEqual([['update', 'lodash'], ['install']]);
     for (const c of h.exec.calls) expect(c.args).toContain('--ignore-scripts');
     const files = h.written();
-    expect(JSON.parse(files['package.json']!).overrides).toEqual({ lodash: '4.17.21' });
+    expect(JSON.parse(files['package.json']!).overrides).toEqual({ 'lodash@^4': '4.17.21' });
     expect(files['package-lock.json']).toContain('https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz');
     expect(h.prs).toHaveLength(1);
   });
@@ -384,7 +398,7 @@ describe('audit: npm fix PRs', () => {
     expect(await h.run()).toBe(0);
     expect(h.prs).toEqual([]);
     expect(h.summary()).toMatch(/failed.*ETARGET/);
-    expect(h.fs.files.has('/rt/decant-audit-ghsa-aaaa-bbbb-cccc.npmrc')).toBe(false);
+    expect([...h.fs.files.keys()].some((k) => k.startsWith('/rt/'))).toBe(false);
   });
 
   it('overlay sync rejected (422) → recorded as unverified, no npm, no PR', async () => {
@@ -416,7 +430,7 @@ describe('audit: npm fix PRs', () => {
       osv: DIRECT.osv,
       records: LODASH_RECORD,
       exec: (c, fs) => {
-        if (c.cmd === 'npm' && c.args[1] === 'lodash@4.17.21') {
+        if (c.cmd === 'npm' && c.args.at(-1) === 'lodash@4.17.21') {
           const dir = c.opts!.cwd!;
           fs.files.set(`${dir}/package-lock.json`, lock([{ name: 'lodash', version: '4.17.21', resolved: overlayResolved('lodash', '4.17.21') }]));
         }
@@ -425,6 +439,144 @@ describe('audit: npm fix PRs', () => {
     expect(await h.run()).toBe(0);
     expect(h.prs).toHaveLength(1);
     expect(Object.keys(h.written()).sort()).toEqual(['decant.json', 'package-lock.json', 'sub/package-lock.json']);
+  });
+});
+
+describe('audit: fix round 1', () => {
+  it('two major lines → per-line override keys, both fixed, auto-merge enabled', async () => {
+    const records = {
+      [GHSA]: {
+        ...npmRecord(GHSA, 'lodash', []),
+        affected: [
+          {
+            package: { ecosystem: 'npm', name: 'lodash' },
+            ranges: [
+              { type: 'SEMVER', events: [{ introduced: '0' }, { fixed: '3.10.1' }] },
+              { type: 'SEMVER', events: [{ introduced: '4.0.0' }, { fixed: '4.17.21' }] },
+            ],
+          },
+        ],
+      },
+    };
+    const h = harness({
+      files: {
+        '/w/package.json': JSON.stringify({ name: 'app', dependencies: { a: '^1.0.0', b: '^1.0.0' } }, null, 2),
+        '/w/package-lock.json': lock([
+          { name: 'a', version: '1.0.0' },
+          { name: 'b', version: '1.0.0' },
+          { name: 'lodash', version: '3.10.0', path: 'node_modules/a/node_modules/lodash' },
+          { name: 'lodash', version: '4.17.20', path: 'node_modules/b/node_modules/lodash' },
+        ]),
+      },
+      osv: { 'lodash@3.10.0': [GHSA], 'lodash@4.17.20': [GHSA] },
+      records,
+      exec: (c, fs) => {
+        if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+        const o = JSON.parse(fs.files.get('/w/package.json')!).overrides ?? {};
+        if (o['lodash@^3'] === '3.10.1' && o['lodash@^4'] === '4.17.21') {
+          fs.files.set(
+            '/w/package-lock.json',
+            lock([
+              { name: 'a', version: '1.0.0' },
+              { name: 'b', version: '1.0.0' },
+              { name: 'lodash', version: '3.10.1', path: 'node_modules/a/node_modules/lodash' },
+              { name: 'lodash', version: '4.17.21', path: 'node_modules/b/node_modules/lodash' },
+            ]),
+          );
+        }
+      },
+    });
+    expect(await h.run()).toBe(0);
+    expect(JSON.parse(h.written()['package.json']!).overrides).toEqual({ 'lodash@^3': '3.10.1', 'lodash@^4': '4.17.21' });
+    expect(h.syncs[0]!.body.policy.allow.map((a: any) => a.package)).toEqual(['npm:lodash@3.10.1', 'npm:lodash@4.17.21']);
+    expect(JSON.parse(h.written()['decant.json']!).allow).toHaveLength(2);
+    expect(h.prs[0]!.title).toBe(`decant: lodash 3.10.0, 4.17.20 → 3.10.1, 4.17.21 (${GHSA})`);
+    expect(h.autoMerges).toHaveLength(1);
+  });
+
+  it('direct dep 1.x whose only fix is 2.0.0 → PR opened, auto-merge NOT enabled', async () => {
+    const h = harness({
+      files: {
+        '/w/package.json': JSON.stringify({ name: 'app', dependencies: { lodash: '^1.0.0' } }, null, 2),
+        '/w/package-lock.json': lock([{ name: 'lodash', version: '1.0.0' }]),
+      },
+      osv: { 'lodash@1.0.0': [GHSA] },
+      records: { [GHSA]: npmRecord(GHSA, 'lodash', [{ introduced: '0' }, { fixed: '2.0.0' }]) },
+      exec: (c, fs) => {
+        if (c.cmd === 'npm' && c.args.at(-1) === 'lodash@2.0.0') fs.files.set('/w/package-lock.json', lock([{ name: 'lodash', version: '2.0.0' }]));
+      },
+    });
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.body).toContain('major upgrade: auto-merge disabled');
+    expect(h.autoMerges).toEqual([]);
+  });
+
+  it('overrideKey uses ^major, or ~0.minor for 0.x', async () => {
+    const { overrideKey } = await import('../src/modes/audit');
+    expect(overrideKey('x', '1.2.3')).toBe('x@^1');
+    expect(overrideKey('@s/x', '0.3.1')).toBe('@s/x@~0.3');
+  });
+
+  it("OSV fixed 'file:../x' → treated as unfixed (invalid fixed version), no PR", async () => {
+    const h = harness({ ...DIRECT, records: { [GHSA]: npmRecord(GHSA, 'lodash', [{ introduced: '0' }, { fixed: 'file:../x' }]) }, exec: npmFake() });
+    expect(await h.run()).toBe(0);
+    expect(h.syncs).toEqual([]);
+    expect(h.prs).toEqual([]);
+    const issue = h.issueCreates.find((i) => i.title === 'decant: unfixed advisories');
+    expect(issue.body).toContain('invalid fixed version');
+  });
+
+  it('package name starting with - → group failure, nothing executed', async () => {
+    const h = harness({
+      files: { '/w/package.json': '{}', '/w/package-lock.json': lock([{ name: '-evil', version: '1.0.0' }]) },
+      osv: { '-evil@1.0.0': [GHSA] },
+      records: { [GHSA]: npmRecord(GHSA, '-evil', [{ introduced: '0' }, { fixed: '1.0.1' }]) },
+    });
+    expect(await h.run()).toBe(0);
+    expect(h.exec.calls).toEqual([]);
+    expect(h.syncs).toEqual([]);
+    expect(h.summary()).toMatch(/failed: invalid package name/);
+  });
+
+  it('closed unmerged PR for the branch → declined, not reopened', async () => {
+    const h = harness({ ...DIRECT, closedPrs: [BRANCH], exec: npmFake() });
+    expect(await h.run()).toBe(0);
+    expect(h.syncs).toEqual([]);
+    expect(h.prs).toEqual([]);
+    expect(h.summary()).toMatch(/declined/);
+  });
+
+  it('non-default ref → exit 1, no writes', async () => {
+    const h = harness({ ...DIRECT, ref: 'refs/heads/feature', exec: npmFake() });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toMatch(/runs on the default branch \(main\)/);
+    expect(h.syncs).toEqual([]);
+    expect(h.exec.calls).toEqual([]);
+    expect(h.branches).toEqual([]);
+  });
+
+  it('default branch moved since checkout → exit 1', async () => {
+    const h = harness({ ...DIRECT, mainHead: 'f'.repeat(40), exec: npmFake() });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('default branch moved since checkout; re-run');
+    expect(h.syncs).toEqual([]);
+    expect(h.branches).toEqual([]);
+  });
+
+  it('RUNNER_TEMP unset → exit 1', async () => {
+    const h = harness({ ...DIRECT, env: { RUNNER_TEMP: undefined }, exec: npmFake() });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toMatch(/RUNNER_TEMP/);
+  });
+
+  it('without DECANT_GITHUB_LOGIN, an App-bot issue of ours is matched and closed', async () => {
+    const h = harness({
+      files: { '/w/package.json': '{}', '/w/package-lock.json': lock([{ name: 'ok', version: '1.0.0' }]) },
+      issues: [{ number: 9, title: 'decant: unfixed advisories', user: { login: 'decant-app[bot]', type: 'Bot' } }],
+    });
+    expect(await h.run()).toBe(0);
+    expect(h.issuePatches).toEqual([{ n: 9, body: { state: 'closed', state_reason: 'completed' } }]);
   });
 });
 
@@ -456,12 +608,12 @@ describe('audit: Go', () => {
     });
     expect(await h.run()).toBe(0);
     const go = h.exec.calls.filter((c) => c.cmd === 'go');
-    expect(go.map((c) => c.args)).toEqual([['get', 'github.com/x/y@v1.0.1'], ['mod', 'tidy']]);
+    expect(go.map((c) => c.args)).toEqual([['get', '--', 'github.com/x/y@v1.0.1'], ['mod', 'tidy']]);
     for (const c of go) {
       expect(c.opts?.cwd).toBe('/w');
       expect(c.opts?.env?.GOPROXY).toBe(`${D}/r/audit-go-2026-0001/go`);
       expect(c.opts?.env?.GOFLAGS).toBe('-mod=mod');
-      expect(c.opts?.env?.NETRC?.startsWith('/rt/')).toBe(true);
+      expect(c.opts?.env?.NETRC).toMatch(/^\/rt\/decant-audit-\w+\/[0-9a-f-]{36}\.netrc$/);
       expect(c.opts?.env?.GOSUMDB).toBeUndefined();
       expect(JSON.stringify(c)).not.toContain('ci-secret');
     }

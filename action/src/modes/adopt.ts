@@ -1,6 +1,7 @@
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { formatPackageId } from '../../../src/ids';
 import { parsePolicy } from '../../../src/policy/schema';
+import { defaultHeadCheckout } from '../checkout';
 import { error, mask, notice, setOutput } from '../gh-io';
 import { github } from '../github';
 import type { ModeCtx } from '../inputs';
@@ -156,13 +157,16 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   // 5. Branch, commit, PR.
   const body = prBody(added, cooldownDays, [...notGated].sort(), changedFiles.length);
   try {
-    const gh = github(deps.fetch, inputs.githubToken, repo, { selfLogin: env.DECANT_GITHUB_LOGIN || 'github-actions[bot]' });
+    const gh = github(deps.fetch, inputs.githubToken, repo, { selfLogin: env.DECANT_GITHUB_LOGIN || undefined });
+    // The files come from the checkout, so it must be the live default-branch head.
+    const co = await defaultHeadCheckout(gh, env, 'adopt');
+    if (!co.ok) return stop(co.message);
+    const base = co.base;
     const open = await gh.findOpenPr(BRANCH);
     let head: string;
-    const base = await gh.defaultBranch();
     if (open) head = open.headSha;
     else {
-      head = await gh.branchHead(base);
+      head = co.sha;
       try {
         await gh.createBranch(BRANCH, head);
       } catch (e) {

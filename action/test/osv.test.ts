@@ -202,3 +202,14 @@ describe('review fix: querybatch fails closed', () => {
     await expect(createOsv(fakeFetch(() => jsonRes({ results: [{}] }))).queryVulns(deps)).rejects.toThrow(/OSV/);
   });
 });
+
+describe('toVuln: unparseable fixed bound', () => {
+  it('fails closed: covered, with the raw fixed string returned for the caller to validate', () => {
+    const v = toVuln({
+      id: 'GHSA-xxxx-xxxx-xxxx',
+      affected: [{ package: { ecosystem: 'npm', name: 'a' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }, { fixed: 'file:../x' }] }] }],
+    });
+    expect(v.affects('npm', 'a', '1.0.0')).toBe(true);
+    expect(v.fixedFor('npm', 'a', '1.0.0')).toBe('file:../x');
+  });
+});

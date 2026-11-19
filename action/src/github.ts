@@ -248,6 +248,13 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
       return prs[0] ? toPr(prs[0]) : null;
     },
 
+    /** Number of a closed, unmerged PR from `head` (a declined change), or null. */
+    async findClosedUnmergedPr(head: string): Promise<number | null> {
+      const q = `head=${encodeURIComponent(`${owner}:${head}`)}`;
+      const prs = await json<{ number: number; merged_at?: string | null }[]>('GET', `${R}/pulls?state=closed&${q}&per_page=100`);
+      return prs.find((p) => !p.merged_at)?.number ?? null;
+    },
+
     /** Head commit sha of branch `name`. */
     async branchHead(name: string): Promise<string> {
       const r = await json<{ object: { sha: string } }>('GET', `${R}/git/ref/heads/${name.split('/').map(encodeURIComponent).join('/')}`);

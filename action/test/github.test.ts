@@ -199,6 +199,16 @@ describe('upsertIssue', () => {
     expect(f.calls.every((c) => c.method === 'GET')).toBe(true);
   });
 
+  it('findClosedUnmergedPr ignores merged PRs', async () => {
+    const f = route({
+      [`GET ${R}/pulls?state=closed&head=o%3Ab&per_page=100`]: () => jsonRes([{ number: 1, merged_at: '2026-01-01T00:00:00Z' }, { number: 2, merged_at: null }]),
+      [`GET ${R}/pulls?state=closed&head=o%3Ac&per_page=100`]: () => jsonRes([{ number: 1, merged_at: '2026-01-01T00:00:00Z' }]),
+    });
+    const gh = github(f, TOKEN, 'o/r');
+    expect(await gh.findClosedUnmergedPr('b')).toBe(2);
+    expect(await gh.findClosedUnmergedPr('c')).toBeNull();
+  });
+
   it('closeIssue PATCHes state closed', async () => {
     const f = route({ [`PATCH ${R}/issues/4`]: () => jsonRes({ number: 4 }) });
     await github(f, TOKEN, 'o/r').closeIssue(4);

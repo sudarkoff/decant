@@ -9,8 +9,10 @@ export type Fs = {
   exists(p: string): Promise<boolean>;
   mkdir(p: string): Promise<void>;
   chmod(p: string, mode: number): Promise<void>;
-  /** Removes a file; a missing file is not an error. */
+  /** Removes a file or directory tree; a missing path is not an error. */
   rm(p: string): Promise<void>;
+  /** Creates a unique private (0700) directory named `prefix` + random suffix; returns its path. */
+  mkdtemp(prefix: string): Promise<string>;
 };
 
 export type ActionDeps = {
@@ -46,7 +48,8 @@ export const defaultFs: Fs = {
     }
   },
   chmod: (p, mode) => nodeFs.chmod(p, mode),
-  rm: (p) => nodeFs.rm(p, { force: true }),
+  rm: (p) => nodeFs.rm(p, { force: true, recursive: true }),
+  mkdtemp: (prefix) => nodeFs.mkdtemp(prefix),
   async mkdir(p) {
     await nodeFs.mkdir(p, { recursive: true });
   },

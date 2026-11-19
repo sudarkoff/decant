@@ -35,6 +35,8 @@ type World = {
   stale?: boolean;
   prFiles?: Record<string, string>;
   repo?: string;
+  ref?: string;
+  sha?: string;
 };
 
 function harness(w: World) {
@@ -102,6 +104,8 @@ function harness(w: World) {
     INPUT_POLICY_PATH: 'decant.json',
     GITHUB_REPOSITORY: w.repo ?? 'o/r',
     GITHUB_OUTPUT: output,
+    GITHUB_REF: w.ref ?? 'refs/heads/main',
+    GITHUB_SHA: w.sha ?? HEAD,
   };
   const out: string[] = [];
   vi.spyOn(process.stdout, 'write').mockImplementation(((s: string) => (out.push(String(s)), true)) as typeof process.stdout.write);
@@ -248,6 +252,23 @@ describe('adopt', () => {
     const h = harness({ ...THREE, openPr: true, prFiles });
     expect(await h.run()).toBe(0);
     expect(h.log()).toContain('adopt PR already up to date');
+    expect(h.commits).toEqual([]);
+  });
+});
+
+describe('adopt: checkout guard', () => {
+  it('non-default ref → exit 1, no writes', async () => {
+    const h = harness({ ...THREE, ref: 'refs/heads/feature' });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toMatch(/runs on the default branch \(main\)/);
+    expect(h.branches).toEqual([]);
+    expect(h.commits).toEqual([]);
+  });
+
+  it('default branch moved since checkout → exit 1', async () => {
+    const h = harness({ ...THREE, sha: 'f'.repeat(40) });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('default branch moved since checkout; re-run');
     expect(h.commits).toEqual([]);
   });
 });

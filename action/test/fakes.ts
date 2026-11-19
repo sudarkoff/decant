@@ -1,21 +1,31 @@
 import type { ActionDeps, Fs } from '../src/deps';
 import type { Exec } from '../src/exec';
 
-export function memFs(files: Record<string, string> = {}, symlinks: string[] = []): Fs & { files: Map<string, string>; modes: Map<string, number>; bytes: Map<string, Uint8Array> } {
+export function memFs(files: Record<string, string> = {}, symlinks: string[] = []): Fs & { files: Map<string, string>; modes: Map<string, number>; bytes: Map<string, Uint8Array>; dirs: Set<string> } {
   const modes = new Map<string, number>();
   const bytes = new Map<string, Uint8Array>();
   const m = new Map(Object.entries(files));
   const dirs = new Set<string>();
   return {
     files: m,
+    dirs,
     modes,
     bytes,
     async writeBytes(p, data) {
       bytes.set(p, data);
     },
     async rm(p) {
-      m.delete(p);
-      modes.delete(p);
+      for (const k of [...m.keys()]) if (k === p || k.startsWith(`${p}/`)) m.delete(k);
+      for (const k of [...modes.keys()]) if (k === p || k.startsWith(`${p}/`)) modes.delete(k);
+      dirs.delete(p);
+    },
+    async mkdtemp(prefix) {
+      let i = 0;
+      while (dirs.has(`${prefix}${String(i).padStart(6, '0')}`)) i++;
+      const d = `${prefix}${String(i).padStart(6, '0')}`;
+      dirs.add(d);
+      modes.set(d, 0o700);
+      return d;
     },
     async chmod(p, mode) {
       modes.set(p, mode);

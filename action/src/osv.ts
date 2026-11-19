@@ -132,6 +132,13 @@ function rangeCover(events: OsvEvent[], eco: Ecosystem, version: string): Cover 
     if (start === undefined) continue;
     if (e.fixed !== undefined || e.limit !== undefined) {
       const end = withV(eco, (e.fixed ?? e.limit)!);
+      // An unparseable fixed bound: we cannot tell where the interval ends, so fail closed
+      // (covered) and hand back the raw string; callers validate it before using it.
+      if (e.fixed !== undefined && parseVersion(end, eco) === null) {
+        if (inside(start)) return { covered: true, fixed: end };
+        start = undefined;
+        continue;
+      }
       if (inside(start) && cmp(version, end) < 0) {
         if (e.fixed !== undefined) return { covered: true, fixed: end };
         best = { covered: true, fixed: null };
