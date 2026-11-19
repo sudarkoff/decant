@@ -1,0 +1,48 @@
+name: decant
+description: Supply-chain gate and package cache for npm and Go, backed by a decant Worker.
+runs:
+  using: node24
+  main: dist/index.js
+inputs:
+  mode:
+    description: setup | sync | scan | audit | adopt
+    required: true
+  decant-url:
+    description: Base URL of the decant Worker
+    required: true
+  token:
+    description: decant token (read for setup, ci for scan/audit/adopt, sync for sync on main)
+    required: false
+    default: ''
+  sync-token:
+    description: decant sync token
+    required: false
+    default: ''
+  github-token:
+    description: GitHub token
+    required: false
+    default: ${{ github.token }}
+  policy-path:
+    description: Path to the policy file
+    required: false
+    default: decant.json
+  fail-on:
+    description: Minimum severity that fails the run
+    required: false
+    default: high
+  working-directory:
+    description: Directory to operate in
+    required: false
+    default: .
+  bypass:
+    description: Bypass the gate
+    required: false
+    default: 'false'
+  bypass-reason:
+    description: Reason for bypass
+    required: false
+    default: ''
+  project:
+    description: Project name (default policy.project if a policy exists, else the repo name)
+    required: false
+    default: ''
