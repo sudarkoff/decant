@@ -171,7 +171,7 @@ A version is in the global block set if any of these hold:
 
 ### Lockfile URLs and who installs through decant (my call)
 
-- **Lockfiles keep `registry.npmjs.org` URLs.** npm's default `replace-registry-host=npmjs` rewrites them to the configured registry at install time. Lockfiles stay portable, and decant's domain never gets baked into them. The Worker builds `dist.tarball` URLs under the prefix of the request, whether that's `/npm/` or `/r/pr-<n>/npm/`, so previews work too. The Action's lockfile differ keys on name and version, never on URL.
+- **Lockfiles keep `registry.npmjs.org` URLs.** npm's default `replace-registry-host=npmjs` rewrites them to the configured registry at install time. Lockfiles stay portable, and decant's domain never gets baked into them. *Correction (2026-11-19, tested):* npm writes the URL it actually downloaded from into `resolved`, so an install through decant puts decant URLs into the lockfile. The Action therefore normalizes lockfiles: any `resolved` URL under `<decant>/npm/` or `<decant>/r/<ref>/npm/` is rewritten to `https://registry.npmjs.org/` (the paths below that prefix are identical). `scan` fails a PR whose lockfile contains decant URLs and prints the one-line fix, and `audit` and `adopt` normalize what they write. The Worker builds `dist.tarball` URLs under the prefix of the request, whether that's `/npm/` or `/r/pr-<n>/npm/`, so previews work too. The Action's lockfile differ keys on name and version, never on URL.
 - **Every install goes through decant:** CI, Docker builds (the token is passed as a BuildKit secret, never as a build arg or layer) and local dev (each developer's `~/.npmrc` and `.netrc` hold a read token). A local `npm install` is an attack path too.
 
 ### PR previews
@@ -256,3 +256,23 @@ It's a single TypeScript action, bundled and committed as `dist/` (the standard 
 - How the semver comparator handles edge cases. It must order prereleases per the npm spec.
 - Whether verdict JSON lives in R2 or D1, provided lookup is by `pkg@version`.
 - CLI ergonomics for the operator script.
+
+## Additions for plan 2 (2026-11-19)
+
+These came out of building and reviewing the Worker. George approved the direction in conversation.
+
+- **Three token kinds: `read`, `ci` and `sync`.**
+  - A `sync` token can only sync the main-ref policy.
+  - A `ci` token can sync overlays (any ref except main), write and read verdicts, read status and read blocks. A `ci` token on the main ref gets 403.
+  - Adopters keep the `sync` token in a GitHub Environment restricted to the default branch. A workflow on another branch then can't loosen the main policy, even though it can read the repo's other secrets.
+  - Migration `0003` widens the `tokens.kind` check.
+- **`GET /api/blocks` (`ci` token):** returns every global block (`package`, `source`, `reason`, `at`). The Action intersects these with the lockfiles.
+- **Emergency bypass (George: last resort, deliberate manual steps only, never automatic).**
+  - The Action's `setup` mode writes the npm and Go client config. With the inputs `bypass: true` and a non-empty `bypass-reason`, it points at the public registries instead.
+  - It emits a warning annotation and a step-summary banner naming the actor and the reason.
+  - The example workflow exposes this only as a `workflow_dispatch` input that defaults to `false`.
+  - Because lockfiles are normalized (above), npm and Go still verify the locked hashes during a bypass.
+- **Reviewing a flagged scan result:** a heuristics `flagged` result fails the check until a user with write access adds the label `decant:reviewed` to the PR. Security PRs carrying a `flagged` result are never auto-merged.
+- **Fixed versions inside `audit`:** a fixed version can still be in its cooldown. `audit` therefore first syncs an overlay for ref `audit-<advisory>`, holding only the advisory's verified allow entry. It then resolves the upgrade through `/r/audit-<advisory>/`, and the PR gets its own `pr-<n>` overlay as usual.
+- **`adopt` is an Action mode (`workflow_dispatch`).** It reads the lockfiles and writes `decant.json` with `allow` entries (reason `adopted`) for pinned versions still in their cooldown, using publish times from the public registries. It opens a PR, so adoption is also approved in git.
+- **Unscannable sources:** lockfile entries resolved from git, file or non-npm URLs can't be gated. `scan` reports them as warnings, and they don't fail the check.
