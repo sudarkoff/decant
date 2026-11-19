@@ -1,3 +1,4 @@
+import { warning } from './gh-io';
 import { httpError, readJson, request, TIMEOUT_MS } from './http';
 
 const API = 'https://api.github.com';
@@ -105,7 +106,24 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
     return readJson<T>(await rest(method, path, body), `GitHub ${method} ${path}`);
   }
 
-  /** GETs every page (following Link rel="next", at most MAX_PAGES). */
+  /**
+   * Pages (following Link rel="next") until an item satisfies `match`; returns it, or null when the
+   * pages run out. `capped` is true when MAX_PAGES was reached with a next page left (no throw:
+   * used where an attacker could pad the list, and a miss just means "create a new one").
+   */
+  async function findPaged<T>(path: string, match: (x: T) => boolean): Promise<{ hit: T | null; capped: boolean }> {
+    let url: string | null = path;
+    for (let page = 0; url; page++) {
+      if (page >= MAX_PAGES) return { hit: null, capped: true };
+      const res = await rest('GET', url);
+      const hit = (await readJson<T[]>(res, `GitHub GET ${path}`)).find(match);
+      if (hit) return { hit, capped: false };
+      url = nextLink(res.headers.get('link'));
+    }
+    return { hit: null, capped: false };
+  }
+
+  /** GETs every page (following Link rel="next"); throws past MAX_PAGES (fails closed). */
   async function paged<T>(path: string): Promise<T[]> {
     const out: T[] = [];
     let url: string | null = path;
@@ -174,8 +192,11 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
     /** Edits the first comment containing `marker`, else posts one. The body always carries the marker. */
     async upsertComment(n: number, marker: string, body: string): Promise<{ id: number; created: boolean }> {
       const text = body.includes(marker) ? body : `${marker}\n${body}`;
-      const comments = await paged<{ id: number; body?: string; user?: Author }>(`${R}/issues/${n}/comments?per_page=100`);
-      const hit = comments.find((c) => isMine(c.user) && (c.body ?? '').includes(marker));
+      const { hit, capped } = await findPaged<{ id: number; body?: string; user?: Author }>(
+        `${R}/issues/${n}/comments?per_page=100`,
+        (c) => isMine(c.user) && (c.body ?? '').includes(marker),
+      );
+      if (capped) warning(`decant: #${n} has more than ${MAX_PAGES} pages of comments; posting a new report comment`);
       if (hit) {
         await rest('PATCH', `${R}/issues/comments/${hit.id}`, { body: text });
         return { id: hit.id, created: false };
@@ -235,8 +256,21 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
      * Matches on title and author only (not labels), so a removed label never causes a duplicate.
      */
     async upsertIssue(title: string, body: string, labels: string[]): Promise<{ number: number; created: boolean }> {
-      const issues = await paged<{ number: number; title: string; pull_request?: unknown; user?: Author }>(`${R}/issues?state=open&per_page=100`);
-      const hit = issues.find((i) => i.pull_request === undefined && i.title === title && isMine(i.user));
+      type Issue = { number: number; title: string; pull_request?: unknown; user?: Author };
+      const match = (i: Issue) => i.pull_request === undefined && i.title === title && isMine(i.user);
+      const list = `${R}/issues?state=open&per_page=100`;
+      // Narrowest query first: our own issues (selfLogin), else our labels, falling back to all open issues.
+      const queries = opts.selfLogin
+        ? [`${list}&creator=${encodeURIComponent(opts.selfLogin)}`]
+        : labels.length
+          ? [`${list}&labels=${encodeURIComponent(labels.join(','))}`, list]
+          : [list];
+      let hit: Issue | null = null;
+      for (const q of queries) {
+        const r = await findPaged<Issue>(q, match);
+        if (r.capped) warning(`decant: more than ${MAX_PAGES} pages of open issues; may create a duplicate of "${title}"`);
+        if ((hit = r.hit)) break;
+      }
       if (hit) {
         await rest('PATCH', `${R}/issues/${hit.number}`, { body });
         return { number: hit.number, created: false };

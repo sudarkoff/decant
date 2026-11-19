@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { github } from '../src/github';
 import { fakeFetch, jsonRes, type FetchCall } from './fakes';
 
@@ -90,6 +90,7 @@ describe('upsertIssue', () => {
   it('updates the open issue with the exact title (title only, not labels)', async () => {
     const list = `${R}/issues?state=open&per_page=100`;
     const f = route({
+      [`GET ${list}&labels=decant%3Asecurity`]: () => jsonRes([]),
       [`GET ${list}`]: () =>
         jsonRes([
           { number: 1, title: 'decant: GHSA-x in a (extra)', user: BOT },
@@ -114,17 +115,77 @@ describe('upsertIssue', () => {
 
   it("ignores a human's issue with the exact title and creates a new one", async () => {
     const f = route({
+      [`GET ${R}/issues?state=open&per_page=100&labels=decant%3Asecurity`]: () => jsonRes([{ number: 1, title: 'T', user: HUMAN }]),
       [`GET ${R}/issues?state=open&per_page=100`]: () => jsonRes([{ number: 1, title: 'T', user: HUMAN }]),
       [`POST ${R}/issues`]: () => jsonRes({ number: 8 }, 201),
     });
     expect(await github(f, TOKEN, 'o/r').upsertIssue('T', 'b', ['decant:security'])).toEqual({ number: 8, created: true });
   });
 
-  it('throws when a next page remains after 10 pages', async () => {
+  it('with selfLogin, lists only issues created by it', async () => {
+    const f = route({
+      [`GET ${R}/issues?state=open&per_page=100&creator=decant-app%5Bbot%5D`]: () =>
+        jsonRes([{ number: 6, title: 'T', user: { login: 'decant-app[bot]', type: 'Bot' } }]),
+      [`PATCH ${R}/issues/6`]: () => jsonRes({ number: 6 }),
+    });
+    const r = await github(f, TOKEN, 'o/r', { selfLogin: 'decant-app[bot]' }).upsertIssue('T', 'b', ['decant:security']);
+    expect(r).toEqual({ number: 6, created: false });
+    expect(f.calls.length).toBe(2);
+  });
+
+  it('without selfLogin, pre-filters by labels and stops on a hit', async () => {
+    const f = route({
+      [`GET ${R}/issues?state=open&per_page=100&labels=decant%3Asecurity%2Cdecant%3Ahigh`]: () => jsonRes([{ number: 2, title: 'T', user: BOT }]),
+      [`PATCH ${R}/issues/2`]: () => jsonRes({ number: 2 }),
+    });
+    const r = await github(f, TOKEN, 'o/r').upsertIssue('T', 'b', ['decant:security', 'decant:high']);
+    expect(r).toEqual({ number: 2, created: false });
+    expect(f.calls.length).toBe(2);
+  });
+
+  it('without selfLogin, falls back to the unfiltered list when the label filter finds nothing', async () => {
+    const f = route({
+      [`GET ${R}/issues?state=open&per_page=100&labels=decant%3Asecurity`]: () => jsonRes([]),
+      [`GET ${R}/issues?state=open&per_page=100`]: () => jsonRes([{ number: 4, title: 'T', user: BOT }]),
+      [`PATCH ${R}/issues/4`]: () => jsonRes({ number: 4 }),
+    });
+    expect(await github(f, TOKEN, 'o/r').upsertIssue('T', 'b', ['decant:security'])).toEqual({ number: 4, created: false });
+  });
+
+  it('cap hit without a match → creates a new issue (warns), no throw', async () => {
+    const warn = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
     let n = 0;
-    const f = fakeFetch(() => jsonRes([], 200, { link: `<${R}/issues?state=open&per_page=100&page=${++n + 1}>; rel="next"` }));
-    await expect(github(f, TOKEN, 'o/r').upsertIssue('T', 'b', [])).rejects.toThrow(/10 pages/);
-    expect(f.calls.length).toBe(10);
+    const f = fakeFetch((c) =>
+      c.method === 'POST'
+        ? jsonRes({ number: 11 }, 201)
+        : jsonRes([{ number: 99, title: 'spam', user: HUMAN }], 200, { link: `<${R}/issues?state=open&per_page=100&page=${++n + 1}>; rel="next"` }),
+    );
+    expect(await github(f, TOKEN, 'o/r').upsertIssue('T', 'b', [])).toEqual({ number: 11, created: true });
+    expect(f.calls.filter((c) => c.method === 'GET').length).toBe(10);
+    expect(warn.mock.calls.map((a) => String(a[0])).join('')).toMatch(/::warning::.*10 pages/);
+    warn.mockRestore();
+  });
+
+  it('a match on page 1 stops paging', async () => {
+    const f = route({
+      [`GET ${R}/issues?state=open&per_page=100`]: () =>
+        jsonRes([{ number: 1, title: 'T', user: BOT }], 200, { link: `<${R}/issues?state=open&per_page=100&page=2>; rel="next"` }),
+      [`PATCH ${R}/issues/1`]: () => jsonRes({ number: 1 }),
+    });
+    expect(await github(f, TOKEN, 'o/r').upsertIssue('T', 'b', [])).toEqual({ number: 1, created: false });
+    expect(f.calls.filter((c) => c.method === 'GET').length).toBe(1);
+  });
+
+  it('upsertComment: cap hit without a match → posts a new comment', async () => {
+    const warn = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    let n = 0;
+    const f = fakeFetch((c) =>
+      c.method === 'POST'
+        ? jsonRes({ id: 5 }, 201)
+        : jsonRes([{ id: 1, body: '<!-- m -->', user: HUMAN }], 200, { link: `<${R}/issues/5/comments?per_page=100&page=${++n + 1}>; rel="next"` }),
+    );
+    expect(await github(f, TOKEN, 'o/r').upsertComment(5, '<!-- m -->', 'b')).toEqual({ id: 5, created: true });
+    warn.mockRestore();
   });
 
   it('closeIssue PATCHes state closed', async () => {
@@ -222,6 +283,16 @@ describe('labelAddedByWriter', () => {
       [lb]: has('other'),
     });
     expect(await github(f, TOKEN, 'o/r').labelAddedByWriter(3, 'L')).toBe(false);
+  });
+
+  it('still throws (fails closed) when the timeline exceeds the page cap', async () => {
+    let n = 0;
+    const f = fakeFetch((c) =>
+      c.url.includes('/labels')
+        ? jsonRes([{ name: 'L' }])
+        : jsonRes([], 200, { link: `<${tl}&page=${++n + 1}>; rel="next"` }),
+    );
+    await expect(github(f, TOKEN, 'o/r').labelAddedByWriter(3, 'L')).rejects.toThrow(/10 pages/);
   });
 
   it('matches label names case-insensitively', async () => {

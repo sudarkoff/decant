@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Dep } from '../src/lockfiles';
-import { createOsv, cvss31BaseScore, depKey, toVuln } from '../src/osv';
+import { createOsv, cvss31BaseScore, depKey, mergeAliases, toVuln } from '../src/osv';
 import { fakeFetch, jsonRes } from './fakes';
 
 const dep = (eco: 'npm' | 'go', name: string, version: string): Dep => ({ eco, name, version, file: 'x', source: 'registry' });
@@ -165,6 +165,18 @@ describe('review fixes: severity', () => {
     const goOnly = m.get('go:github.com/x/z@v1.0.0')!;
     expect(goOnly.map((v) => [v.id, v.severity])).toEqual([['GO-2026-1', 'critical']]);
     expect(f.calls.filter((c) => c.url.endsWith('/GHSA-xxxx-yyyy-zzzz')).length).toBe(1);
+  });
+});
+
+describe('review fixes: merged fixedFor', () => {
+  it('returns the highest fixed version across an alias group', () => {
+    const range = (fixed: string) => [{ package: { ecosystem: 'npm', name: 'a' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }, { fixed }] }] }];
+    const merged = mergeAliases([
+      toVuln(rec({ id: 'GHSA-1111-1111-1111', aliases: ['CVE-2026-5'], affected: range('1.2.0') })),
+      toVuln(rec({ id: 'GHSA-2222-2222-2222', aliases: ['CVE-2026-5'], affected: range('1.5.0') })),
+    ]);
+    expect(merged.length).toBe(1);
+    expect(merged[0]!.fixedFor('npm', 'a', '1.0.0')).toBe('1.5.0');
   });
 });
 

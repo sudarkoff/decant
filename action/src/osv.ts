@@ -181,7 +181,7 @@ export function toVuln(r: OsvRecord): Vuln {
 
 /**
  * Merges vulns that alias each other (by id or shared alias) into one Vuln per group:
- * GHSA id preferred as `id`, aliases unioned, max severity, first non-null fixedFor, any affects.
+ * GHSA id preferred as `id`, aliases unioned, max severity, highest fixedFor, any affects.
  */
 export function mergeAliases(vulns: Vuln[]): Vuln[] {
   const parent = vulns.map((_, i) => i);
@@ -211,12 +211,14 @@ export function mergeAliases(vulns: Vuln[]): Vuln[] {
       severity: maxSeverity(...g.map((v) => v.severity)),
       summary: primary.summary || (g.find((v) => v.summary)?.summary ?? ''),
       malicious: g.some((v) => v.malicious),
+      // Highest fix across the group: a lower one would leave another member's advisory open.
       fixedFor: (eco, name, version) => {
+        let best: string | null = null;
         for (const v of g) {
           const x = v.fixedFor(eco, name, version);
-          if (x !== null) return x;
+          if (x !== null && (best === null || compareVersions(x, best, eco) > 0)) best = x;
         }
-        return null;
+        return best;
       },
       affects: (eco, name, version) => g.some((v) => v.affects(eco, name, version)),
     };
