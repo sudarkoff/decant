@@ -144,6 +144,7 @@ function readInputs(env) {
 // action/src/modes/adopt.ts
 var adopt_exports = {};
 __export(adopt_exports, {
+  defaultProject: () => defaultProject,
   run: () => run
 });
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -162,6 +163,7 @@ function parsePackageId(id) {
   if (at <= 0 || at === rest.length - 1) return null;
   return { eco, name: rest.slice(0, at), version: rest.slice(at + 1) };
 }
+var PROJECT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 // src/policy/schema.ts
 var SEVERITIES = ["critical", "high", "moderate", "low"];
@@ -210,6 +212,7 @@ function parsePolicy(input) {
   for (const k of Object.keys(input)) if (!TOP_KEYS.has(k)) errors.push(`unknown key: ${k}`);
   let project = "";
   if (typeof input.project !== "string" || input.project === "") errors.push("project must be a non-empty string");
+  else if (!PROJECT_ID_RE.test(input.project)) errors.push(`project must match ${PROJECT_ID_RE.source}`);
   else project = input.project;
   let cooldownDays = 7;
   if (input.cooldownDays !== void 0) {
@@ -310,7 +313,8 @@ function toPr(p) {
     headRef: p.head.ref,
     headSha: p.head.sha,
     baseRef: p.base.ref,
-    baseSha: p.base.sha
+    baseSha: p.base.sha,
+    autoMerge: p.auto_merge !== null && p.auto_merge !== void 0
   };
 }
 function nextLink(link) {
@@ -528,6 +532,9 @@ ${body}`) !== null;
         { id: prNodeId, method }
       );
     },
+    async disableAutoMerge(prNodeId) {
+      await graphql("mutation($id: ID!) { disablePullRequestAutoMerge(input: { pullRequestId: $id }) { clientMutationId } }", { id: prNodeId });
+    },
     /** Our open issue titled exactly `title` (see upsertIssue for the search order); null if none. */
     findIssue,
     /**
@@ -696,6 +703,9 @@ var CONCURRENCY = 8;
 var DAY = 864e5;
 var safe = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
 var ymd = (d) => d.toISOString().slice(0, 10);
+function defaultProject(repo) {
+  return repo.slice(repo.indexOf("/") + 1).toLowerCase();
+}
 async function run({ deps, inputs }) {
   const env = deps.env;
   mask(inputs.token);
@@ -733,9 +743,15 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     cooldownDays = parsed.policy.cooldownDays;
     existing = parsed.policy.allow;
   } else {
+    const project = inputs.project || defaultProject(repo);
+    if (!PROJECT_ID_RE.test(project)) {
+      return stop(
+        `project ${JSON.stringify(project)} is not a valid decant project id (must match ${PROJECT_ID_RE.source}); set the project input to your decant project`
+      );
+    }
     raw = {
       $schema: SCHEMA,
-      project: inputs.project || repo.slice(repo.indexOf("/") + 1),
+      project,
       cooldownDays,
       allow: [],
       block: []
@@ -1841,6 +1857,17 @@ function isForkPr(payload) {
   return !head || head.full_name !== payload.repository?.full_name;
 }
 
+// action/src/git.ts
+var SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+async function fileAtCommit(deps, wd, sha, rel) {
+  const r = await deps.exec("git", ["show", `${sha}:./${rel}`], { cwd: wd });
+  if (r.code === 0) return r.stdout;
+  if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null;
+  throw new Error(
+    `git show ${sha.slice(0, 12)}:${rel} failed: ${r.stderr.trim().slice(0, 300)} (actions/checkout needs fetch-depth: 0)`
+  );
+}
+
 // action/src/guarddog.ts
 var GUARDDOG_VERSION = "3.2.0";
 function tail(s) {
@@ -1899,6 +1926,7 @@ var MARKER = "<!-- decant-scan -->";
 var MAX_DEPS2 = 500;
 var CONCURRENCY2 = 4;
 var REVIEWED = "decant:reviewed";
+var SECURITY = "decant:security";
 var OSV_SCANNER_VERSION = "api.osv.dev/v1";
 var COMMENT_LIMIT = 6e4;
 var SEV_RANK = { low: 1, moderate: 2, unknown: 2, high: 3, critical: 4 };
@@ -1926,14 +1954,6 @@ async function pool(items, n, fn) {
   };
   await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
 }
-async function baseFile(deps, wd, sha, rel) {
-  const r = await deps.exec("git", ["show", `${sha}:./${rel}`], { cwd: wd });
-  if (r.code === 0) return r.stdout;
-  if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null;
-  throw new Error(
-    `git show ${sha.slice(0, 12)}:${rel} failed: ${r.stderr.trim().slice(0, 300)} (actions/checkout needs fetch-depth: 0)`
-  );
-}
 function parseLock(rel, text, decantUrl) {
   return isPackageLock2(rel) ? parsePackageLock(text, rel, decantUrl) : parseGoSum(text, rel);
 }
@@ -1945,11 +1965,12 @@ async function cooldownNote(deps, dep, cooldownDays) {
   }
   return "waiting for cooldown (publish time unknown)";
 }
-function render(rows, pass, failOn, ref, limit = Infinity) {
+function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
   const head = [
     MARKER,
     `## decant scan: ${pass ? "\u2705 pass" : "\u274C fail"}`,
     "",
+    ...note ? [note, ""] : [],
     `${rows.length} new dependency version${rows.length === 1 ? "" : "s"} (ref \`${ref}\`, fail-on \`${failOn}\`).`,
     "",
     "| Package | Source | OSV | GuardDog | Vulns | Status |",
@@ -1974,6 +1995,14 @@ function render(rows, pass, failOn, ref, limit = Infinity) {
 ${lines.join("\n")}
 `;
 }
+async function changedLockfiles(deps, wd, baseSha) {
+  const tree = await findLockfileTree(wd, deps.fs);
+  const out = tree.symlinks.map((l) => l.path);
+  for (const rel of tree.files) {
+    if (await fileAtCommit(deps, wd, baseSha, rel) !== await deps.fs.readFile(join3(wd, rel))) out.push(rel);
+  }
+  return out.map(safe3);
+}
 async function run3({ deps, inputs }) {
   const env = deps.env;
   mask(inputs.token);
@@ -1991,19 +2020,24 @@ async function run3({ deps, inputs }) {
   }
   const n = payload.pull_request?.number;
   if (typeof n !== "number") return stop("event payload has no pull_request.number");
+  const baseSha = payload.pull_request?.base?.sha ?? "";
+  if (!SHA_RE.test(baseSha)) return stop("event payload has no valid pull_request.base.sha");
+  const wd = inputs.workingDirectory;
   if (!inputs.token) {
-    if (isForkPr(payload)) {
-      notice("fork PR has no secrets; decant scan skipped");
-      return 0;
+    if (!isForkPr(payload)) return stop("token is required on pull requests (ci token)");
+    try {
+      const changed = await changedLockfiles(deps, wd, baseSha);
+      if (changed.length) return stop(`fork changes lockfiles (${changed.join(", ")}); push the branch to this repo to scan it`);
+    } catch (e) {
+      return stop(`decant scan: ${e.message}`);
     }
-    return stop("token is required on pull requests (ci token)");
+    notice("fork PR changes no lockfile; nothing to scan");
+    setOutput("result", "pass", env);
+    return 0;
   }
   if (!inputs.githubToken) return stop("github-token is required");
-  const baseSha = payload.pull_request?.base?.sha ?? "";
-  if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(baseSha)) return stop("event payload has no valid pull_request.base.sha");
   if (!SEVERITIES.includes(inputs.failOn)) return stop(`fail-on must be one of ${SEVERITIES.join(", ")}`);
   const failOn = inputs.failOn;
-  const wd = inputs.workingDirectory;
   let cooldownDays = 7;
   const policyFile = join3(wd, inputs.policyPath);
   if (await deps.fs.exists(policyFile)) {
@@ -2044,7 +2078,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     for (const rel of tree.files) {
       const abs = join3(wd, rel);
       const head = await deps.fs.readFile(abs);
-      const base = await baseFile(deps, wd, baseSha, rel);
+      const base = await fileAtCommit(deps, wd, baseSha, rel);
       if (base === head) continue;
       if (isPackageLock2(rel) && containsDecantUrls(head, inputs.decantUrl)) {
         withDecantUrls.push(abs);
@@ -2174,6 +2208,15 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       if (reviewed) r.notes.unshift(`flagged; ${REVIEWED} by a writer`);
       else r.problems.push(`flagged by GuardDog (needs ${REVIEWED} from a writer)`);
     }
+    let securityNote = "";
+    if (anyFlagged && (await gh.prLabels(n)).some((l) => l.toLowerCase() === SECURITY)) {
+      const pr = await gh.getPr(n);
+      if (pr.autoMerge) {
+        await gh.disableAutoMerge(pr.nodeId);
+        notice("flagged security PR: auto-merge disabled; merge it manually after review");
+      }
+      securityNote = `**Auto-merge is off:** a dependency was flagged by GuardDog, so this \`${SECURITY}\` PR must be merged manually after review.`;
+    }
     const all = [...regRows, ...rows];
     const pass = all.every((r) => r.problems.length === 0);
     setOutput("result", pass ? "pass" : "fail", env);
@@ -2187,8 +2230,8 @@ No new dependency versions.`;
       await gh.updateComment(n, MARKER, body);
       return 0;
     }
-    appendSummary(render(all, pass, failOn, ref), env);
-    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT));
+    appendSummary(render(all, pass, failOn, ref, Infinity, securityNote), env);
+    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT, securityNote));
     if (!pass) return fail(`decant scan failed: ${all.filter((r) => r.problems.length).length} dependency version(s) need attention`);
     return 0;
   } catch (e) {
@@ -2228,10 +2271,24 @@ Actor: ${actor} \xB7 Reason: ${reason} \xB7 Run: ${runUrl}`, env);
     return 0;
   }
   if (!inputs.token) return fail2("token is required (read token)");
-  const base = inputs.decantUrl.replace(/\/+$/, "");
-  const host = new URL(base).host;
+  const origin = inputs.decantUrl.replace(/\/+$/, "");
+  const host = new URL(origin).host;
+  let prefix = "";
+  if (env.GITHUB_EVENT_NAME === "pull_request") {
+    let payload;
+    try {
+      payload = await readPayload(deps);
+    } catch (e) {
+      return fail2(e.message);
+    }
+    const n = payload.pull_request?.number;
+    if (typeof n !== "number") return fail2("event payload has no pull_request.number");
+    if (!isForkPr(payload)) prefix = `/r/pr-${n}`;
+  }
+  const base = `${origin}${prefix}`;
+  const npmPath = new URL(`${base}/npm/`).pathname;
   await deps.fs.writeFile(npmrc, `registry=${base}/npm/
-//${host}/npm/:_authToken=${inputs.token}
+//${host}${npmPath}:_authToken=${inputs.token}
 ignore-scripts=true
 `, 384);
   await deps.fs.writeFile(netrc, `machine ${host} login decant password ${inputs.token}
@@ -2245,6 +2302,7 @@ ignore-scripts=true
 // action/src/modes/sync.ts
 var sync_exports = {};
 __export(sync_exports, {
+  overlayPolicy: () => overlayPolicy,
   run: () => run5
 });
 import { join as join4 } from "node:path";
@@ -2253,6 +2311,26 @@ function fail3(msg) {
   process.stderr.write(`${msg}
 `);
   return 1;
+}
+function overlayPolicy(baseRaw, base, prRaw, pr) {
+  const baseAllow = new Set(base.allow.map((a) => a.package));
+  const baseBlock = new Set(base.block.map((b) => b.package));
+  const prBlock = new Set(pr.block.map((b) => b.package));
+  const prAllowRaw = prRaw.allow ?? [];
+  const prBlockRaw = prRaw.block ?? [];
+  const allow = [...baseRaw.allow ?? [], ...prAllowRaw.filter((_, i) => !baseAllow.has(pr.allow[i].package))];
+  const block = [...baseRaw.block ?? [], ...prBlockRaw.filter((_, i) => !baseBlock.has(pr.block[i].package))];
+  const changed = pr.cooldownDays !== base.cooldownDays || JSON.stringify(pr.autoShip) !== JSON.stringify(base.autoShip) || base.block.some((b) => !prBlock.has(b.package));
+  return { raw: { ...baseRaw, allow, block }, changed };
+}
+function parseRaw(text) {
+  try {
+    const raw = JSON.parse(text);
+    const p = parsePolicy(raw);
+    return p.ok ? { raw, policy: p.policy } : null;
+  } catch {
+    return null;
+  }
 }
 async function run5({ deps, inputs }) {
   const env = deps.env;
@@ -2278,6 +2356,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
   const event = env.GITHUB_EVENT_NAME ?? "";
   let ref;
   let token;
+  let policy = parsed.policy;
   if (event === "pull_request") {
     const n = payload.pull_request?.number;
     if (typeof n !== "number") return fail3("event payload has no pull_request.number");
@@ -2290,7 +2369,23 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       }
       return fail3("token is required on pull requests");
     }
-  } else if (event === "push") {
+    const baseSha = payload.pull_request?.base?.sha ?? "";
+    if (!SHA_RE.test(baseSha)) return fail3("event payload has no valid pull_request.base.sha");
+    let baseText;
+    try {
+      baseText = await fileAtCommit(deps, inputs.workingDirectory, baseSha, inputs.policyPath);
+    } catch (e) {
+      return fail3(e.message);
+    }
+    const base = baseText === null ? null : parseRaw(baseText);
+    if (baseText !== null && !base) warning(`${inputs.policyPath} at the base commit is invalid; syncing the PR's policy as is`);
+    if (base) {
+      const o = overlayPolicy(base.raw, base.policy, raw, parsed.policy);
+      raw = o.raw;
+      policy = base.policy;
+      if (o.changed) notice("policy changes in decant.json take effect after merge");
+    }
+  } else if (event === "push" || event === "workflow_dispatch") {
     const branch = env.GITHUB_REF_NAME || (env.GITHUB_REF ?? "").replace(/^refs\/heads\//, "");
     if (!branch || branch !== payload.repository?.default_branch) {
       notice("not the default branch; nothing to sync");
@@ -2302,7 +2397,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
   } else {
     return fail3(`unsupported event ${event}`);
   }
-  const project = inputs.project || parsed.policy.project;
+  const project = inputs.project || policy.project;
   const res = await decant(deps.fetch, inputs.decantUrl, token).syncPolicy(project, raw, env.GITHUB_SHA ?? "", ref);
   if (res.status < 200 || res.status >= 300) {
     const b = res.body;
