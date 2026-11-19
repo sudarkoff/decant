@@ -1,0 +1,10 @@
+CREATE TABLE projects (id TEXT PRIMARY KEY, main_ref TEXT NOT NULL DEFAULT 'main', created_at TEXT NOT NULL);
+CREATE TABLE tokens (hash TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), kind TEXT NOT NULL CHECK (kind IN ('read','ci')), created_at TEXT NOT NULL);
+CREATE TABLE policies (project_id TEXT NOT NULL, ref TEXT NOT NULL, json TEXT NOT NULL, sha TEXT NOT NULL, synced_at TEXT NOT NULL, PRIMARY KEY (project_id, ref));
+CREATE TABLE allows (project_id TEXT NOT NULL, ref TEXT NOT NULL, eco TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL, advisory TEXT, reason TEXT NOT NULL, verified_at TEXT, PRIMARY KEY (project_id, ref, eco, name, version));
+CREATE TABLE versions (eco TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL, publish_time TEXT NOT NULL, first_seen TEXT NOT NULL, conflict INTEGER NOT NULL DEFAULT 0, stored_at TEXT, osv_checked_at TEXT, PRIMARY KEY (eco, name, version));
+CREATE TABLE global_blocks (eco TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL, source TEXT NOT NULL, reason TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (eco, name, version, source));
+CREATE TABLE verdicts (eco TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL, scanner TEXT NOT NULL, scanner_version TEXT NOT NULL, result TEXT NOT NULL CHECK (result IN ('clean','flagged','malicious')), details TEXT, scanned_at TEXT NOT NULL, PRIMARY KEY (eco, name, version, scanner));
+CREATE TABLE serve_log (project_id TEXT NOT NULL, eco TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL, day TEXT NOT NULL, PRIMARY KEY (project_id, eco, name, version, day));
+CREATE INDEX idx_blocks_pkg ON global_blocks (eco, name);
+CREATE INDEX idx_versions_stored ON versions (stored_at, osv_checked_at);
