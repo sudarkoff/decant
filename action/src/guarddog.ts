@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import type { Exec } from './exec';
 
 /** Pinned in action/guarddog-requirements.txt (hash-locked). */
@@ -11,13 +12,26 @@ function tail(s: string): string {
 }
 
 /**
+ * The action's root directory. GitHub sets GITHUB_ACTION_PATH only for composite actions, and decant is a
+ * node action, so it is an override only. Otherwise the directory is found from this code's own location:
+ * one level up from action/dist/index.js (the bundle) or action/src/guarddog.ts (unbundled) is action/.
+ */
+export function actionDir(override: string | undefined, moduleUrl: string = import.meta.url): string {
+  return override || fileURLToPath(new URL('..', moduleUrl));
+}
+
+export function requirementsPath(actionPath: string): string {
+  return `${actionPath.replace(/\/+$/, '')}/guarddog-requirements.txt`;
+}
+
+/**
  * Creates a venv at `dir` and installs the hash-locked GuardDog from `<actionPath>/guarddog-requirements.txt`.
  * Binary wheels only: no sdist build (and so no package build code) ever runs.
  */
 export async function installGuardDog(exec: Exec, dir: string, actionPath: string): Promise<GuardDog> {
   const venv = await exec('python3', ['-m', 'venv', dir]);
   if (venv.code !== 0) throw new Error(`python3 -m venv failed: ${tail(venv.stderr)}`);
-  const req = `${actionPath.replace(/\/+$/, '')}/guarddog-requirements.txt`;
+  const req = requirementsPath(actionPath);
   const pip = await exec(`${dir}/bin/pip`, [
     'install',
     '--disable-pip-version-check',

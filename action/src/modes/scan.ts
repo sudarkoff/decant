@@ -8,7 +8,7 @@ import { isForkPr, readPayload, type Payload } from '../event';
 import { fileAtCommit as baseFile, SHA_RE } from '../git';
 import { appendSummary, error, mask, notice, setOutput, warning } from '../gh-io';
 import { github } from '../github';
-import { GUARDDOG_VERSION, installGuardDog, scanGo, scanNpm, type GuardDog } from '../guarddog';
+import { actionDir, GUARDDOG_VERSION, installGuardDog, scanGo, scanNpm, type GuardDog } from '../guarddog';
 import type { ModeCtx } from '../inputs';
 import { containsDecantUrls, diffDeps, findLockfileTree, parseGoSum, parsePackageLock, type Dep } from '../lockfiles';
 import { createOsv, depKey, type Vuln } from '../osv';
@@ -264,12 +264,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
     let gd: Promise<GuardDog> | null = null;
     const guarddog = () => {
-      if (!gd) {
-        const actionPath = env.GITHUB_ACTION_PATH;
-        gd = actionPath
-          ? installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionPath)
-          : Promise.reject(new Error('GITHUB_ACTION_PATH is not set'));
-      }
+      gd ??= installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionDir(env.GITHUB_ACTION_PATH));
       return gd;
     };
     if (regDeps.length) await deps.fs.mkdir(scratch);
