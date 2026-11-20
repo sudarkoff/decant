@@ -4,7 +4,50 @@ import type { Exec } from './exec';
 /** Pinned in action/guarddog-requirements.txt (hash-locked). */
 export const GUARDDOG_VERSION = '3.2.0';
 
-export type GuardDogResult = { result: 'clean' | 'flagged'; details: string[] };
+/**
+ * One rule that fired. Everything but `rule` comes from the scanned package (file paths, messages) or
+ * from the shared verdict cache, so it is untrusted text: callers escape it before display.
+ */
+export type GuardDogFinding = { rule: string; count?: number; message?: string; locations?: string[] };
+export type GuardDogResult = { result: 'clean' | 'flagged'; details: GuardDogFinding[] };
+
+const MAX_LOCATIONS = 5;
+const MAX_MESSAGE = 200;
+const MAX_RULE = 100;
+const MAX_LOCATION = 200;
+
+/** Whitespace collapsed, cut to `n` chars (with … when cut). */
+function clip(s: string, n: number): string {
+  const t = s.replace(/\s+/g, ' ').trim();
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+}
+
+function finding(rule: string, count: number | undefined, message: unknown, locations: unknown[]): GuardDogFinding {
+  const f: GuardDogFinding = { rule: clip(rule, MAX_RULE) };
+  if (count !== undefined) f.count = count;
+  if (typeof message === 'string' && message.trim()) f.message = clip(message, MAX_MESSAGE);
+  const locs = [...new Set(locations.filter((l): l is string => typeof l === 'string' && l.trim() !== '').map((l) => clip(l, MAX_LOCATION)))];
+  if (locs.length) f.locations = locs.slice(0, MAX_LOCATIONS);
+  return f;
+}
+
+/**
+ * Verdict `details` read back from decant's shared cache: the current finding objects, or the legacy
+ * list of rule strings. Anything else is dropped, and the caps are re-applied (another project wrote it).
+ */
+export function normalizeFindings(details: unknown): GuardDogFinding[] {
+  if (!Array.isArray(details)) return [];
+  const out: GuardDogFinding[] = [];
+  for (const d of details) {
+    if (typeof d === 'string' && d.trim()) out.push({ rule: clip(d, MAX_RULE) });
+    else if (d && typeof d === 'object' && typeof (d as { rule?: unknown }).rule === 'string') {
+      const o = d as { rule: string; count?: unknown; message?: unknown; locations?: unknown };
+      const count = typeof o.count === 'number' && Number.isInteger(o.count) && o.count >= 0 ? o.count : undefined;
+      out.push(finding(o.rule, count, o.message, Array.isArray(o.locations) ? o.locations : []));
+    }
+  }
+  return out;
+}
 export type GuardDog = { bin: string };
 
 function tail(s: string): string {
@@ -105,22 +148,42 @@ export function parseGuardDogJson(stdout: string): GuardDogResult {
     throw new Error(`guarddog reported errors: ${Object.keys(doc.errors).join(', ')}`);
   }
   if (!doc.results || typeof doc.results !== 'object') throw new Error('guarddog: no results in output');
-  const details: string[] = [];
+  // Source-code rules give a list of {location, code, match, message}; metadata rules give a message string.
+  const details: GuardDogFinding[] = [];
   for (const [rule, v] of Object.entries(doc.results as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : 1))) {
     if (rule.startsWith('capability-') || !hasFindings(v)) continue;
-    details.push(Array.isArray(v) ? `${rule} (${v.length})` : rule);
+    if (Array.isArray(v)) {
+      const hits = v.map((h) => (h && typeof h === 'object' ? (h as { location?: unknown; message?: unknown }) : {}));
+      details.push(finding(rule, v.length, hits.map((h) => h.message).find((m) => typeof m === 'string' && m.trim()), hits.map((h) => h.location)));
+    } else {
+      details.push(finding(rule, undefined, v, []));
+    }
   }
   if (Array.isArray(doc.risks) && doc.risks.length > 0) {
     const label = typeof doc.risk_score?.label === 'string' ? doc.risk_score.label : 'unlabelled';
-    details.push(`risk: ${label}`);
+    const locs = doc.risks.map((r) => (r && typeof r === 'object' ? (r as { threat_location?: unknown }).threat_location : undefined));
+    details.push(finding('risk', doc.risks.length, label, locs));
   }
   return { result: details.length > 0 ? 'flagged' : 'clean', details };
 }
 
+/**
+ * GuardDog (utils/archives.py) refuses a zip it cannot enumerate unambiguously, e.g. one with two
+ * End-Of-Central-Directory records, and cli.py logs `Error occurred while scanning target <path>:
+ * '<message>'` and exits 1. Archives that contain zip test fixtures (Go modules like klauspost/compress)
+ * trip it. That is a reason for a human to look, not an unscannable package: it becomes a flag.
+ */
+const ANOMALY_RE = /Error occurred while scanning target [^\n]*?: '(archive parser anomaly: [^'\n]*)'/;
+export const ARCHIVE_ANOMALY = 'archive-anomaly';
+
 async function scan(exec: Exec, bin: string, eco: 'npm' | 'go', path: string): Promise<GuardDogResult> {
   // `path` must be an existing absolute file: guarddog treats anything else as a remote name and downloads it.
   const r = await exec(bin, [eco, 'scan', path, '--output-format', 'json', '--sandbox']);
-  if (r.code !== 0) throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+  if (r.code !== 0) {
+    const anomaly = ANOMALY_RE.exec(r.stderr) ?? ANOMALY_RE.exec(r.stdout);
+    if (anomaly) return { result: 'flagged', details: [finding(ARCHIVE_ANOMALY, undefined, anomaly[1], [])] };
+    throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+  }
   return parseGuardDogJson(r.stdout);
 }
 

@@ -1612,11 +1612,11 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
         );
       }
     } else lines.push("No fixable advisories.");
-    const count = (r) => outcomes.filter((o) => o.result === r).length;
+    const count2 = (r) => outcomes.filter((o) => o.result === r).length;
     lines.push(
       "",
       `Security PR: ${prLine}`,
-      `Packages fixed: ${count("fixed")} \xB7 declined: ${count("declined")} \xB7 unverified: ${count("unverified")} \xB7 unresolvable: ${count("unresolvable")} \xB7 failed: ${count("failed")}`,
+      `Packages fixed: ${count2("fixed")} \xB7 declined: ${count2("declined")} \xB7 unverified: ${count2("unverified")} \xB7 unresolvable: ${count2("unresolvable")} \xB7 failed: ${count2("failed")}`,
       `Unfixed advisories: ${unfixed.length}${unfixedIssue ? ` (issue #${unfixedIssue})` : ""}`,
       `Blocked versions in lockfiles: ${hits.length}${blockedIssue ? ` (issue #${blockedIssue})` : ""}`,
       `Prune: ${prune}`
@@ -2106,6 +2106,35 @@ async function fileAtCommit(deps, wd, sha, rel) {
 // action/src/guarddog.ts
 import { fileURLToPath } from "node:url";
 var GUARDDOG_VERSION = "3.2.0";
+var MAX_LOCATIONS = 5;
+var MAX_MESSAGE = 200;
+var MAX_RULE = 100;
+var MAX_LOCATION = 200;
+function clip(s, n) {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length > n ? `${t.slice(0, n - 1)}\u2026` : t;
+}
+function finding(rule, count2, message, locations) {
+  const f = { rule: clip(rule, MAX_RULE) };
+  if (count2 !== void 0) f.count = count2;
+  if (typeof message === "string" && message.trim()) f.message = clip(message, MAX_MESSAGE);
+  const locs = [...new Set(locations.filter((l) => typeof l === "string" && l.trim() !== "").map((l) => clip(l, MAX_LOCATION)))];
+  if (locs.length) f.locations = locs.slice(0, MAX_LOCATIONS);
+  return f;
+}
+function normalizeFindings(details) {
+  if (!Array.isArray(details)) return [];
+  const out = [];
+  for (const d of details) {
+    if (typeof d === "string" && d.trim()) out.push({ rule: clip(d, MAX_RULE) });
+    else if (d && typeof d === "object" && typeof d.rule === "string") {
+      const o = d;
+      const count2 = typeof o.count === "number" && Number.isInteger(o.count) && o.count >= 0 ? o.count : void 0;
+      out.push(finding(o.rule, count2, o.message, Array.isArray(o.locations) ? o.locations : []));
+    }
+  }
+  return out;
+}
 function tail(s) {
   return s.trim().split("\n").slice(-5).join(" ").slice(0, 500);
 }
@@ -2168,17 +2197,29 @@ function parseGuardDogJson(stdout) {
   const details = [];
   for (const [rule, v] of Object.entries(doc.results).sort(([a], [b]) => a < b ? -1 : 1)) {
     if (rule.startsWith("capability-") || !hasFindings(v)) continue;
-    details.push(Array.isArray(v) ? `${rule} (${v.length})` : rule);
+    if (Array.isArray(v)) {
+      const hits = v.map((h) => h && typeof h === "object" ? h : {});
+      details.push(finding(rule, v.length, hits.map((h) => h.message).find((m) => typeof m === "string" && m.trim()), hits.map((h) => h.location)));
+    } else {
+      details.push(finding(rule, void 0, v, []));
+    }
   }
   if (Array.isArray(doc.risks) && doc.risks.length > 0) {
     const label = typeof doc.risk_score?.label === "string" ? doc.risk_score.label : "unlabelled";
-    details.push(`risk: ${label}`);
+    const locs = doc.risks.map((r) => r && typeof r === "object" ? r.threat_location : void 0);
+    details.push(finding("risk", doc.risks.length, label, locs));
   }
   return { result: details.length > 0 ? "flagged" : "clean", details };
 }
+var ANOMALY_RE = /Error occurred while scanning target [^\n]*?: '(archive parser anomaly: [^'\n]*)'/;
+var ARCHIVE_ANOMALY = "archive-anomaly";
 async function scan(exec, bin, eco, path) {
   const r = await exec(bin, [eco, "scan", path, "--output-format", "json", "--sandbox"]);
-  if (r.code !== 0) throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+  if (r.code !== 0) {
+    const anomaly = ANOMALY_RE.exec(r.stderr) ?? ANOMALY_RE.exec(r.stdout);
+    if (anomaly) return { result: "flagged", details: [finding(ARCHIVE_ANOMALY, void 0, anomaly[1], [])] };
+    throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+  }
   return parseGuardDogJson(r.stdout);
 }
 var scanNpm = (exec, bin, tgzPath) => scan(exec, bin, "npm", tgzPath);
@@ -2201,6 +2242,18 @@ function fail(msg) {
   return 1;
 }
 var safe3 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var safeText = (s) => s.replace(/\s+/g, " ").replace(/[^A-Za-z0-9._~/+:,;=!?#%&*()'"{}$^ -]/g, "?");
+var count = (f) => f.count !== void 0 ? ` (${f.count})` : "";
+function findingText(f) {
+  const msg = f.message ? `: ${safeText(f.message)}` : "";
+  const at = f.locations?.length ? ` at ${f.locations.map(safeText).join(", ")}` : "";
+  return `${safe3(f.rule)}${count(f)}${msg}${at}`;
+}
+function findingLine(r, f) {
+  const msg = f.message ? `: \`${safeText(f.message)}\`` : "";
+  const at = f.locations?.length ? ` at ${f.locations.map((l) => `\`${safeText(l)}\``).join(", ")}` : "";
+  return `- \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` \`${safe3(f.rule)}\`${count(f)}${msg}${at}`;
+}
 var isPackageLock2 = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
 var shellQuote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
 function newReviewScope(p) {
@@ -2241,6 +2294,7 @@ function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
   ].join("\n");
   const lines = [];
   let size2 = head.length;
+  let cut = false;
   for (const [i, r] of rows.entries()) {
     const vulns = r.vulns.length ? r.vulns.map((v) => `${safe3(v.id)} (${v.malicious ? "malicious" : v.severity})`).join(", ") : "\u2014";
     const status = r.problems.length ? `\u274C ${r.problems.join("; ")}` : r.warn ? `\u26A0\uFE0F ${r.notes.join("; ")}` : `\u2705 ${r.notes.length ? r.notes.join("; ") : "ok"}`;
@@ -2249,10 +2303,26 @@ function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
     if (size2 + line2.length + 1 > limit) {
       lines.push(`
 \u2026 and ${rows.length - i} more (see the job summary).`);
+      cut = true;
       break;
     }
     lines.push(line2);
     size2 += line2.length + 1;
+  }
+  const findings = rows.filter((r) => r.flagged).flatMap((r) => r.findings.length ? r.findings.map((f) => findingLine(r, f)) : [`- \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` (no rule details recorded)`]);
+  if (findings.length && !cut) {
+    const title = "\n### GuardDog findings\n";
+    lines.push(title);
+    size2 += title.length + 1;
+    for (const [i, line2] of findings.entries()) {
+      if (size2 + line2.length + 1 > limit) {
+        lines.push(`
+\u2026 and ${findings.length - i} more finding${findings.length - i === 1 ? "" : "s"} (see the job summary).`);
+        break;
+      }
+      lines.push(line2);
+      size2 += line2.length + 1;
+    }
   }
   return `${head}
 ${lines.join("\n")}
@@ -2374,7 +2444,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     }
     const registry = /* @__PURE__ */ new Map();
     const rows = [];
-    const row = (dep) => ({ dep, osv: "\u2014", guarddog: "\u2014", vulns: [], problems: [], notes: [], warn: false, flagged: false });
+    const row = (dep) => ({ dep, osv: "\u2014", guarddog: "\u2014", vulns: [], problems: [], notes: [], warn: false, flagged: false, findings: [] });
     for (const d of added) {
       if (d.source === "registry") {
         if (!registry.has(formatPackageId(d))) registry.set(formatPackageId(d), d);
@@ -2442,6 +2512,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       if (cGd) {
         gdResult = cGd.result;
         r.guarddog = `${cGd.result} (cached)`;
+        r.findings = normalizeFindings(cGd.details);
         const status = await client.availability(d.eco, d.name, d.version, ref);
         if (status !== "ok") await unavailable(status);
       } else {
@@ -2456,15 +2527,18 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
           await client.putVerdict({ package: id, scanner: "guarddog", scannerVersion: GUARDDOG_VERSION, result: res.result, details: res.details });
           gdResult = res.result;
           r.guarddog = res.result;
-          if (res.details.length) r.notes.push(`GuardDog: ${res.details.map(safe3).join(", ")}`);
+          r.findings = res.details;
         }
       }
+      if (gdResult !== "clean" && r.findings.length) r.notes.push(`GuardDog: ${r.findings.map((f) => `${safe3(f.rule)}${count(f)}`).join(", ")}`);
       if (gdResult === "flagged") r.flagged = true;
     }
     const anyFlagged = regRows.some((r) => r.flagged);
     const reviewed = anyFlagged ? await gh.labelAddedByWriter(n, REVIEWED) : false;
     for (const r of regRows) {
       if (!r.flagged) continue;
+      const what = r.findings.length ? r.findings.map(findingText).join("; ") : "no rule details recorded";
+      warning(`${safe3(r.dep.name)}@${safe3(r.dep.version)} flagged by GuardDog: ${what}`);
       if (reviewed) r.notes.unshift(`flagged; ${REVIEWED} by a writer`);
       else r.problems.push(`flagged by GuardDog (needs ${REVIEWED} from a writer)`);
     }

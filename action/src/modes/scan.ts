@@ -8,7 +8,7 @@ import { isForkPr, readPayload, type Payload } from '../event';
 import { fileAtCommit as baseFile, SHA_RE } from '../git';
 import { appendSummary, error, mask, notice, setOutput, warning } from '../gh-io';
 import { github } from '../github';
-import { actionDir, GUARDDOG_VERSION, installGuardDog, scanGo, scanNpm, type GuardDog } from '../guarddog';
+import { actionDir, GUARDDOG_VERSION, installGuardDog, normalizeFindings, scanGo, scanNpm, type GuardDog, type GuardDogFinding } from '../guarddog';
 import type { ModeCtx } from '../inputs';
 import { containsDecantUrls, diffDeps, findLockfileTree, parseGoSum, parsePackageLock, type Dep } from '../lockfiles';
 import { createOsv, depKey, type Vuln } from '../osv';
@@ -39,10 +39,34 @@ type Row = {
   notes: string[];
   warn: boolean;
   flagged: boolean;
+  findings: GuardDogFinding[];
 };
 
 /** Package names and ids in the report come from the PR's lockfile: keep only harmless characters. */
 const safe = (s: string) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, '?');
+
+/**
+ * GuardDog's messages and file paths come from the scanned package (or the shared verdict cache): the
+ * same allowlist as `safe`, widened to prose punctuation that is inert inside a code span, which is the
+ * only place the report shows them. No backtick, pipe, backslash, brackets, angle brackets or @.
+ */
+const safeText = (s: string) => s.replace(/\s+/g, ' ').replace(/[^A-Za-z0-9._~/+:,;=!?#%&*()'"{}$^ -]/g, '?');
+
+const count = (f: GuardDogFinding) => (f.count !== undefined ? ` (${f.count})` : '');
+
+/** One finding as plain text (annotations): `rule (n): message at a.js:1, b.js:2`. */
+function findingText(f: GuardDogFinding): string {
+  const msg = f.message ? `: ${safeText(f.message)}` : '';
+  const at = f.locations?.length ? ` at ${f.locations.map(safeText).join(', ')}` : '';
+  return `${safe(f.rule)}${count(f)}${msg}${at}`;
+}
+
+/** One finding as a markdown list item, every package-controlled part in a code span. */
+function findingLine(r: Row, f: GuardDogFinding): string {
+  const msg = f.message ? `: \`${safeText(f.message)}\`` : '';
+  const at = f.locations?.length ? ` at ${f.locations.map((l) => `\`${safeText(l)}\``).join(', ')}` : '';
+  return `- \`${safe(r.dep.name)}@${safe(r.dep.version)}\` \`${safe(f.rule)}\`${count(f)}${msg}${at}`;
+}
 
 const isPackageLock = (rel: string) => rel === 'package-lock.json' || rel.endsWith('/package-lock.json');
 
@@ -94,6 +118,7 @@ function render(rows: Row[], pass: boolean, failOn: string, ref: string, limit =
   ].join('\n');
   const lines: string[] = [];
   let size = head.length;
+  let cut = false;
   for (const [i, r] of rows.entries()) {
     const vulns = r.vulns.length ? r.vulns.map((v) => `${safe(v.id)} (${v.malicious ? 'malicious' : v.severity})`).join(', ') : '—';
     const status = r.problems.length
@@ -105,10 +130,27 @@ function render(rows: Row[], pass: boolean, failOn: string, ref: string, limit =
     const line = `| \`${safe(r.dep.name)}@${safe(r.dep.version)}\` | ${source} | ${r.osv} | ${r.guarddog} | ${vulns} | ${status} |`;
     if (size + line.length + 1 > limit) {
       lines.push(`\n… and ${rows.length - i} more (see the job summary).`);
+      cut = true;
       break;
     }
     lines.push(line);
     size += line.length + 1;
+  }
+  const findings = rows
+    .filter((r) => r.flagged)
+    .flatMap((r) => (r.findings.length ? r.findings.map((f) => findingLine(r, f)) : [`- \`${safe(r.dep.name)}@${safe(r.dep.version)}\` (no rule details recorded)`]));
+  if (findings.length && !cut) {
+    const title = '\n### GuardDog findings\n';
+    lines.push(title);
+    size += title.length + 1;
+    for (const [i, line] of findings.entries()) {
+      if (size + line.length + 1 > limit) {
+        lines.push(`\n… and ${findings.length - i} more finding${findings.length - i === 1 ? '' : 's'} (see the job summary).`);
+        break;
+      }
+      lines.push(line);
+      size += line.length + 1;
+    }
   }
   return `${head}\n${lines.join('\n')}\n`;
 }
@@ -240,7 +282,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     // 2. One row per registry package version (deduped across lockfiles), one per other-source entry.
     const registry = new Map<string, Dep>();
     const rows: Row[] = [];
-    const row = (dep: Dep): Row => ({ dep, osv: '—', guarddog: '—', vulns: [], problems: [], notes: [], warn: false, flagged: false });
+    const row = (dep: Dep): Row => ({ dep, osv: '—', guarddog: '—', vulns: [], problems: [], notes: [], warn: false, flagged: false, findings: [] });
     for (const d of added) {
       if (d.source === 'registry') {
         if (!registry.has(formatPackageId(d))) registry.set(formatPackageId(d), d);
@@ -317,6 +359,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       if (cGd) {
         gdResult = cGd.result;
         r.guarddog = `${cGd.result} (cached)`;
+        r.findings = normalizeFindings(cGd.details);
         const status = await client.availability(d.eco, d.name, d.version, ref);
         if (status !== 'ok') await unavailable(status);
       } else {
@@ -331,9 +374,10 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
           await client.putVerdict({ package: id, scanner: 'guarddog', scannerVersion: GUARDDOG_VERSION, result: res.result, details: res.details });
           gdResult = res.result;
           r.guarddog = res.result;
-          if (res.details.length) r.notes.push(`GuardDog: ${res.details.map(safe).join(', ')}`);
+          r.findings = res.details;
         }
       }
+      if (gdResult !== 'clean' && r.findings.length) r.notes.push(`GuardDog: ${r.findings.map((f) => `${safe(f.rule)}${count(f)}`).join(', ')}`);
       if (gdResult === 'flagged') r.flagged = true;
     }
 
@@ -342,6 +386,8 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     const reviewed = anyFlagged ? await gh.labelAddedByWriter(n, REVIEWED) : false;
     for (const r of regRows) {
       if (!r.flagged) continue;
+      const what = r.findings.length ? r.findings.map(findingText).join('; ') : 'no rule details recorded';
+      warning(`${safe(r.dep.name)}@${safe(r.dep.version)} flagged by GuardDog: ${what}`);
       if (reviewed) r.notes.unshift(`flagged; ${REVIEWED} by a writer`);
       else r.problems.push(`flagged by GuardDog (needs ${REVIEWED} from a writer)`);
     }

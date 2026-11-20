@@ -7,6 +7,7 @@ import {
   actionDir,
   GUARDDOG_VERSION,
   installGuardDog,
+  normalizeFindings,
   parseGuardDogJson,
   pythonInterpreter,
   requirementsPath,
@@ -146,20 +147,61 @@ describe('scanNpm / scanGo', () => {
   });
 });
 
+describe('archive parser anomaly', () => {
+  // guarddog 3.2.0 cli.py logs this and exits 1 when utils/archives.py refuses a zip.
+  const anomaly =
+    "ERROR: Error occurred while scanning target /rt/decant-scan/2.zip: 'archive parser anomaly: multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)'\n";
+
+  it('is a flag (rule archive-anomaly) with GuardDog\'s message, not a scan error', async () => {
+    const r = await scanGo(fakeExec(() => ({ code: 1, stderr: anomaly })), 'g', '/rt/decant-scan/2.zip');
+    expect(r).toEqual({
+      result: 'flagged',
+      details: [{ rule: 'archive-anomaly', message: 'archive parser anomaly: multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)' }],
+    });
+  });
+
+  it('the local-header variant is a flag too', async () => {
+    const msg = 'archive parser anomaly: 9 ZIP local file headers but zipfile enumerates 3 members from the central directory (possible scan evasion via EOCD size/offset differential)';
+    const r = await scanNpm(fakeExec(() => ({ code: 1, stderr: `Error occurred while scanning target /t/0.tgz: '${msg}'` })), 'g', '/t/0.tgz');
+    expect(r.details).toEqual([{ rule: 'archive-anomaly', message: msg }]);
+  });
+
+  it('any other non-zero exit stays a scan error, even if the text appears elsewhere', async () => {
+    await expect(scanGo(fakeExec(() => ({ code: 1, stderr: 'Error occurred while scanning target x: \'boom\'' })), 'g', '/z.zip')).rejects.toThrow(/exited 1/);
+    await expect(scanGo(fakeExec(() => ({ code: 1, stderr: 'unrelated: archive parser anomaly: in a file name' })), 'g', '/z.zip')).rejects.toThrow(/exited 1/);
+  });
+});
+
 describe('parseGuardDogJson', () => {
-  it('flags any non-capability rule with findings', () => {
+  it('flags any non-capability rule with findings, with messages and locations', () => {
     const r = parseGuardDogJson(
       JSON.stringify({
         ...clean,
         results: {
-          'threat-npm-preinstall-script': [{ location: 'package/package.json:3', message: 'x' }],
+          'threat-npm-preinstall-script': [{ location: 'package/package.json:3', code: 'x', match: 'x', message: 'runs a preinstall script' }],
           typosquatting: 'looks like lodash',
           'capability-network-outbound': [{ location: 'a.js:1' }],
           'threat-process-hooks': {},
         },
       }),
     );
-    expect(r).toEqual({ result: 'flagged', details: ['threat-npm-preinstall-script (1)', 'typosquatting'] });
+    expect(r).toEqual({
+      result: 'flagged',
+      details: [
+        { rule: 'threat-npm-preinstall-script', count: 1, message: 'runs a preinstall script', locations: ['package/package.json:3'] },
+        { rule: 'typosquatting', message: 'looks like lodash' },
+      ],
+    });
+  });
+
+  it('caps locations at 5 (deduped) and truncates long messages', () => {
+    const hits = Array.from({ length: 8 }, (_, i) => ({ location: `a.js:${i % 7}`, message: 'm'.repeat(300) }));
+    const r = parseGuardDogJson(JSON.stringify({ ...clean, results: { 'threat-shady-links': hits } }));
+    const f = r.details[0]!;
+    expect(f.count).toBe(8);
+    expect(f.locations).toEqual(['a.js:0', 'a.js:1', 'a.js:2', 'a.js:3', 'a.js:4']);
+    expect(f.message!.length).toBe(200);
+    expect(f.message!.endsWith('…')).toBe(true);
   });
 
   it('capability-only findings are clean (informational in guarddog 3.x)', () => {
@@ -168,7 +210,25 @@ describe('parseGuardDogJson', () => {
   });
 
   it('a correlated risk is flagged', () => {
-    const r = parseGuardDogJson(JSON.stringify({ ...clean, risks: [{ x: 1 }], risk_score: { label: 'suspicious' } }));
-    expect(r).toEqual({ result: 'flagged', details: ['risk: suspicious'] });
+    const r = parseGuardDogJson(JSON.stringify({ ...clean, risks: [{ threat_location: 'i.js:2' }], risk_score: { label: 'suspicious' } }));
+    expect(r).toEqual({ result: 'flagged', details: [{ rule: 'risk', count: 1, message: 'suspicious', locations: ['i.js:2'] }] });
+  });
+});
+
+describe('normalizeFindings (verdict details read back from the shared cache)', () => {
+  it('accepts the current shape and the legacy string list; drops junk', () => {
+    expect(normalizeFindings([{ rule: 'r', count: 2, message: 'm', locations: ['a:1', 7] }, { nope: 1 }, 'legacy-rule (3)', 5])).toEqual([
+      { rule: 'r', count: 2, message: 'm', locations: ['a:1'] },
+      { rule: 'legacy-rule (3)' },
+    ]);
+    expect(normalizeFindings(undefined)).toEqual([]);
+    expect(normalizeFindings({ rule: 'x' })).toEqual([]);
+  });
+
+  it('re-applies the caps to untrusted cached details', () => {
+    const [f] = normalizeFindings([{ rule: 'r'.repeat(300), message: 'm'.repeat(300), locations: Array.from({ length: 9 }, (_, i) => `f:${i}`) }]);
+    expect(f!.rule.length).toBeLessThanOrEqual(100);
+    expect(f!.message!.length).toBe(200);
+    expect(f!.locations).toHaveLength(5);
   });
 });

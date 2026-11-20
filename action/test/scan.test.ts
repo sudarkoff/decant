@@ -35,7 +35,7 @@ const LP = { name: 'left-pad', version: '1.3.0' };
 type World = {
   head: string;
   base: string | null;
-  verdicts?: Record<string, { scanner: string; result: string; scannerVersion?: string }[]>;
+  verdicts?: Record<string, { scanner: string; result: string; scannerVersion?: string; details?: unknown }[]>;
   osv?: Record<string, { id: string; severity?: string }[]>;
   download?: 'ok' | 'cooldown' | 'blocked';
   guarddog?: Record<string, unknown>;
@@ -54,6 +54,7 @@ type World = {
   priorComment?: boolean;
   autoMerge?: boolean;
   python?: string;
+  gdExit?: { code: number; stderr: string };
 };
 
 function harness(w: World) {
@@ -161,7 +162,7 @@ function harness(w: World) {
     if (c.cmd === 'git') {
       return w.base === null ? { code: 128, stderr: `fatal: path 'package-lock.json' exists on disk, but not in '${BASE}'` } : { stdout: w.base };
     }
-    if (c.cmd.endsWith('/bin/guarddog')) return { stdout: JSON.stringify(gdOut) };
+    if (c.cmd.endsWith('/bin/guarddog')) return w.gdExit ?? { stdout: JSON.stringify(gdOut) };
     if (c.args[0] === '-c') return { stdout: `${w.python ?? '3.12'}\n` };
     return {};
   });
@@ -502,6 +503,84 @@ describe('scan', () => {
     const log = h.log().replace(/::add-mask::.*\n/g, '');
     expect(log).not.toContain(TOKEN);
     expect(log).not.toContain(GH);
+  });
+});
+
+describe('scan: GuardDog findings in the report', () => {
+  const anomaly = {
+    code: 1,
+    stderr:
+      "ERROR: Error occurred while scanning target /rt/decant-scan/0.tgz: 'archive parser anomaly: multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)'\n",
+  };
+
+  it('shows each rule, its message and locations in the summary, the comment and an annotation; stores them in the verdict', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), guarddog: flaggedGd });
+    expect(await h.run()).toBe(1);
+    const line = '- `left-pad@1.3.0` `threat-npm-preinstall-script` (1): `preinstall` at `package/package.json:5`';
+    expect(h.summary()).toContain('### GuardDog findings');
+    expect(h.summary()).toContain(line);
+    expect(h.comments[0]).toContain(line);
+    expect(h.log()).toContain('::warning::left-pad@1.3.0 flagged by GuardDog: threat-npm-preinstall-script (1): preinstall at package/package.json:5');
+    expect(h.puts).toContainEqual(
+      expect.objectContaining({
+        scanner: 'guarddog',
+        result: 'flagged',
+        details: [{ rule: 'threat-npm-preinstall-script', count: 1, message: 'preinstall', locations: ['package/package.json:5'] }],
+      }),
+    );
+  });
+
+  it('escapes package-controlled text: no markdown, mentions, HTML or table breaks', async () => {
+    const evil = {
+      ...flaggedGd,
+      results: { 'threat-x': [{ location: 'a`|b.js:1', message: 'hi @octocat <img src=x> | `code` [l](http://e)\n## h' }] },
+    };
+    const h = harness({ head: lock([LP]), base: lock([]), guarddog: evil });
+    await h.run();
+    const section = h.summary().slice(h.summary().indexOf('### GuardDog findings'));
+    expect(section).not.toMatch(/@octocat|<img|\[l\]|`code`|\n## h/);
+    expect(section).toContain('`a??b.js:1`');
+    expect(h.log()).not.toContain('<img');
+  });
+
+  it('a cached flagged verdict still shows its rules', async () => {
+    const h = harness({
+      head: lock([LP]),
+      base: lock([]),
+      verdicts: {
+        'npm:left-pad@1.3.0': [
+          { scanner: 'osv', result: 'clean' },
+          { scanner: 'guarddog', result: 'flagged', details: [{ rule: 'threat-shady-links', count: 2, message: 'shady URL' }] },
+        ],
+      },
+    });
+    expect(await h.run()).toBe(1);
+    expect(h.summary()).toContain('- `left-pad@1.3.0` `threat-shady-links` (2): `shady URL`');
+  });
+
+  it('an archive parser anomaly is a flag (archive-anomaly), not a scan error', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), gdExit: anomaly });
+    expect(await h.run()).toBe(1);
+    expect(h.comments[0]).not.toContain('scan error');
+    expect(h.comments[0]).toContain('flagged by GuardDog (needs decant:reviewed from a writer)');
+    expect(h.comments[0]).toContain(
+      '`archive-anomaly`: `archive parser anomaly: multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)`',
+    );
+    expect(h.puts).toContainEqual(expect.objectContaining({ scanner: 'guarddog', result: 'flagged', details: [expect.objectContaining({ rule: 'archive-anomaly' })] }));
+    expect(h.outputs()).toMatch(/flagged<<\S+\ntrue\n/);
+  });
+
+  it('a writer\'s decant:reviewed clears an archive-anomaly flag', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), gdExit: anomaly, labels: ['decant:reviewed'], labeler: { login: 'maint', permission: 'write' } });
+    expect(await h.run()).toBe(0);
+    expect(h.outputs()).toMatch(/result<<\S+\npass\n/);
+  });
+
+  it('any other GuardDog failure is still a scan error (fails closed)', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), gdExit: { code: 1, stderr: "Error occurred while scanning target x: 'boom'" } });
+    expect(await h.run()).toBe(1);
+    expect(h.comments[0]).toContain('scan error');
+    expect(h.puts).not.toContainEqual(expect.objectContaining({ scanner: 'guarddog' }));
   });
 });
 
