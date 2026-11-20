@@ -1107,9 +1107,10 @@ function decant(f, url, token, retry = {}) {
       }
       return { status: res.status, body };
     },
-    /** PUT the default branch's dependency summary (sync token). Never throws on an HTTP status. */
-    async syncDeps(project, sha, deps) {
-      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps }, retryStatuses: false });
+    /** PUT the default branch's dependency summary (sync token), with the GitHub repo when known. Never throws on an HTTP status. */
+    async syncDeps(project, sha, deps, repo) {
+      const payload = repo === void 0 ? { sha, deps } : { sha, deps, repo };
+      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/deps`, { body: payload, retryStatuses: false });
       const text = await res.text();
       let body = text;
       try {
@@ -2902,6 +2903,7 @@ function parseRaw(text) {
 function errorText2(b) {
   return typeof b === "object" && b !== null && typeof b.error === "string" ? b.error : typeof b === "string" ? b : JSON.stringify(b);
 }
+var REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 async function sendDependencySummary(deps, client, wd, project, sha) {
   try {
     const s = await dependencySummary(wd, deps.fs);
@@ -2909,7 +2911,8 @@ async function sendDependencySummary(deps, client, wd, project, sha) {
     const c = capSummary(sha, s.deps);
     if (c.trimmed === "via") warning("dependency summary is over 1 MB; sent without the held-back-by names");
     if (c.trimmed === "transitive") warning("dependency summary is over 1 MB; sent direct dependencies only");
-    const res = await client.syncDeps(project, sha, c.deps);
+    const repo = deps.env.GITHUB_REPOSITORY ?? "";
+    const res = await client.syncDeps(project, sha, c.deps, REPO_RE.test(repo) ? repo : void 0);
     if (res.status < 200 || res.status >= 300) warning(`decant did not store the dependency summary (HTTP ${res.status}): ${errorText2(res.body)}`);
   } catch (e) {
     warning(`dependency summary not sent: ${e instanceof Error ? e.message : String(e)}`);

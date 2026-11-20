@@ -55,6 +55,8 @@ function errorText(b: unknown): string {
       : JSON.stringify(b);
 }
 
+const REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+
 /**
  * Default branch only: send the lockfiles' dependency summary (names, versions, direct or not, and which
  * direct dependencies pull each one in) for the dashboard. Best effort: every failure is a warning.
@@ -66,7 +68,9 @@ async function sendDependencySummary(deps: ActionDeps, client: DecantClient, wd:
     const c = capSummary(sha, s.deps);
     if (c.trimmed === 'via') warning('dependency summary is over 1 MB; sent without the held-back-by names');
     if (c.trimmed === 'transitive') warning('dependency summary is over 1 MB; sent direct dependencies only');
-    const res = await client.syncDeps(project, sha, c.deps);
+    // The repo (owner/name) lets the dashboard link to the project's open PRs; decant rejects anything else.
+    const repo = deps.env.GITHUB_REPOSITORY ?? '';
+    const res = await client.syncDeps(project, sha, c.deps, REPO_RE.test(repo) ? repo : undefined);
     if (res.status < 200 || res.status >= 300) warning(`decant did not store the dependency summary (HTTP ${res.status}): ${errorText(res.body)}`);
   } catch (e) {
     warning(`dependency summary not sent: ${e instanceof Error ? e.message : String(e)}`);

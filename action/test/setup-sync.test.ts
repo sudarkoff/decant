@@ -474,6 +474,19 @@ describe('sync sends a dependency summary on the default branch', () => {
     });
   });
 
+  it('sends the repo from GITHUB_REPOSITORY when it is owner/name; omits it otherwise', async () => {
+    const withRepo = syncDeps({ event: 'push', payload: dispatch, files, env: { ...env, GITHUB_REPOSITORY: 'acme/web-app' } });
+    cap();
+    expect(await run(withRepo.deps)).toBe(0);
+    expect(JSON.parse(withRepo.f.calls[1].body!).repo).toBe('acme/web-app');
+    for (const bad of ['', 'acme', 'acme/web app', 'a/b/c']) {
+      const s = syncDeps({ event: 'push', payload: dispatch, files, env: { ...env, GITHUB_REPOSITORY: bad } });
+      cap();
+      expect(await run(s.deps)).toBe(0);
+      expect(JSON.parse(s.f.calls[1].body!)).not.toHaveProperty('repo');
+    }
+  });
+
   it('workflow_dispatch on main also sends it', async () => {
     const { deps, f } = syncDeps({ event: 'workflow_dispatch', payload: dispatch, files, env });
     cap();
