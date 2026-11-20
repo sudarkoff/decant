@@ -1,6 +1,8 @@
 import { join } from 'node:path';
 import { parsePolicy, type Policy } from '../../../src/policy/schema';
-import { decant } from '../decant-client';
+import { decant, type DecantClient } from '../decant-client';
+import { capSummary, dependencySummary } from '../dep-summary';
+import type { ActionDeps } from '../deps';
 import { isForkPr, readPayload, type Payload } from '../event';
 import { error, mask, notice, setOutput, warning } from '../gh-io';
 import { fileAtCommit, SHA_RE } from '../git';
@@ -42,6 +44,32 @@ function parseRaw(text: string): { raw: Raw; policy: Policy } | null {
     return p.ok ? { raw: raw as Raw, policy: p.policy } : null;
   } catch {
     return null;
+  }
+}
+
+function errorText(b: unknown): string {
+  return typeof b === 'object' && b !== null && typeof (b as { error?: unknown }).error === 'string'
+    ? (b as { error: string }).error
+    : typeof b === 'string'
+      ? b
+      : JSON.stringify(b);
+}
+
+/**
+ * Default branch only: send the lockfiles' dependency summary (names, versions, direct or not, and which
+ * direct dependencies pull each one in) for the dashboard. Best effort: every failure is a warning.
+ */
+async function sendDependencySummary(deps: ActionDeps, client: DecantClient, wd: string, project: string, sha: string): Promise<void> {
+  try {
+    const s = await dependencySummary(wd, deps.fs);
+    for (const w of s.warnings) warning(`dependency summary: ${w}`);
+    const c = capSummary(sha, s.deps);
+    if (c.trimmed === 'via') warning('dependency summary is over 1 MB; sent without the held-back-by names');
+    if (c.trimmed === 'transitive') warning('dependency summary is over 1 MB; sent direct dependencies only');
+    const res = await client.syncDeps(project, sha, c.deps);
+    if (res.status < 200 || res.status >= 300) warning(`decant did not store the dependency summary (HTTP ${res.status}): ${errorText(res.body)}`);
+  } catch (e) {
+    warning(`dependency summary not sent: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -116,17 +144,10 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   }
 
   const project = inputs.project || policy.project;
-  const res = await decant(deps.fetch, inputs.decantUrl, token).syncPolicy(project, raw, env.GITHUB_SHA ?? '', ref);
-  if (res.status < 200 || res.status >= 300) {
-    const b = res.body;
-    const msg =
-      typeof b === 'object' && b !== null && typeof (b as { error?: unknown }).error === 'string'
-        ? (b as { error: string }).error
-        : typeof b === 'string'
-          ? b
-          : JSON.stringify(b);
-    return fail(`decant rejected the policy (HTTP ${res.status}): ${msg}`);
-  }
+  const client = decant(deps.fetch, inputs.decantUrl, token);
+  const res = await client.syncPolicy(project, raw, env.GITHUB_SHA ?? '', ref);
+  if (res.status < 200 || res.status >= 300) return fail(`decant rejected the policy (HTTP ${res.status}): ${errorText(res.body)}`);
+  if (event !== 'pull_request') await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? '');
   setOutput('ref', ref, env);
   return 0;
 }
