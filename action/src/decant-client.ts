@@ -117,6 +117,19 @@ export function decant(f: typeof fetch, url: string, token: string) {
       return { status: res.status, body };
     },
 
+    /** PUT the default branch's dependency summary (sync token). Never throws on an HTTP status. */
+    async syncDeps(project: string, sha: string, deps: unknown[]): Promise<{ status: number; body: unknown }> {
+      const res = await call('PUT', `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps } });
+      const text = await res.text();
+      let body: unknown = text;
+      try {
+        body = JSON.parse(text);
+      } catch {
+        // keep text
+      }
+      return { status: res.status, body };
+    },
+
     async getVerdicts(pkgId: string): Promise<Verdict[]> {
       const res = await call('GET', `/api/verdicts?package=${encodeURIComponent(pkgId)}`);
       return (await ok<{ verdicts?: Verdict[] }>(res, 'decant GET /api/verdicts')).verdicts ?? [];

@@ -1,7 +1,7 @@
 var __defProp = Object.defineProperty;
-var __export = (target, all) => {
+var __export = (target2, all) => {
   for (var name in all)
-    __defProp(target, name, { get: all[name], enumerable: true });
+    __defProp(target2, name, { get: all[name], enumerable: true });
 };
 
 // action/src/deps.ts
@@ -19,7 +19,7 @@ function scrubEnv(env) {
   }
   return out;
 }
-var defaultExec = (cmd, args, opts = {}) => new Promise((resolve3) => {
+var defaultExec = (cmd, args, opts = {}) => new Promise((resolve4) => {
   const child = spawn(cmd, args, {
     cwd: opts.cwd,
     env: { ...scrubEnv(process.env), ...opts.env },
@@ -30,8 +30,8 @@ var defaultExec = (cmd, args, opts = {}) => new Promise((resolve3) => {
   let stderr = "";
   child.stdout.setEncoding("utf8").on("data", (d) => stdout += d);
   child.stderr.setEncoding("utf8").on("data", (d) => stderr += d);
-  child.on("error", (e) => resolve3({ code: 127, stdout, stderr: stderr + String(e.message) }));
-  child.on("close", (code) => resolve3({ code: code ?? 1, stdout, stderr }));
+  child.on("error", (e) => resolve4({ code: 127, stdout, stderr: stderr + String(e.message) }));
+  child.on("close", (code) => resolve4({ code: code ?? 1, stdout, stderr }));
   child.stdin.on("error", () => {
   });
   child.stdin.end(opts.input ?? "");
@@ -1003,15 +1003,15 @@ function decant(f, url, token) {
   const secrets = [token, basic];
   const bearer = { authorization: `Bearer ${token}` };
   async function call(method, path, opts = {}) {
-    const target = path.startsWith("https://") || path.startsWith("http://") ? path : `${base}${path}`;
-    if (new URL(target).origin !== origin) throw new Error(`decant: refusing to send credentials to another host (${new URL(target).host})`);
+    const target2 = path.startsWith("https://") || path.startsWith("http://") ? path : `${base}${path}`;
+    if (new URL(target2).origin !== origin) throw new Error(`decant: refusing to send credentials to another host (${new URL(target2).host})`);
     const headers = { ...bearer, ...opts.headers };
     let body;
     if (opts.body !== void 0) {
       headers["content-type"] = "application/json";
       body = JSON.stringify(opts.body);
     }
-    return request(f, target, { method, headers, body }, { label: `decant ${method} ${new URL(target).pathname}`, timeoutMs: TIMEOUT_MS, secrets });
+    return request(f, target2, { method, headers, body }, { label: `decant ${method} ${new URL(target2).pathname}`, timeoutMs: TIMEOUT_MS, secrets });
   }
   async function ok(res, label) {
     if (!res.ok) throw await httpError(res, { label, secrets });
@@ -1048,6 +1048,17 @@ function decant(f, url, token) {
     async syncPolicy(project, policy, sha, ref) {
       const parsed = typeof policy === "string" ? JSON.parse(policy) : policy;
       const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/policy`, { body: { policy: parsed, sha, ref } });
+      const text = await res.text();
+      let body = text;
+      try {
+        body = JSON.parse(text);
+      } catch {
+      }
+      return { status: res.status, body };
+    },
+    /** PUT the default branch's dependency summary (sync token). Never throws on an HTTP status. */
+    async syncDeps(project, sha, deps) {
+      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps } });
       const text = await res.text();
       let body = text;
       try {
@@ -1883,8 +1894,8 @@ async function stale(ctx, abs, p) {
   const out = [];
   for (const d of deps) {
     if (d.name !== p.name) continue;
-    const target = targetFor(p.vulns, "npm", d.name, d.version);
-    if (target !== null) out.push({ dep: d, target, vulns: [] });
+    const target2 = targetFor(p.vulns, "npm", d.name, d.version);
+    if (target2 !== null) out.push({ dep: d, target: target2, vulns: [] });
   }
   return out;
 }
@@ -1947,7 +1958,7 @@ async function fixGo(ctx, p, dir, track) {
   await track(`${dir}/go.mod`);
   await track(`${dir}/go.sum`);
   const here = p.copies.filter((c) => dirname(join2(ctx.wd, c.dep.file)) === dir).map((c) => c.target);
-  const target = uniqSorted(here.length ? here : targetsOf(p), "go").at(-1);
+  const target2 = uniqSorted(here.length ? here : targetsOf(p), "go").at(-1);
   const base = inputs.decantUrl.replace(/\/+$/, "");
   const netrc = await ctx.tmpFile("netrc");
   const env = {
@@ -1960,7 +1971,7 @@ async function fixGo(ctx, p, dir, track) {
 `, 384);
   try {
     await deps.fs.chmod(netrc, 384);
-    await run1(deps, "go", ["get", "--", `${p.name}@${target}`], dir, env, [inputs.token]);
+    await run1(deps, "go", ["get", "--", `${p.name}@${target2}`], dir, env, [inputs.token]);
     await run1(deps, "go", ["mod", "tidy"], dir, env, [inputs.token]);
   } finally {
     await deps.fs.rm(netrc);
@@ -2201,19 +2212,19 @@ function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
     "|---|---|---|---|---|---|"
   ].join("\n");
   const lines = [];
-  let size = head.length;
+  let size2 = head.length;
   for (const [i, r] of rows.entries()) {
     const vulns = r.vulns.length ? r.vulns.map((v) => `${safe3(v.id)} (${v.malicious ? "malicious" : v.severity})`).join(", ") : "\u2014";
     const status = r.problems.length ? `\u274C ${r.problems.join("; ")}` : r.warn ? `\u26A0\uFE0F ${r.notes.join("; ")}` : `\u2705 ${r.notes.length ? r.notes.join("; ") : "ok"}`;
     const source = r.dep.source === "registry" ? r.dep.eco : "other";
     const line2 = `| \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` | ${source} | ${r.osv} | ${r.guarddog} | ${vulns} | ${status} |`;
-    if (size + line2.length + 1 > limit) {
+    if (size2 + line2.length + 1 > limit) {
       lines.push(`
 \u2026 and ${rows.length - i} more (see the job summary).`);
       break;
     }
     lines.push(line2);
-    size += line2.length + 1;
+    size2 += line2.length + 1;
   }
   return `${head}
 ${lines.join("\n")}
@@ -2534,6 +2545,159 @@ __export(sync_exports, {
   run: () => run5
 });
 import { join as join4 } from "node:path";
+
+// action/src/dep-summary.ts
+var MAX_VIA = 5;
+var MAX_SUMMARY_BYTES = 1024 * 1024;
+var DEP_FIELDS = ["dependencies", "optionalDependencies", "peerDependencies"];
+var ROOT_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
+var NM = "node_modules/";
+function nameOf(key2, e) {
+  return e.name ?? key2.slice(key2.lastIndexOf(NM) + NM.length);
+}
+function resolve3(packages, from, dep) {
+  let dir = from;
+  for (; ; ) {
+    const candidate = dir === "" ? `${NM}${dep}` : `${dir}/${NM}${dep}`;
+    if (packages[candidate]) return candidate;
+    if (dir === "") return null;
+    const i = dir.lastIndexOf("/");
+    dir = i < 0 ? "" : dir.slice(0, i);
+  }
+}
+function target(packages, key2) {
+  const e = packages[key2];
+  if (!e) return null;
+  if (e.link) return e.resolved !== void 0 && packages[e.resolved] ? e.resolved : null;
+  return key2;
+}
+var byName = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+function summarizePackageLock(text) {
+  const lock = JSON.parse(text);
+  if (!lock.packages || (lock.lockfileVersion ?? 1) < 2) throw new Error("regenerate package-lock.json with npm 7 or newer");
+  const packages = lock.packages;
+  const root = packages[""] ?? {};
+  const rootDeps = /* @__PURE__ */ new Set();
+  for (const f of ROOT_FIELDS) for (const d of Object.keys(root[f] ?? {})) rootDeps.add(d);
+  function declared(from, names, into) {
+    for (const d of names) {
+      const k = resolve3(packages, from, d);
+      const t = k === null ? null : target(packages, k);
+      if (k !== null && t !== null && !into.has(t)) into.set(t, packages[k].link ? nameOf(k, packages[k]) : nameOf(t, packages[t]));
+    }
+  }
+  const directKeys = /* @__PURE__ */ new Map();
+  declared("", rootDeps, directKeys);
+  const roots = new Map(directKeys);
+  for (const e of Object.values(packages)) {
+    if (!e.link || e.resolved === void 0) continue;
+    const ws = packages[e.resolved];
+    if (!ws) continue;
+    const names = /* @__PURE__ */ new Set();
+    for (const f of ROOT_FIELDS) for (const d of Object.keys(ws[f] ?? {})) names.add(d);
+    declared(e.resolved, names, roots);
+  }
+  const via = /* @__PURE__ */ new Map();
+  for (const [start, directName] of roots) {
+    const seen = /* @__PURE__ */ new Set([start]);
+    const queue = [start];
+    for (let qi = 0; qi < queue.length; qi++) {
+      const at = queue[qi];
+      const e = packages[at];
+      for (const f of DEP_FIELDS) {
+        for (const d of Object.keys(e[f] ?? {})) {
+          const k = resolve3(packages, at, d);
+          const t = k === null ? null : target(packages, k);
+          if (t === null || seen.has(t)) continue;
+          seen.add(t);
+          queue.push(t);
+          let s = via.get(t);
+          if (!s) via.set(t, s = /* @__PURE__ */ new Set());
+          s.add(directName);
+        }
+      }
+    }
+  }
+  const out = [];
+  for (const [key2, e] of Object.entries(packages)) {
+    if (key2 === "" || e.link || e.inBundle || !key2.includes(NM) || !e.version) continue;
+    const name = nameOf(key2, e);
+    const direct = directKeys.has(key2);
+    const parents = [...via.get(key2) ?? []].filter((n) => !(direct && n === name)).sort(byName);
+    out.push({ eco: "npm", name, version: e.version, direct, via: parents.slice(0, MAX_VIA) });
+  }
+  return out;
+}
+function goDirect(goMod) {
+  const out = /* @__PURE__ */ new Map();
+  let inBlock = false;
+  for (const raw of goMod.split(/\r?\n/)) {
+    const line2 = raw.trim();
+    let spec = null;
+    if (inBlock) {
+      if (line2.startsWith(")")) inBlock = false;
+      else spec = line2;
+    } else if (/^require\s*\($/.test(line2)) {
+      inBlock = true;
+    } else if (/^require\s+/.test(line2)) {
+      spec = line2.replace(/^require\s+/, "");
+    }
+    if (!spec || spec.startsWith("//")) continue;
+    const comment = spec.indexOf("//");
+    const indirect = comment >= 0 && /^\/\/\s*indirect\b/.test(spec.slice(comment));
+    const parts = (comment >= 0 ? spec.slice(0, comment) : spec).trim().split(/\s+/);
+    if (parts.length !== 2 || indirect) continue;
+    out.set(parts[0].replace(/^"|"$/g, ""), parts[1]);
+  }
+  return out;
+}
+function summarizeGo(goSum, goMod) {
+  const direct = goMod === null ? /* @__PURE__ */ new Map() : goDirect(goMod);
+  return parseGoSum(goSum, "go.sum").map((d) => ({ eco: "go", name: d.name, version: d.version, direct: direct.get(d.name) === d.version, via: [] }));
+}
+function merge(into, deps) {
+  for (const d of deps) {
+    const k = `${d.eco}\0${d.name}\0${d.version}`;
+    const cur = into.get(k);
+    if (!cur) {
+      into.set(k, { ...d, via: [...d.via] });
+      continue;
+    }
+    cur.direct ||= d.direct;
+    cur.via = [.../* @__PURE__ */ new Set([...cur.via, ...d.via])].sort(byName).slice(0, MAX_VIA);
+  }
+}
+async function dependencySummary(root, fs) {
+  const base = root.replace(/\/+$/, "");
+  const tree = await findLockfileTree(base, fs);
+  const all = /* @__PURE__ */ new Map();
+  const warnings = [];
+  for (const rel of tree.files) {
+    const abs = `${base}/${rel}`;
+    try {
+      if (rel.endsWith("go.sum")) {
+        const modPath = `${abs.slice(0, -"go.sum".length)}go.mod`;
+        const goMod = await fs.exists(modPath) ? await fs.readFile(modPath) : null;
+        merge(all, summarizeGo(await fs.readFile(abs), goMod));
+      } else {
+        merge(all, summarizePackageLock(await fs.readFile(abs)));
+      }
+    } catch (e) {
+      warnings.push(`${rel}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  const deps = [...all.values()].sort((a, b) => byName(a.eco, b.eco) || byName(a.name, b.name) || byName(a.version, b.version));
+  return { deps, warnings };
+}
+var size = (sha, deps) => Buffer.byteLength(JSON.stringify({ sha, deps }));
+function capSummary(sha, deps) {
+  if (size(sha, deps) <= MAX_SUMMARY_BYTES) return { deps, trimmed: null };
+  const noVia = deps.map((d) => ({ ...d, via: [] }));
+  if (size(sha, noVia) <= MAX_SUMMARY_BYTES) return { deps: noVia, trimmed: "via" };
+  return { deps: noVia.filter((d) => d.direct), trimmed: "transitive" };
+}
+
+// action/src/modes/sync.ts
 function fail3(msg) {
   error(msg);
   process.stderr.write(`${msg}
@@ -2558,6 +2722,22 @@ function parseRaw(text) {
     return p.ok ? { raw, policy: p.policy } : null;
   } catch {
     return null;
+  }
+}
+function errorText2(b) {
+  return typeof b === "object" && b !== null && typeof b.error === "string" ? b.error : typeof b === "string" ? b : JSON.stringify(b);
+}
+async function sendDependencySummary(deps, client, wd, project, sha) {
+  try {
+    const s = await dependencySummary(wd, deps.fs);
+    for (const w of s.warnings) warning(`dependency summary: ${w}`);
+    const c = capSummary(sha, s.deps);
+    if (c.trimmed === "via") warning("dependency summary is over 1 MB; sent without the held-back-by names");
+    if (c.trimmed === "transitive") warning("dependency summary is over 1 MB; sent direct dependencies only");
+    const res = await client.syncDeps(project, sha, c.deps);
+    if (res.status < 200 || res.status >= 300) warning(`decant did not store the dependency summary (HTTP ${res.status}): ${errorText2(res.body)}`);
+  } catch (e) {
+    warning(`dependency summary not sent: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 async function run5({ deps, inputs }) {
@@ -2613,7 +2793,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       policy = base.policy;
       if (o.changed) notice("policy changes in decant.json take effect after merge");
     }
-  } else if (event === "push" || event === "workflow_dispatch") {
+  } else if (event === "push" || event === "workflow_dispatch" || event === "schedule") {
     const branch = payload.repository?.default_branch ?? "";
     if (!branch || env.GITHUB_REF !== `refs/heads/${branch}`) {
       if (event === "workflow_dispatch") return fail3("sync must run on the default branch");
@@ -2627,12 +2807,10 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     return fail3(`unsupported event ${event}`);
   }
   const project = inputs.project || policy.project;
-  const res = await decant(deps.fetch, inputs.decantUrl, token).syncPolicy(project, raw, env.GITHUB_SHA ?? "", ref);
-  if (res.status < 200 || res.status >= 300) {
-    const b = res.body;
-    const msg = typeof b === "object" && b !== null && typeof b.error === "string" ? b.error : typeof b === "string" ? b : JSON.stringify(b);
-    return fail3(`decant rejected the policy (HTTP ${res.status}): ${msg}`);
-  }
+  const client = decant(deps.fetch, inputs.decantUrl, token);
+  const res = await client.syncPolicy(project, raw, env.GITHUB_SHA ?? "", ref);
+  if (res.status < 200 || res.status >= 300) return fail3(`decant rejected the policy (HTTP ${res.status}): ${errorText2(res.body)}`);
+  if (event !== "pull_request") await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? "");
   setOutput("ref", ref, env);
   return 0;
 }

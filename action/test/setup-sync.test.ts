@@ -190,10 +190,10 @@ describe('sync', () => {
     expect(f.calls).toHaveLength(0);
   });
   it('unsupported event exits 1', async () => {
-    const { deps } = syncDeps({ event: 'schedule' });
+    const { deps } = syncDeps({ event: 'release' });
     const { err } = cap();
     expect(await run(deps)).toBe(1);
-    expect(err.join('')).toContain('unsupported event schedule');
+    expect(err.join('')).toContain('unsupported event release');
   });
   it('missing policy file exits 1', async () => {
     const { deps } = syncDeps();
@@ -440,5 +440,96 @@ describe('sync bootstrap and base-derived overlays', () => {
     const { err } = cap();
     expect(await run(deps)).toBe(1);
     expect(err.join('')).toContain('no valid pull_request.base.sha');
+  });
+});
+
+describe('sync sends a dependency summary on the default branch', () => {
+  const LOCK = JSON.stringify({
+    lockfileVersion: 3,
+    packages: {
+      '': { dependencies: { a: '^1' } },
+      'node_modules/a': { version: '1.0.0', dependencies: { b: '^1' } },
+      'node_modules/b': { version: '1.0.0' },
+    },
+  });
+  const files = { '/w/decant.json': POLICY, '/w/package-lock.json': LOCK };
+  const env = { INPUT_WORKING_DIRECTORY: '/w' };
+  const dispatch = { repository: { default_branch: 'main' } };
+
+  it('push to main: PUTs /deps with the sync token after the policy', async () => {
+    const { deps, f } = syncDeps({ event: 'push', payload: dispatch, files, env });
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(f.calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+      'PUT https://decant.example/api/projects/proj/policy',
+      'PUT https://decant.example/api/projects/proj/deps',
+    ]);
+    expect(f.calls[1].headers.get('authorization')).toBe('Bearer sync-tok');
+    expect(JSON.parse(f.calls[1].body!)).toEqual({
+      sha: 'abc123',
+      deps: [
+        { eco: 'npm', name: 'a', version: '1.0.0', direct: true, via: [] },
+        { eco: 'npm', name: 'b', version: '1.0.0', direct: false, via: ['a'] },
+      ],
+    });
+  });
+
+  it('workflow_dispatch on main also sends it', async () => {
+    const { deps, f } = syncDeps({ event: 'workflow_dispatch', payload: dispatch, files, env });
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(f.calls.map((c) => c.url)).toContain('https://decant.example/api/projects/proj/deps');
+  });
+
+  it('weekly schedule on main syncs main and sends it', async () => {
+    const { deps, f } = syncDeps({ event: 'schedule', payload: dispatch, files, env });
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(f.calls[0].headers.get('authorization')).toBe('Bearer sync-tok');
+    expect(JSON.parse(f.calls[0].body!).ref).toBe('main');
+    expect(f.calls.map((c) => c.url)).toContain('https://decant.example/api/projects/proj/deps');
+  });
+
+  it('schedule off the default branch does nothing', async () => {
+    const { deps, f } = syncDeps({ event: 'schedule', payload: dispatch, files, env: { ...env, GITHUB_REF: 'refs/heads/feat' } });
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it('pull_request overlays never send it', async () => {
+    const { deps, f } = syncDeps({ files, env });
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0].url).toContain('/policy');
+  });
+
+  it('not sent when the policy sync fails', async () => {
+    const { deps, f } = syncDeps({ event: 'push', payload: dispatch, files, env, fetch: fakeFetch(() => jsonRes({ error: 'no' }, 422)) });
+    cap();
+    expect(await run(deps)).toBe(1);
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it('a rejected summary is a warning; the sync still passes', async () => {
+    const { deps } = syncDeps({
+      event: 'push',
+      payload: dispatch,
+      files,
+      env,
+      fetch: fakeFetch((c) => (c.url.endsWith('/deps') ? jsonRes({ error: 'not found' }, 404) : jsonRes({ ok: true }))),
+    });
+    const { out } = cap();
+    expect(await run(deps)).toBe(0);
+    expect(out.join('')).toContain('::warning::decant did not store the dependency summary (HTTP 404): not found');
+  });
+
+  it('an unreadable lockfile is a warning; the rest is still sent', async () => {
+    const { deps, f } = syncDeps({ event: 'push', payload: dispatch, files: { ...files, '/w/sub/package-lock.json': 'nope' }, env });
+    const { out } = cap();
+    expect(await run(deps)).toBe(0);
+    expect(out.join('')).toContain('::warning::dependency summary: sub/package-lock.json');
+    expect(JSON.parse(f.calls[1].body!).deps).toHaveLength(2);
   });
 });

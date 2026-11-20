@@ -25,6 +25,10 @@ jobs:
   decant:
     # Pull requests only: the default branch is synced by decant-main.yml with the sync token.
     if: github.event_name == 'pull_request'
+    # A newer push to the PR supersedes this sync (its own group: decant-pr.yml uses decant-pr-<n>).
+    concurrency:
+      group: decant-build-sync-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

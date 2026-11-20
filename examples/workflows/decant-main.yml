@@ -8,6 +8,9 @@ on:
     branches: [main]
     paths:
       - decant.json
+  # Weekly: refreshes the dependency summary the dashboard uses (direct vs transitive).
+  schedule:
+    - cron: '41 6 * * 1'
   workflow_dispatch:
 permissions:
   contents: read
