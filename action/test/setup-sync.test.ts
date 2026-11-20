@@ -479,7 +479,7 @@ describe('sync sends a dependency summary on the default branch', () => {
     cap();
     expect(await run(withRepo.deps)).toBe(0);
     expect(JSON.parse(withRepo.f.calls[1].body!).repo).toBe('acme/web-app');
-    for (const bad of ['', 'acme', 'acme/web app', 'a/b/c']) {
+    for (const bad of ['', 'acme', 'acme/web app', 'a/b/c', 'acme/.', 'acme/..']) {
       const s = syncDeps({ event: 'push', payload: dispatch, files, env: { ...env, GITHUB_REPOSITORY: bad } });
       cap();
       expect(await run(s.deps)).toBe(0);

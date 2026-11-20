@@ -243,6 +243,48 @@ describe('fixed versions', () => {
     expect(await fixedOf('golang.org/x/net', 'v0.58.0', 'GO-1')).toBe('["v0.59.0"]');
   });
 
+  it('re-fetches an advisory with no fix after 20 h, so a fix that ships reaches the row', async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    await e.DB.prepare('DELETE FROM vulns').run();
+    await addVersion('v-later', '1.0.0');
+    const before = { 'GHSA-l': { id: 'GHSA-l', affected: [{ package: { ecosystem: 'npm', name: 'v-later' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }] }] }] } };
+    const after = { 'GHSA-l': { id: 'GHSA-l', affected: [{ package: { ecosystem: 'npm', name: 'v-later' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }, { fixed: '1.0.1' }] }] }] } };
+    await runScheduled(e, { fetch: vulnFetch({ 'v-later': ['GHSA-l'] }, before), now: () => NOW });
+    expect(await fixedOf('v-later', '1.0.0', 'GHSA-l')).toBe('[]');
+
+    const soon: string[] = [];
+    await runScheduled(e, { fetch: vulnFetch({ 'v-later': ['GHSA-l'] }, after, soon), now: () => new Date(NOW.getTime() + 3600_000) });
+    expect(soon).toEqual([]);
+    expect(await fixedOf('v-later', '1.0.0', 'GHSA-l')).toBe('[]');
+
+    const nextDay = new Date(NOW.getTime() + 86400_000);
+    const later: string[] = [];
+    await runScheduled(e, { fetch: vulnFetch({ 'v-later': ['GHSA-l'] }, after, later), now: () => nextDay });
+    expect(later).toHaveLength(1);
+    expect(await fixedOf('v-later', '1.0.0', 'GHSA-l')).toBe('["1.0.1"]');
+    const at = await e.DB.prepare("SELECT details_fetched_at AS t FROM vulns WHERE id = 'GHSA-l'").first<{ t: string }>();
+    expect(at!.t).toBe(nextDay.toISOString());
+  });
+
+  it('re-fetches at most 20 no-fix advisories per run, oldest fetch first, never MAL', async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    await e.DB.prepare('DELETE FROM vulns').run();
+    await addVersion('v-many', '1.0.0');
+    const ids = Array.from({ length: 22 }, (_, i) => `GHSA-m${String(i).padStart(2, '0')}`);
+    const ins = e.DB.prepare(
+      "INSERT INTO vulns (eco, name, version, id, severity, summary, checked_at, fixed_versions, details_fetched_at) VALUES ('npm', 'v-many', '1.0.0', ?, 'high', 's', ?, '[]', ?)",
+    );
+    // m00 fetched most recently, m21 longest ago; MAL-x oldest of all.
+    await e.DB.batch([
+      ...ids.map((id, i) => ins.bind(id, day(3), day(2 + i))),
+      ins.bind('MAL-x', day(3), day(100)),
+    ]);
+    const recs = Object.fromEntries([...ids, 'MAL-x'].map((id) => [id, { id }]));
+    const calls: string[] = [];
+    await runScheduled(e, { fetch: vulnFetch({ 'v-many': [...ids, 'MAL-x'] }, recs, calls), now: () => NOW });
+    expect(calls.map((u) => u.split('/').pop()).sort()).toEqual(ids.slice(2).sort());
+  });
+
   it('back-fills rows written before fixed versions were stored, within the fetch budget', async () => {
     await e.DB.prepare('DELETE FROM versions').run();
     await e.DB.prepare('DELETE FROM vulns').run();

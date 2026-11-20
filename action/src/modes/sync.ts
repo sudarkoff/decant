@@ -55,7 +55,7 @@ function errorText(b: unknown): string {
       : JSON.stringify(b);
 }
 
-const REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+const REPO_RE = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9._-]+$/; // owner/name; name is never . or ..
 
 /**
  * Default branch only: send the lockfiles' dependency summary (names, versions, direct or not, and which

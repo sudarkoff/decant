@@ -2903,7 +2903,7 @@ function parseRaw(text) {
 function errorText2(b) {
   return typeof b === "object" && b !== null && typeof b.error === "string" ? b.error : typeof b === "string" ? b : JSON.stringify(b);
 }
-var REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+var REPO_RE = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9._-]+$/;
 async function sendDependencySummary(deps, client, wd, project, sha) {
   try {
     const s = await dependencySummary(wd, deps.fs);

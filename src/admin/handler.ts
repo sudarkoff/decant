@@ -267,7 +267,7 @@ const MAX_DEP_NAME = 214;
 const MAX_DEP_VERSION = 128;
 const MAX_VIA = 5;
 /** GitHub owner/name (owner: letters, digits, '-'; repo: also '.' and '_'). */
-const REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+const REPO_RE = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9._-]+$/; // owner/name; name is never . or ..
 const MAX_REPO = 140;
 
 type DepRow = { eco: string; name: string; version: string; direct: boolean; via: string[] };

@@ -25,7 +25,7 @@ export interface Item {
 
 // ---- To-dos and links (pure) ----
 
-const REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+const REPO_RE = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9._-]+$/; // owner/name; name is never . or ..
 const ARCHIVE_ANOMALY = 'archive-anomaly';
 const MAX_FINDINGS = 6;
 const FINDING_MAX = 200;
@@ -102,7 +102,8 @@ type Pkg = { eco: Ecosystem; name: string; version: string };
 export type TodoInput =
   /** fixedKnown false: the advisory's fixed versions were not looked up yet (rows stored before 0007). */
   | ({ kind: 'vuln'; advisory: string; fixed: string | null; fixedKnown?: boolean; repo: string | null } & Pkg)
-  | ({ kind: 'flagged'; notScanned: boolean; repo: string | null } & Pkg)
+  /** noFindings: the verdict recorded no rule details (older action, or another writer). */
+  | ({ kind: 'flagged'; notScanned: boolean; noFindings?: boolean; repo: string | null } & Pkg)
   | ({ kind: 'malicious'; advisories: string[] } & Pkg)
   | ({ kind: 'blocked' } & Pkg)
   | ({ kind: 'conflict' } & Pkg)
@@ -135,6 +136,12 @@ export function todoFor(i: TodoInput): { todo: string; links: Link[] } {
         const what = i.eco === 'go' ? 'module zip' : 'tarball';
         return {
           todo: `Nothing inside was scanned. Download the ${what} and check what makes it unusual (often zip test fixtures). Add \`decant:reviewed\` only once you have.`,
+          links,
+        };
+      }
+      if (i.noFindings) {
+        return {
+          todo: "decant didn't record which checks fired. Re-run the decant check on the PR to see them, then add the `decant:reviewed` label if they are expected; if not, block the version in `decant.json`.",
           links,
         };
       }
@@ -324,7 +331,7 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
           add({ key: `vuln:${vid}:${id}:${p}`, project: p, kind: 'vuln', detail: clip(summary ? `${s}: ${summary}` : s), rank: RANK[s], ...todo });
         }
         if (flaggedBy.length) {
-          const todo = todoFor({ kind: 'flagged', ...pkg, notScanned, repo });
+          const todo = todoFor({ kind: 'flagged', ...pkg, notScanned, noFindings: findings.length === 0, repo });
           add({ key: `flagged:${id}:${p}`, project: p, kind: 'flagged', detail: clip(`flagged by ${flaggedBy.join(', ')}`), rank: RANK.flagged, ...todo, findings });
         }
       }

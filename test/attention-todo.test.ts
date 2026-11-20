@@ -103,6 +103,14 @@ describe('todoFor', () => {
     ]);
   });
 
+  it('flagged with no recorded findings: re-run the check to see them', () => {
+    const r = todoFor({ kind: 'flagged', ...pkg, notScanned: false, noFindings: true, repo: 'acme/web-app' });
+    expect(r.todo).toBe(
+      "decant didn't record which checks fired. Re-run the decant check on the PR to see them, then add the `decant:reviewed` label if they are expected; if not, block the version in `decant.json`.",
+    );
+    expect(r.links.map((l) => l.label)).toEqual(['PRs failing checks', 'View on npm']);
+  });
+
   it('flagged archive anomaly: nothing was scanned; same links; go package page', () => {
     const r = todoFor({ kind: 'flagged', eco: 'go', name: 'github.com/klauspost/compress', version: 'v1.20.2', notScanned: true, repo: null });
     expect(r.todo).toBe(
@@ -142,7 +150,7 @@ describe('todoFor', () => {
   });
 
   it('a repo that is not owner/name never becomes a link', () => {
-    for (const repo of ['acme', 'acme/web app', '../x/y', 'acme/web-app/extra', 'a@b/c']) {
+    for (const repo of ['acme/.', 'acme/..', 'acme', 'acme/web app', '../x/y', 'acme/web-app/extra', 'a@b/c']) {
       expect(todoFor({ kind: 'vuln', ...pkg, advisory: 'GHSA-x', fixed: '7.29.1', repo }).links.map((l) => l.label)).toEqual(['Advisory']);
     }
   });

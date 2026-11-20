@@ -102,6 +102,7 @@ describe('attention items', () => {
     // no repo synced: no PR links
     expect(byKey['vuln:GHSA-aaaa-aaaa-aaaa:npm:v@1.0.0:twocal']!.links.map((l) => l.label)).toEqual(['Advisory']);
     expect(byKey['flagged:npm:f@1.0.0:twocal']!.findings).toEqual([]);
+    expect(byKey['flagged:npm:f@1.0.0:twocal']!.todo).toMatch(/^decant didn't record which checks fired/);
 
     // conflicts are listed under "all" only
     expect(keys((await attention(e, 'twocal', 30, NOW)).open)).not.toContain('conflict:npm:c@1.0.0');
