@@ -67,20 +67,35 @@ export function summarizePackageLock(text: string): SummaryDep[] {
   const rootDeps = new Set<string>();
   for (const f of ROOT_FIELDS) for (const d of Object.keys(root[f] ?? {})) rootDeps.add(d);
 
-  // key of each direct dependency's entry (after links) → its real name
+  /** key of each dependency `from` lists (after links) → its real name */
+  function declared(from: string, names: Iterable<string>, into: Map<string, string>): void {
+    for (const d of names) {
+      const k = resolve(packages, from, d);
+      const t = k === null ? null : target(packages, k);
+      if (k !== null && t !== null && !into.has(t)) into.set(t, packages[k]!.link ? nameOf(k, packages[k]!) : nameOf(t, packages[t]!));
+    }
+  }
+
   const directKeys = new Map<string, string>();
-  for (const d of rootDeps) {
-    const k = resolve(packages, '', d);
-    const t = k === null ? null : target(packages, k);
-    if (k !== null && t !== null) directKeys.set(t, packages[k]!.link ? nameOf(k, packages[k]!) : nameOf(t, packages[t]!));
+  declared('', rootDeps, directKeys);
+
+  // `via` roots: the root's direct dependencies, plus each workspace's own (monorepos), which stay non-direct.
+  const roots = new Map(directKeys);
+  for (const e of Object.values(packages)) {
+    if (!e.link || e.resolved === undefined) continue;
+    const ws = packages[e.resolved];
+    if (!ws) continue;
+    const names = new Set<string>();
+    for (const f of ROOT_FIELDS) for (const d of Object.keys(ws[f] ?? {})) names.add(d);
+    declared(e.resolved, names, roots);
   }
 
   const via = new Map<string, Set<string>>();
-  for (const [start, directName] of directKeys) {
+  for (const [start, directName] of roots) {
     const seen = new Set<string>([start]);
     const queue = [start];
-    while (queue.length > 0) {
-      const at = queue.shift()!;
+    for (let qi = 0; qi < queue.length; qi++) {
+      const at = queue[qi]!;
       const e = packages[at]!;
       for (const f of DEP_FIELDS) {
         for (const d of Object.keys(e[f] ?? {})) {

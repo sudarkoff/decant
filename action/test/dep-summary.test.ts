@@ -88,6 +88,23 @@ describe('summarizePackageLock', () => {
     expect(byKey(summarizePackageLock(JSON.stringify(lock))).get('x@1.0.0')?.via).toEqual(['ws']);
   });
 
+  it("monorepo: each workspace's own dependencies are via roots (not direct)", () => {
+    const lock = {
+      lockfileVersion: 3,
+      packages: {
+        '': { name: 'mono', workspaces: ['packages/*'] },
+        'packages/web': { name: 'web', version: '0.0.1', dependencies: { y: '^1' }, devDependencies: { v: '^1' } },
+        'node_modules/web': { resolved: 'packages/web', link: true },
+        'packages/web/node_modules/y': reg('y', '1.0.0', { dependencies: { z: '^1' } }),
+        'node_modules/z': reg('z', '1.0.0'),
+        'node_modules/v': reg('v', '1.0.0', { dependencies: { z: '^1' } }),
+      },
+    };
+    const m = byKey(summarizePackageLock(JSON.stringify(lock)));
+    expect(m.get('z@1.0.0')).toEqual({ eco: 'npm', name: 'z', version: '1.0.0', direct: false, via: ['v', 'y'] });
+    expect(m.get('y@1.0.0')).toMatchObject({ direct: false, via: [] });
+  });
+
   it('rejects v1 lockfiles', () => {
     expect(() => summarizePackageLock(JSON.stringify({ lockfileVersion: 1, dependencies: {} }))).toThrow('npm 7');
   });
