@@ -2251,13 +2251,36 @@ function parseGuardDogJson(stdout) {
   }
   return { result: details.length > 0 ? "flagged" : "clean", details };
 }
-var ANOMALY_RE = /Error occurred while scanning target [^\n]*?: '(archive parser anomaly: [^'\n]*)'/;
 var ARCHIVE_ANOMALY = "archive-anomaly";
+var ANOMALY_REASONS = [
+  {
+    re: /^multiple End-Of-Central-Directory records \(possible scan evasion via duplicate EOCD\)$/,
+    text: () => "multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)"
+  },
+  {
+    re: /^(\d{1,9}) ZIP local file headers but zipfile enumerates (\d{1,9}) members from the central directory \(possible scan evasion via EOCD size\/offset differential\)$/,
+    text: (m) => `${Number(m[1])} ZIP local file headers but zipfile enumerates ${Number(m[2])} members from the central directory (possible scan evasion via EOCD size/offset differential)`
+  }
+];
+function archiveAnomaly(r, path) {
+  if (r.code !== 1 || r.stdout.trim() !== "") return null;
+  const lines = r.stderr.split("\n").filter((l) => l.trim() !== "");
+  if (lines.length !== 1) return null;
+  const prefix = `ERROR: Error occurred while scanning target ${path}: 'archive parser anomaly: `;
+  const line2 = lines[0].replace(/\r$/, "");
+  if (!line2.startsWith(prefix) || !line2.endsWith("'")) return null;
+  const reason = line2.slice(prefix.length, -1);
+  for (const { re, text } of ANOMALY_REASONS) {
+    const m = re.exec(reason);
+    if (m) return `archive parser anomaly: ${text(m)}`;
+  }
+  return null;
+}
 async function scan(exec, bin, eco, path) {
   const r = await exec(bin, [eco, "scan", path, "--output-format", "json", "--sandbox"]);
   if (r.code !== 0) {
-    const anomaly = ANOMALY_RE.exec(r.stderr) ?? ANOMALY_RE.exec(r.stdout);
-    if (anomaly) return { result: "flagged", details: [finding(ARCHIVE_ANOMALY, void 0, anomaly[1], [])] };
+    const anomaly = archiveAnomaly(r, path);
+    if (anomaly) return { result: "flagged", details: [{ rule: ARCHIVE_ANOMALY, message: anomaly }] };
     throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
   }
   return parseGuardDogJson(r.stdout);

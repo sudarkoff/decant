@@ -148,27 +148,58 @@ describe('scanNpm / scanGo', () => {
 });
 
 describe('archive parser anomaly', () => {
-  // guarddog 3.2.0 cli.py logs this and exits 1 when utils/archives.py refuses a zip.
-  const anomaly =
-    "ERROR: Error occurred while scanning target /rt/decant-scan/2.zip: 'archive parser anomaly: multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)'\n";
+  // guarddog 3.2.0: utils/archives.py raises ValueError('archive parser anomaly: ...'); cli.py logs
+  // "ERROR: Error occurred while scanning target <path>: '<e>'\n" (format "%(levelname)s: %(message)s") and exits 1.
+  const P = '/rt/decant-scan/2.zip';
+  const EOCD = 'multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)';
+  const line = (path: string, reason: string) => `ERROR: Error occurred while scanning target ${path}: 'archive parser anomaly: ${reason}'\n\n`;
+  const run = (r: { code?: number; stdout?: string; stderr?: string }, path = P) => scanGo(fakeExec(() => r), 'g', path);
 
-  it('is a flag (rule archive-anomaly) with GuardDog\'s message, not a scan error', async () => {
-    const r = await scanGo(fakeExec(() => ({ code: 1, stderr: anomaly })), 'g', '/rt/decant-scan/2.zip');
-    expect(r).toEqual({
+  it('is a flag (rule archive-anomaly) with the canonical message, not a scan error', async () => {
+    expect(await run({ code: 1, stderr: line(P, EOCD) })).toEqual({
       result: 'flagged',
-      details: [{ rule: 'archive-anomaly', message: 'archive parser anomaly: multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)' }],
+      details: [{ rule: 'archive-anomaly', message: `archive parser anomaly: ${EOCD}` }],
     });
   });
 
-  it('the local-header variant is a flag too', async () => {
-    const msg = 'archive parser anomaly: 9 ZIP local file headers but zipfile enumerates 3 members from the central directory (possible scan evasion via EOCD size/offset differential)';
-    const r = await scanNpm(fakeExec(() => ({ code: 1, stderr: `Error occurred while scanning target /t/0.tgz: '${msg}'` })), 'g', '/t/0.tgz');
-    expect(r.details).toEqual([{ rule: 'archive-anomaly', message: msg }]);
+  it('the local-header variant is a flag too, rebuilt from its numbers', async () => {
+    const reason = '9 ZIP local file headers but zipfile enumerates 3 members from the central directory (possible scan evasion via EOCD size/offset differential)';
+    const r = await scanNpm(fakeExec(() => ({ code: 1, stderr: line('/t/0.tgz', reason) })), 'g', '/t/0.tgz');
+    expect(r.details).toEqual([{ rule: 'archive-anomaly', message: `archive parser anomaly: ${reason}` }]);
   });
 
-  it('any other non-zero exit stays a scan error, even if the text appears elsewhere', async () => {
-    await expect(scanGo(fakeExec(() => ({ code: 1, stderr: 'Error occurred while scanning target x: \'boom\'' })), 'g', '/z.zip')).rejects.toThrow(/exited 1/);
-    await expect(scanGo(fakeExec(() => ({ code: 1, stderr: 'unrelated: archive parser anomaly: in a file name' })), 'g', '/z.zip')).rejects.toThrow(/exited 1/);
+  it('any other failure stays a scan error', async () => {
+    await expect(run({ code: 1, stderr: "ERROR: Error occurred while scanning target /z.zip: 'boom'" })).rejects.toThrow(/exited 1/);
+  });
+
+  it('package-controlled text containing the anomaly inside another error stays a scan error', async () => {
+    // e.g. a file name echoed in some other exception's message
+    const inner = `ERROR: Error occurred while scanning target ${P}: 'cannot read x/archive parser anomaly: ${EOCD}'`;
+    await expect(run({ code: 1, stderr: inner })).rejects.toThrow(/exited 1/);
+    const nested = `ERROR: Error occurred while scanning target ${P}: 'bad name 'archive parser anomaly: ${EOCD}''`;
+    await expect(run({ code: 1, stderr: nested })).rejects.toThrow(/exited 1/);
+    await expect(run({ code: 1, stderr: line(P, `${EOCD} and more`) })).rejects.toThrow(/exited 1/);
+    await expect(run({ code: 1, stderr: line(P, 'something new (possible scan evasion)') })).rejects.toThrow(/exited 1/);
+  });
+
+  it('an anomaly line plus any other stderr line stays a scan error', async () => {
+    await expect(run({ code: 1, stderr: `ERROR: sandbox failed\n${line(P, EOCD)}` })).rejects.toThrow(/exited 1/);
+    await expect(run({ code: 1, stderr: `${line(P, EOCD)}Traceback (most recent call last):\n` })).rejects.toThrow(/exited 1/);
+  });
+
+  it('a different target path stays a scan error', async () => {
+    await expect(run({ code: 1, stderr: line('/rt/decant-scan/3.zip', EOCD) })).rejects.toThrow(/exited 1/);
+    await expect(run({ code: 1, stderr: line(`${P}x`, EOCD) })).rejects.toThrow(/exited 1/);
+  });
+
+  it('the anomaly on stdout only, or with anything on stdout, stays a scan error', async () => {
+    await expect(run({ code: 1, stdout: line(P, EOCD), stderr: '' })).rejects.toThrow(/exited 1/);
+    await expect(run({ code: 1, stdout: '{}', stderr: line(P, EOCD) })).rejects.toThrow(/exited 1/);
+  });
+
+  it('an exit code other than 1 stays a scan error', async () => {
+    await expect(run({ code: 2, stderr: line(P, EOCD) })).rejects.toThrow(/exited 2/);
+    await expect(run({ code: 137, stderr: line(P, EOCD) })).rejects.toThrow(/exited 137/);
   });
 });
 

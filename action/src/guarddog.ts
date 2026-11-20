@@ -167,21 +167,55 @@ export function parseGuardDogJson(stdout: string): GuardDogResult {
   return { result: details.length > 0 ? 'flagged' : 'clean', details };
 }
 
-/**
- * GuardDog (utils/archives.py) refuses a zip it cannot enumerate unambiguously, e.g. one with two
- * End-Of-Central-Directory records, and cli.py logs `Error occurred while scanning target <path>:
- * '<message>'` and exits 1. Archives that contain zip test fixtures (Go modules like klauspost/compress)
- * trip it. That is a reason for a human to look, not an unscannable package: it becomes a flag.
- */
-const ANOMALY_RE = /Error occurred while scanning target [^\n]*?: '(archive parser anomaly: [^'\n]*)'/;
 export const ARCHIVE_ANOMALY = 'archive-anomaly';
+
+/**
+ * The reasons guarddog 3.2.0's utils/archives.py gives for refusing a zip it cannot enumerate
+ * unambiguously (the only two `archive parser anomaly` raises in that version). Each maps a match to
+ * the canonical text recorded in the finding: only integers are taken from GuardDog's output.
+ */
+const ANOMALY_REASONS: { re: RegExp; text: (m: RegExpExecArray) => string }[] = [
+  {
+    re: /^multiple End-Of-Central-Directory records \(possible scan evasion via duplicate EOCD\)$/,
+    text: () => 'multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)',
+  },
+  {
+    re: /^(\d{1,9}) ZIP local file headers but zipfile enumerates (\d{1,9}) members from the central directory \(possible scan evasion via EOCD size\/offset differential\)$/,
+    text: (m) =>
+      `${Number(m[1])} ZIP local file headers but zipfile enumerates ${Number(m[2])} members from the central directory (possible scan evasion via EOCD size/offset differential)`,
+  },
+];
+
+/**
+ * GuardDog refuses an archive it cannot enumerate unambiguously (e.g. two End-Of-Central-Directory
+ * records): cli.py logs `ERROR: Error occurred while scanning target <path>: '<reason>'` and exits 1.
+ * Archives that contain zip test fixtures (Go modules like klauspost/compress) trip it. That is a reason
+ * for a human to look, not an unscannable package, so it becomes a flag. GuardDog's output can carry
+ * package-controlled text (file names in other errors), so the match is exact: exit 1, nothing on
+ * stdout, stderr is that one line and nothing else, the target is the path decant passed, and the
+ * reason is one of ANOMALY_REASONS. Anything else is a scan error.
+ */
+export function archiveAnomaly(r: { code: number; stdout: string; stderr: string }, path: string): string | null {
+  if (r.code !== 1 || r.stdout.trim() !== '') return null;
+  const lines = r.stderr.split('\n').filter((l) => l.trim() !== '');
+  if (lines.length !== 1) return null;
+  const prefix = `ERROR: Error occurred while scanning target ${path}: 'archive parser anomaly: `;
+  const line = lines[0]!.replace(/\r$/, '');
+  if (!line.startsWith(prefix) || !line.endsWith("'")) return null;
+  const reason = line.slice(prefix.length, -1);
+  for (const { re, text } of ANOMALY_REASONS) {
+    const m = re.exec(reason);
+    if (m) return `archive parser anomaly: ${text(m)}`;
+  }
+  return null;
+}
 
 async function scan(exec: Exec, bin: string, eco: 'npm' | 'go', path: string): Promise<GuardDogResult> {
   // `path` must be an existing absolute file: guarddog treats anything else as a remote name and downloads it.
   const r = await exec(bin, [eco, 'scan', path, '--output-format', 'json', '--sandbox']);
   if (r.code !== 0) {
-    const anomaly = ANOMALY_RE.exec(r.stderr) ?? ANOMALY_RE.exec(r.stdout);
-    if (anomaly) return { result: 'flagged', details: [finding(ARCHIVE_ANOMALY, undefined, anomaly[1], [])] };
+    const anomaly = archiveAnomaly(r, path);
+    if (anomaly) return { result: 'flagged', details: [{ rule: ARCHIVE_ANOMALY, message: anomaly }] };
     throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
   }
   return parseGuardDogJson(r.stdout);
