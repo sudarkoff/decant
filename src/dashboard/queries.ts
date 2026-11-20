@@ -7,7 +7,7 @@ import { compareVersions, parseVersion } from '../semver';
  * and lets SQLite drive serve_log / request_counts by their (project_id, day) prefix per project.
  * Window queries bind ?2 to the first day (inclusive) of the range.
  */
-const SCOPE = "project_id IN (SELECT id FROM projects WHERE ?1 = 'all' OR id = ?1)";
+export const SCOPE = "project_id IN (SELECT id FROM projects WHERE ?1 = 'all' OR id = ?1)";
 
 const OUTCOMES = ['served', 'cooldown', 'blocked', 'stale', 'failed'] as const;
 type Outcome = (typeof OUTCOMES)[number];
@@ -78,7 +78,7 @@ export async function uptime(db: D1Database, project: string, days: string[]) {
 }
 
 /** Installed versions are passed to the per-version lookups as JSON, at most this many per statement. */
-const INSTALLED_CHUNK = 500;
+export const INSTALLED_CHUNK = 500;
 
 type SecRow = { eco: string; name: string; version: string; blocked: number; malicious: number; flagged: string; sevs: string };
 

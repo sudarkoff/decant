@@ -1,5 +1,6 @@
 import { json } from '../http';
 import type { Deps, Env } from '../types';
+import { attention } from './attention';
 import { activity, freshness, listProjects, packageList, policies, security, uptime, windowDays } from './queries';
 
 const NO_STORE = { 'cache-control': 'no-store' };
@@ -51,6 +52,11 @@ export async function handleDashboardApi(req: Request, env: Env, deps: Deps, pat
       case 'freshness': {
         const days = range();
         return ok(await freshness(db, await project(), days[0]!, deps.now()));
+      }
+      case 'attention': {
+        range();
+        const r = Number(qs.get('range') ?? '30') as 7 | 30 | 90;
+        return ok(await attention(env, await project(), r, deps.now()));
       }
       case 'policy':
         return ok(await policies(db, await project()));
