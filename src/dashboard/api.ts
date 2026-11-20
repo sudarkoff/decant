@@ -55,11 +55,12 @@ export async function handleDashboardApi(req: Request, env: Env, deps: Deps, pat
       case 'policy':
         return ok(await policies(db, await project()));
       case 'packages': {
+        const days = range();
         const raw = qs.get('page') ?? '1';
         if (!/^[1-9]\d{0,4}$/.test(raw) || Number(raw) > MAX_PAGE) throw new BadRequest('page must be a positive integer');
         const q = qs.get('q') ?? '';
         if (q.length > 200) throw new BadRequest('q is too long');
-        return ok(await packageList(db, await project(), q, Number(raw)));
+        return ok(await packageList(db, await project(), days[0]!, q, Number(raw)));
       }
       default:
         return err(404, 'not found');

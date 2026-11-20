@@ -8,8 +8,6 @@ import { compareVersions, parseVersion } from '../semver';
  * Window queries bind ?2 to the first day (inclusive) of the range.
  */
 const SCOPE = "project_id IN (SELECT id FROM projects WHERE ?1 = 'all' OR id = ?1)";
-/** Distinct (eco, name, version) installed (download served) in the window. */
-const INSTALLED = `inst AS (SELECT DISTINCT eco, name, version FROM serve_log WHERE ${SCOPE} AND day >= ?2)`;
 
 const OUTCOMES = ['served', 'cooldown', 'blocked', 'stale', 'failed'] as const;
 type Outcome = (typeof OUTCOMES)[number];
@@ -79,34 +77,16 @@ export async function uptime(db: D1Database, project: string, days: string[]) {
   return { outageDays, staleServed, failed };
 }
 
+/** Installed versions are passed to the per-version lookups as JSON, at most this many per statement. */
+const INSTALLED_CHUNK = 500;
+
+type SecRow = { eco: string; name: string; version: string; blocked: number; malicious: number; flagged: string; sevs: string };
+
 export async function security(db: D1Database, project: string, from: string) {
-  const onInst = 'x.eco = i.eco AND x.name = i.name AND x.version = i.version';
-  const [hits, flagged, sev, fast] = await db.batch([
-    db
-      .prepare(
-        `WITH ${INSTALLED}
-         SELECT
-           (SELECT COUNT(*) FROM inst i WHERE EXISTS (SELECT 1 FROM global_blocks x WHERE ${onInst})) AS blocks,
-           (SELECT COUNT(*) FROM inst i WHERE
-              EXISTS (SELECT 1 FROM vulns x WHERE ${onInst} AND x.id LIKE 'MAL-%')
-              OR EXISTS (SELECT 1 FROM global_blocks x WHERE ${onInst} AND x.source = 'osv')
-              OR EXISTS (SELECT 1 FROM verdicts x WHERE ${onInst} AND x.result = 'malicious')) AS malicious`,
-      )
-      .bind(project, from),
-    db
-      .prepare(
-        `WITH ${INSTALLED}
-         SELECT i.eco, i.name, i.version, x.scanner FROM inst i JOIN verdicts x ON ${onInst}
-         WHERE x.result = 'flagged' ORDER BY i.eco, i.name, i.version, x.scanner`,
-      )
-      .bind(project, from),
-    db
-      .prepare(
-        `WITH ${INSTALLED}
-         SELECT x.severity, COUNT(*) AS n FROM inst i JOIN vulns x ON ${onInst}
-         WHERE x.id NOT LIKE 'MAL-%' GROUP BY x.severity`,
-      )
-      .bind(project, from),
+  // One pass over the serve_log window for the installed set; the global-fact tables are then probed
+  // by primary key for each installed version (json_each), never scanned.
+  const [installed, fast] = await db.batch([
+    db.prepare(`SELECT DISTINCT eco, name, version FROM serve_log WHERE ${SCOPE} AND day >= ?2`).bind(project, from),
     db
       .prepare(
         `SELECT a.project_id, a.eco, a.name, a.version, a.advisory, a.advisory_published, a.first_synced_at
@@ -117,12 +97,46 @@ export async function security(db: D1Database, project: string, from: string) {
       )
       .bind(project),
   ]);
-  const h = (hits!.results[0] ?? {}) as { blocks?: number; malicious?: number };
+  const inst = (installed!.results as { eco: string; name: string; version: string }[]).map((r) => [r.eco, r.name, r.version]);
+  const onInst = 'x.eco = i.eco AND x.name = i.name AND x.version = i.version';
+  const lookup = db.prepare(
+    `WITH i AS (SELECT json_extract(value, '$[0]') AS eco, json_extract(value, '$[1]') AS name, json_extract(value, '$[2]') AS version
+                FROM json_each(?1))
+     SELECT i.eco, i.name, i.version,
+       EXISTS (SELECT 1 FROM global_blocks x WHERE ${onInst}) AS blocked,
+       (EXISTS (SELECT 1 FROM vulns x WHERE ${onInst} AND x.id LIKE 'MAL-%')
+        OR EXISTS (SELECT 1 FROM global_blocks x WHERE ${onInst} AND x.source = 'osv')
+        OR EXISTS (SELECT 1 FROM verdicts x WHERE ${onInst} AND x.result = 'malicious')) AS malicious,
+       (SELECT json_group_array(x.scanner) FROM verdicts x WHERE ${onInst} AND x.result = 'flagged') AS flagged,
+       (SELECT json_group_array(x.severity) FROM vulns x WHERE ${onInst} AND x.id NOT LIKE 'MAL-%') AS sevs
+     FROM i`,
+  );
+  const chunks: string[] = [];
+  for (let k = 0; k < inst.length; k += INSTALLED_CHUNK) chunks.push(JSON.stringify(inst.slice(k, k + INSTALLED_CHUNK)));
+  const results = chunks.length ? await db.batch(chunks.map((c) => lookup.bind(c))) : [];
+
+  let blocksHit = 0;
+  let maliciousHits = 0;
+  const flagged: { key: string[]; package: string; scanner: string }[] = [];
   const vulnsBySeverity = { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 };
-  for (const r of sev!.results as { severity: string; n: number }[]) {
-    const k = (r.severity in vulnsBySeverity ? r.severity : 'unknown') as keyof typeof vulnsBySeverity;
-    vulnsBySeverity[k] += r.n;
+  for (const res of results) {
+    for (const r of res.results as SecRow[]) {
+      if (r.blocked) blocksHit++;
+      if (r.malicious) maliciousHits++;
+      for (const scanner of JSON.parse(r.flagged) as string[]) {
+        flagged.push({ key: [r.eco, r.name, r.version, scanner], package: pkg(r.eco, r.name, r.version), scanner });
+      }
+      for (const sv of JSON.parse(r.sevs) as string[]) {
+        const k = (sv in vulnsBySeverity ? sv : 'unknown') as keyof typeof vulnsBySeverity;
+        vulnsBySeverity[k]++;
+      }
+    }
   }
+  flagged.sort((a, b) => {
+    for (let k = 0; k < 4; k++) if (a.key[k] !== b.key[k]) return a.key[k]! < b.key[k]! ? -1 : 1;
+    return 0;
+  });
+
   type FastRow = { project_id: string; eco: string; name: string; version: string; advisory: string; advisory_published: string; first_synced_at: string };
   const fastLane = [];
   for (const r of fast!.results as FastRow[]) {
@@ -131,12 +145,9 @@ export async function security(db: D1Database, project: string, from: string) {
     fastLane.push({ project: r.project_id, package: pkg(r.eco, r.name, r.version), advisory: r.advisory, hoursToFix: Math.round(ms / 360_000) / 10 });
   }
   return {
-    blocksHit: h.blocks ?? 0,
-    maliciousHits: h.malicious ?? 0,
-    flagged: (flagged!.results as { eco: string; name: string; version: string; scanner: string }[]).map((r) => ({
-      package: pkg(r.eco, r.name, r.version),
-      scanner: r.scanner,
-    })),
+    blocksHit,
+    maliciousHits,
+    flagged: flagged.map(({ package: p, scanner }) => ({ package: p, scanner })),
     vulnsBySeverity,
     fastLane,
   };
@@ -185,23 +196,28 @@ export async function freshness(db: D1Database, project: string, from: string, n
       chosen.set(key, row);
     }
   }
+  // Packages with no `packages` row (latest never fetched) are skipped entirely, including from the median.
+  // Go majors come from the version and a `/vN` path suffix only; gopkg.in-style `.vN` paths are not handled.
   const rows = [...chosen.values()].filter((x) => x.latest !== null);
 
-  // Go: a newer major lives at a different module path (<base>/vN). Look up the known siblings.
+  // Go: a newer major lives at a different module path (<base>/vN). Look up the known siblings in one
+  // query: a primary-key range scan of packages per base, driven by json_each.
   const goBases = [...new Set(rows.filter((x) => x.eco === 'go').map((x) => x.name.replace(GO_MAJOR_SUFFIX, '')))];
   const siblings = new Map<string, { name: string; latest: string }[]>();
   if (goBases.length > 0) {
-    const res = await db.batch(
-      goBases.map((b) =>
-        db.prepare("SELECT name, latest FROM packages WHERE eco = 'go' AND name >= ?1 AND name < ?2").bind(`${b}/v`, `${b}/w`),
-      ),
-    );
-    goBases.forEach((b, i) => {
-      siblings.set(
-        b,
-        (res[i]!.results as { name: string; latest: string }[]).filter((x) => GO_MAJOR_SUFFIX.test(x.name) && x.name.replace(GO_MAJOR_SUFFIX, '') === b),
-      );
-    });
+    const res = await db
+      .prepare(
+        `SELECT j.value AS base, p.name, p.latest FROM json_each(?1) j
+         JOIN packages p ON p.eco = 'go' AND p.name >= j.value || '/v' AND p.name < j.value || '/w'`,
+      )
+      .bind(JSON.stringify(goBases))
+      .all<{ base: string; name: string; latest: string }>();
+    for (const r of res.results) {
+      if (!GO_MAJOR_SUFFIX.test(r.name) || r.name.replace(GO_MAJOR_SUFFIX, '') !== r.base) continue;
+      const list = siblings.get(r.base) ?? [];
+      list.push({ name: r.name, latest: r.latest });
+      siblings.set(r.base, list);
+    }
   }
 
   const ages: number[] = [];
@@ -280,11 +296,11 @@ export function likeLiteral(q: string): string {
   return q.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
-export async function packageList(db: D1Database, project: string, q: string, page: number) {
+export async function packageList(db: D1Database, project: string, from: string, q: string, page: number) {
   const r = await db
     .prepare(
       `WITH s AS (SELECT project_id, eco, name, version, MAX(day) AS last FROM serve_log
-                  WHERE ${SCOPE} AND (?2 = '' OR name LIKE '%' || ?2 || '%' ESCAPE '\\')
+                  WHERE ${SCOPE} AND day >= ?5 AND (?2 = '' OR name LIKE '%' || ?2 || '%' ESCAPE '\\')
                   GROUP BY project_id, eco, name, version)
        SELECT s.project_id, s.eco, s.name, s.version, v.publish_time, p.latest, s.last
        FROM s LEFT JOIN versions v ON v.eco = s.eco AND v.name = s.name AND v.version = s.version
@@ -292,7 +308,7 @@ export async function packageList(db: D1Database, project: string, q: string, pa
        ORDER BY s.name, s.version, s.project_id, s.eco
        LIMIT ?3 OFFSET ?4`,
     )
-    .bind(project, likeLiteral(q), PAGE_SIZE + 1, (page - 1) * PAGE_SIZE)
+    .bind(project, likeLiteral(q), PAGE_SIZE + 1, (page - 1) * PAGE_SIZE, from)
     .all<{ project_id: string; eco: string; name: string; version: string; publish_time: string | null; latest: string | null; last: string }>();
   const rows = r.results;
   return {

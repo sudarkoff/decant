@@ -299,15 +299,25 @@ describe('dashboard api: seeded', () => {
     expect(body.page).toBe(1);
     expect(body.hasMore).toBe(false);
     expect(body.items.map((i: { name: string; version: string }) => `${i.name}@${i.version}`)).toEqual([
-      '100%pct@1.0.0', 'a@10.0.0', 'a@9.0.0', 'b@1.0.0', 'example.com/m@v1.2.0', 'old@1.0.0',
+      '100%pct@1.0.0', 'a@10.0.0', 'a@9.0.0', 'b@1.0.0', 'example.com/m@v1.2.0',
     ]);
     expect(body.items.every((i: { project: string }) => i.project === 'twocal')).toBe(true);
     expect(body.items.find((i: { version: string }) => i.version === '9.0.0')).toEqual({
       project: 'twocal', eco: 'npm', name: 'a', version: '9.0.0',
       published: '2026-10-20T00:00:00Z', latest: '11.0.0', lastServed: '2026-11-19',
     });
-    expect(body.items.find((i: { name: string }) => i.name === 'old')).toMatchObject({ published: null, latest: null });
+    expect(body.items.find((i: { name: string }) => i.name === 'b')).toMatchObject({ published: '2026-10-01T00:00:00Z', latest: null });
     expect((await get('packages?project=other')).body.items.map((i: { name: string }) => i.name)).toEqual(['secret']);
+  });
+
+  it('packages: bounded by range (old@1.0.0 was served only before the 30-day window)', async () => {
+    const d30 = (await get('packages?project=twocal&range=30')).body.items.map((i: { name: string }) => i.name);
+    expect(d30).not.toContain('old');
+    const d7 = (await get('packages?project=twocal&range=7')).body.items.map((i: { name: string }) => i.name);
+    expect(d7).toEqual(['100%pct', 'a', 'a', 'example.com/m']);
+    const d90 = (await get('packages?project=twocal&range=90')).body.items;
+    expect(d90.find((i: { name: string }) => i.name === 'old')).toMatchObject({ published: null, latest: null, lastServed: '2026-09-01' });
+    expect((await get('packages?range=8')).status).toBe(400);
   });
 
   it('packages: q is literal, so % matches only names containing %', async () => {
@@ -332,5 +342,36 @@ describe('dashboard api: seeded', () => {
     expect(p2.page).toBe(2);
     expect(p2.items.map((i: { name: string }) => i.name)).toEqual(['zz-50', 'zz-51']);
     expect(p2.hasMore).toBe(false);
+  });
+
+  it('security: installed sets over one lookup chunk (500) are counted fully', async () => {
+    await exec('INSERT INTO projects (id, created_at) VALUES (?, ?)', ['bulk', '2026-01-01T00:00:00Z']);
+    const rows: unknown[][] = [];
+    for (let i = 0; i < 1203; i++) rows.push(['bulk', 'npm', `bulk-${String(i).padStart(4, '0')}`, '1.0.0', '2026-11-19']);
+    await exec('INSERT INTO serve_log (project_id, eco, name, version, day) VALUES (?, ?, ?, ?, ?)', ...rows);
+    await exec(
+      'INSERT INTO global_blocks (eco, name, version, source, reason, at) VALUES (?, ?, ?, ?, ?, ?)',
+      ['npm', 'bulk-0003', '1.0.0', 'operator', 'r', 'x'],
+      ['npm', 'bulk-0700', '1.0.0', 'osv', 'r', 'x'],
+      ['npm', 'bulk-1202', '1.0.0', 'operator', 'r', 'x'],
+    );
+    await exec(
+      'INSERT INTO vulns (eco, name, version, id, severity, checked_at) VALUES (?, ?, ?, ?, ?, ?)',
+      ['npm', 'bulk-0001', '1.0.0', 'GHSA-b1', 'low', 'x'],
+      ['npm', 'bulk-1100', '1.0.0', 'GHSA-b2', 'low', 'x'],
+    );
+    await exec(
+      'INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, scanned_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      ['npm', 'bulk-1201', '1.0.0', 'z', '1', 'flagged', 'x'],
+      ['npm', 'bulk-0002', '1.0.0', 'z', '1', 'flagged', 'x'],
+    );
+    const { body } = await get('security?project=bulk&range=7');
+    expect(body.blocksHit).toBe(3);
+    expect(body.maliciousHits).toBe(1);
+    expect(body.vulnsBySeverity.low).toBe(2);
+    expect(body.flagged).toEqual([
+      { package: 'npm:bulk-0002@1.0.0', scanner: 'z' },
+      { package: 'npm:bulk-1201@1.0.0', scanner: 'z' },
+    ]);
   });
 });
