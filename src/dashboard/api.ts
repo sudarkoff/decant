@@ -76,6 +76,7 @@ export async function handleDashboardApi(req: Request, env: Env, deps: Deps, pat
     }
   } catch (e) {
     if (e instanceof BadRequest) return err(400, e.message);
-    throw e;
+    console.error('dashboard api failed', e instanceof Error ? e.name : 'error');
+    return err(500, 'internal');
   }
 }

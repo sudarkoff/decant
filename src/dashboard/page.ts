@@ -75,8 +75,9 @@ ul.plain { list-style: none; margin: 0; padding: 0; display: flex; flex-directio
 .legend { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 14px; }
 .legend li { display: inline-flex; align-items: center; gap: 6px; }
 .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
-.table-wrap { overflow-x: auto; }
-table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 14px; }
+.table-wrap { overflow-x: auto; max-width: 100%; }
+.card, .body { min-width: 0; }
+table { border-collapse: collapse; width: 100%; min-width: 560px; font-size: 14px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--muted); font-weight: 600; }
 td.name { white-space: normal; overflow-wrap: anywhere; }
@@ -84,6 +85,10 @@ td.name { white-space: normal; overflow-wrap: anywhere; }
 @media (max-width: 719px) {
   .wrap { padding: 20px 16px; gap: 20px; }
   .grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 479px) {
+  .col-project, .col-published { display: none; }
+  table { min-width: 0; }
 }
 `;
 
@@ -392,8 +397,8 @@ const SCRIPT = String.raw`
   function renderUptime(u) {
     var box = $('uptime');
     var n = u.outageDays.length;
-    line(box, n === 0 ? 'No days with upstream trouble' : plural(n, 'day', 'days') + ' upstream was slow or down: ' + u.outageDays.map(shortDate).join(', '), n ? 'warn' : null);
-    line(box, plural(u.staleServed, 'request', 'requests') + ' served from cache while upstream was unavailable');
+    line(box, n === 0 ? 'No days with stale serves or failures' : plural(n, 'day', 'days') + ' with stale serves or failures: ' + u.outageDays.map(shortDate).join(', '), n ? 'warn' : null);
+    line(box, plural(u.staleServed, 'request', 'requests') + ' served from cache after an upstream error');
     line(box, plural(u.failed, 'failed install', 'failed installs'), u.failed ? 'danger' : null);
   }
   function renderPolicy(p) {
@@ -425,17 +430,17 @@ const SCRIPT = String.raw`
     wrap.setAttribute('aria-label', 'Packages table');
     var table = el('table');
     var head = el('tr');
-    ['Package', 'Project', 'Version', 'Published', 'Latest', 'Last served'].forEach(function (h) {
-      var th = el('th', null, h); th.scope = 'col'; head.appendChild(th);
+    [['Package', ''], ['Project', 'col-project'], ['Version', ''], ['Published', 'col-published'], ['Latest', ''], ['Last served', '']].forEach(function (h) {
+      var th = el('th', h[1] || null, h[0]); th.scope = 'col'; head.appendChild(th);
     });
     var thead = el('thead'); thead.appendChild(head); table.appendChild(thead);
     var tb = el('tbody');
     data.items.forEach(function (x) {
       var tr = el('tr');
       tr.appendChild(el('td', 'name', x.eco + ':' + x.name));
-      tr.appendChild(el('td', null, x.project));
+      tr.appendChild(el('td', 'col-project', x.project));
       tr.appendChild(el('td', null, x.version));
-      tr.appendChild(el('td', null, daysAgo(x.published)));
+      tr.appendChild(el('td', 'col-published', daysAgo(x.published)));
       tr.appendChild(el('td', null, x.latest === null ? '-' : x.latest));
       tr.appendChild(el('td', null, shortDate(x.lastServed)));
       tb.appendChild(tr);

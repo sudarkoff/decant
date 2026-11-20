@@ -28,6 +28,12 @@ describe('dashboard page', () => {
     expect(DASHBOARD_HTML).toMatch(/<h1[^>]*>decant<\/h1>/);
   });
 
+  it('words uptime as stale serves or failures and hides wide columns on phones', () => {
+    expect(DASHBOARD_HTML).toContain('days with stale serves or failures');
+    expect(DASHBOARD_HTML).not.toContain('upstream was slow or down');
+    expect(DASHBOARD_HTML).toMatch(/max-width: 479px[^}]*\.col-project, \.col-published \{ display: none/);
+  });
+
   it('never parses data as HTML', () => {
     expect(DASHBOARD_HTML).not.toContain('innerHTML');
     expect(DASHBOARD_HTML).not.toContain('outerHTML');

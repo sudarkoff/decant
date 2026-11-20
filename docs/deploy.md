@@ -81,6 +81,15 @@ curl https://<your-domain>/healthz
 
 The health check should answer `ok`. The Worker's cron runs daily at 04:17 UTC: it re-checks stored versions against OSV for malicious-package advisories and expires PR overlays 14 days after their last sync.
 
+### Upgrading an existing deployment
+
+Migrations 0004 and 0005 are required for every deploy of this version: policy sync writes the new `allows` columns. Run them BEFORE `npx wrangler deploy` (add `-c <config>` if you use a local config):
+
+```sh
+npx wrangler d1 migrations apply decant --remote
+npx wrangler deploy
+```
+
 ## 6. Create a project and tokens
 
 Point the CLI at your deployment:
@@ -139,10 +148,10 @@ A version younger than the cooldown (7 days by default) is hidden until it ages 
 
 A private page at `https://<your-domain>/dashboard`: needs-attention items, request activity, vulnerabilities in cached versions, package freshness, uptime, policy and recently resolved items. It is protected by Cloudflare Access. Request counts start at deploy (no backfill).
 
-1. In Cloudflare Zero Trust, go to Access > Applications > Add an application > Self-hosted.
+1. In Cloudflare, go to Zero Trust → Access → Applications (newer dashboards: Access controls → Applications) and add a Self-hosted application.
 2. Add two paths on your hostname: `/dashboard` and `/dashboard/*`. Never protect the bare host: that would put Access in front of installs and break them.
 3. Add a policy with action Allow and your email as the include rule.
-4. Copy the Application Audience (AUD) tag from the application's overview. The team domain is `<team>.cloudflareaccess.com` (Zero Trust > Settings > Custom Pages).
+4. Copy the Application Audience (AUD) tag from the application's overview. The team domain is under Zero Trust → Settings (your team domain, `<team>.cloudflareaccess.com`).
 5. Add both to `wrangler.jsonc`:
 
 ```jsonc

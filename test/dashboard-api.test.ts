@@ -31,6 +31,16 @@ const twocalPolicy = {
 };
 const otherPolicy = { project: 'other' };
 
+describe('dashboard api: handler errors', () => {
+  it('returns JSON 500 with no-store when a query throws', async () => {
+    const broken = { DB: { prepare: () => { throw new Error('secret detail'); }, batch: () => { throw new Error('secret detail'); } } } as unknown as Env;
+    const res = await handleDashboardApi(new Request('https://h/dashboard/api/projects'), broken, deps, 'projects');
+    expect(res.status).toBe(500);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(await res.json()).toEqual({ error: 'internal' });
+  });
+});
+
 describe('dashboard api: fresh database', () => {
   beforeAll(() => {
     e = env as unknown as Env;

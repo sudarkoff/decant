@@ -98,6 +98,7 @@ async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; bloc
   let blocked = 0;
   const cache = new Map<string, VulnDetails>(); // per run, never across requests
   const budget = { left: MAX_DETAIL_FETCHES };
+  const done: { batch: PackageRef[]; hits: Map<string, string[]> }[] = [];
   for (let i = 0; i < refs.length; i += BATCH) {
     const batch = refs.slice(i, i + BATCH);
     const hits = await vulnIds(deps, batch);
@@ -112,14 +113,18 @@ async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; bloc
       if (!existing) blocked++;
     }
     await markOsvChecked(env, batch, now);
-    // Best effort and after the security path: a failure here must not skip MAL blocking.
-    try {
+    done.push({ batch, hits });
+    checked += batch.length;
+  }
+  // Best effort, and only after MAL blocking over ALL batches: detail fetches must never use up
+  // subrequests that a later batch's OSV query needs.
+  try {
+    for (const { batch, hits } of done) {
       const details = await detailsFor(env, deps, [...new Set([...hits.values()].flat())], cache, budget);
       await recordVulns(env, batch, hits, details, now);
-    } catch (err) {
-      console.error('cron: recording vulns failed', err instanceof Error ? err.name : 'error');
     }
-    checked += batch.length;
+  } catch (err) {
+    console.error('cron: recording vulns failed', err instanceof Error ? err.name : 'error');
   }
   return { checked, blocked };
 }

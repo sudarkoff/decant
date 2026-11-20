@@ -146,6 +146,24 @@ describe('vulnerability recording', () => {
     expect(await checkedAt('v-fail')).toBe(NOW.toISOString());
   });
 
+  it('blocks MAL in every batch before any detail fetch, even when detail fetching fails', async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    for (let i = 0; i < 1001; i++) await addVersion(`mb-${String(i).padStart(4, '0')}`, '1.0.0', i === 1000 ? null : day(1));
+    const order: string[] = [];
+    const f = (async (u: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'GET') { order.push('GET'); throw new Error('detail down'); }
+      order.push('POST');
+      const body = JSON.parse(String(init!.body)) as { queries: { package: { name: string } }[] };
+      return Response.json({ results: body.queries.map((q) => (q.package.name === 'mb-0000' || q.package.name === 'mb-1000' ? { vulns: [{ id: 'MAL-1' }] } : {})) });
+    }) as typeof fetch;
+    await runScheduled(e, { fetch: f, now: () => NOW });
+    expect([...(await blockedVersions(e, 'npm', 'mb-0000'))]).toEqual(['1.0.0']);
+    expect([...(await blockedVersions(e, 'npm', 'mb-1000'))]).toEqual(['1.0.0']);
+    expect(order.filter((x) => x === 'POST')).toHaveLength(2);
+    expect(order.indexOf('GET')).toBeGreaterThan(order.lastIndexOf('POST'));
+    await e.DB.prepare('DELETE FROM versions').run();
+  });
+
   it('caps detail fetches at 200 per run, stores placeholders, and fills them later', async () => {
     await e.DB.prepare('DELETE FROM versions').run();
     await e.DB.prepare('DELETE FROM vulns').run();
