@@ -66,28 +66,37 @@ function failure(e, timeoutMs) {
   return why && !msg.includes(why) ? `${msg} (${why})` : msg;
 }
 var RETRY_DELAYS_MS = [500, 1e3, 2e3];
+var RETRY_DEADLINE_MS = 6e4;
 var RETRY_STATUSES = /* @__PURE__ */ new Set([502, 503, 504]);
 var realSleep = (ms) => new Promise((resolve4) => setTimeout(resolve4, ms));
 async function requestWithRetry(f, url, init, o) {
   const attempts = RETRY_DELAYS_MS.length + 1;
   const random = o.random ?? Math.random;
+  const now = o.now ?? Date.now;
+  const deadlineMs = o.deadlineMs ?? RETRY_DEADLINE_MS;
+  const end = now() + deadlineMs;
+  const retryStatuses = o.retryStatuses ?? true;
   for (let i = 0; ; i++) {
+    const delay = i < RETRY_DELAYS_MS.length ? Math.round(RETRY_DELAYS_MS[i] * (0.75 + 0.5 * random())) : 0;
     const last = i === attempts - 1;
+    const timeoutMs = Math.max(1, Math.min(o.timeoutMs, end - now()));
     let res;
     try {
-      res = await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
+      res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
-      if (last) {
-        const why = isTimeout(e) ? `timed out (${o.timeoutMs / 1e3}s)` : failure(e, o.timeoutMs);
-        throw new Error(redact(`${o.label}: ${why} after ${attempts} attempts`, o.secrets ?? []));
+      if (last || now() + delay >= end) {
+        const why = isTimeout(e) ? `timed out (${Math.round(timeoutMs / 1e3)}s)` : failure(e, timeoutMs);
+        const n = `${i + 1} attempt${i === 0 ? "" : "s"}`;
+        const cut = i < attempts - 1 ? ` (${deadlineMs / 1e3}s deadline)` : "";
+        throw new Error(redact(`${o.label}: ${why} after ${n}${cut}`, o.secrets ?? []));
       }
-      await o.sleep(Math.round(RETRY_DELAYS_MS[i] * (0.75 + 0.5 * random())));
+      await o.sleep(delay);
       continue;
     }
-    if (last || !RETRY_STATUSES.has(res.status)) return res;
+    if (last || !retryStatuses || !RETRY_STATUSES.has(res.status) || now() + delay >= end) return res;
     await res.body?.cancel().catch(() => {
     });
-    await o.sleep(Math.round(RETRY_DELAYS_MS[i] * (0.75 + 0.5 * random())));
+    await o.sleep(delay);
   }
 }
 async function httpError(res, o) {
@@ -1050,7 +1059,9 @@ function decant(f, url, token, retry = {}) {
       timeoutMs: TIMEOUT_MS,
       secrets,
       sleep: retry.sleep ?? realSleep,
-      random: retry.random
+      random: retry.random,
+      now: retry.now,
+      retryStatuses: opts.retryStatuses
     });
   }
   async function ok(res, label) {
@@ -1087,7 +1098,7 @@ function decant(f, url, token, retry = {}) {
     /** PUT the policy for `ref`. Never throws on an HTTP status: the caller reports {status, body}. */
     async syncPolicy(project, policy, sha, ref) {
       const parsed = typeof policy === "string" ? JSON.parse(policy) : policy;
-      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/policy`, { body: { policy: parsed, sha, ref } });
+      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/policy`, { body: { policy: parsed, sha, ref }, retryStatuses: false });
       const text = await res.text();
       let body = text;
       try {
@@ -1098,7 +1109,7 @@ function decant(f, url, token, retry = {}) {
     },
     /** PUT the default branch's dependency summary (sync token). Never throws on an HTTP status. */
     async syncDeps(project, sha, deps) {
-      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps } });
+      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps }, retryStatuses: false });
       const text = await res.text();
       let body = text;
       try {
@@ -2307,15 +2318,17 @@ function fail(msg) {
 var safe3 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
 var safeText = (s) => s.replace(/\s+/g, " ").replace(/[^A-Za-z0-9._~/+:,;=!?#%&*()'"{}$^ -]/g, "?");
 var count = (f) => f.count !== void 0 ? ` (${f.count})` : "";
+var NOT_SCANNED = "contents NOT scanned by GuardDog (archive anomaly; can be deliberate scan evasion). Inspect the archive manually before adding decant:reviewed";
+var notScanned = (f) => f.rule === ARCHIVE_ANOMALY;
 function findingText(f) {
   const msg = f.message ? `: ${safeText(f.message)}` : "";
   const at = f.locations?.length ? ` at ${f.locations.map(safeText).join(", ")}` : "";
-  return `${safe3(f.rule)}${count(f)}${msg}${at}`;
+  return `${safe3(f.rule)}${count(f)}${msg}${at}${notScanned(f) ? ` - ${NOT_SCANNED}` : ""}`;
 }
 function findingLine(r, f) {
   const msg = f.message ? `: \`${safeText(f.message)}\`` : "";
   const at = f.locations?.length ? ` at ${f.locations.map((l) => `\`${safeText(l)}\``).join(", ")}` : "";
-  return `- \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` \`${safe3(f.rule)}\`${count(f)}${msg}${at}`;
+  return `- \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` \`${safe3(f.rule)}\`${count(f)}${msg}${at}${notScanned(f) ? ` \u26A0\uFE0F **${NOT_SCANNED}**` : ""}`;
 }
 var isPackageLock2 = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
 var shellQuote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
