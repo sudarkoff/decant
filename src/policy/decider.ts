@@ -1,63 +1,45 @@
 import type { RequestCtx } from '../auth';
-import { TtlCache } from '../cache';
 import type { Deps, Ecosystem, Env } from '../types';
+import {
+  allows,
+  cachedPins,
+  cooldowns,
+  denied,
+  facts,
+  FACTS_TTL_MS,
+  pkgKey,
+  POLICY_TTL_MS,
+  rememberPins,
+  type VersionRow,
+  type VersionState,
+} from './caches';
 import { decide, type Decision } from './decide';
 import type { Policy } from './schema';
-import type { PinnedTime } from './store';
+import { selectPinnedStmt, type PinnedTime } from './store';
+
+export { clearDecisionCaches, FACTS_TTL_MS, forgetDenied, POLICY_TTL_MS, type VersionState } from './caches';
 
 /*
- * Decision inputs, read in one D1 round trip and cached per isolate.
+ * Decision inputs, read in one D1 round trip and cached per isolate (caches.ts).
  *
- * - Policy view (cooldown + the ref's allows), per project and ref: POLICY_TTL_MS.
+ * - Cooldown per project+ref, and that ref's allows for the one package: POLICY_TTL_MS.
  * - Deny set (global blocks + publish-time conflicts), per package: POLICY_TTL_MS. A new block or conflict
  *   therefore reaches every request within 30 s. A first serve (a version not yet stored, about to be
  *   fetched upstream) always reads the deny set fresh.
- * - Version facts (pinned publish time, stored_at), per version: FACTS_TTL_MS. Both are write-once.
- *   Conflict is never taken from a cached row alone: the deny set (≤ 30 s) carries it.
+ * - Version facts (pinned publish time, stored_at) and pinned rows: FACTS_TTL_MS. Publish time and
+ *   stored_at are write-once; conflict is never taken from a cached row alone: the deny set carries it.
  *
- * Nothing absent is cached as "allowed": a missing version row is re-read every time, and an unknown
- * project has no view to cache beyond the default cooldown. If the reads fail (after d1-retry's retries)
- * the error propagates and the request fails closed.
+ * Nothing absent is cached as "allowed": a missing version row is re-read every time. If the reads fail
+ * (after d1-retry's retries) the error propagates and the request fails closed.
  */
-export const POLICY_TTL_MS = 30_000;
-export const FACTS_TTL_MS = 60 * 60_000;
 const DEFAULT_COOLDOWN_DAYS = 7;
 
-interface View {
-  cooldownDays: number;
-  /** `${eco}\0${name}\0${version}` */
-  allowed: Set<string>;
-}
-
-export interface VersionState {
-  publishTime: Date;
-  conflict: boolean;
-  storedAt: string | null;
-  osvCheckedAt: string | null;
-}
-
-const views = new TtlCache<View>(1_000);
-const denied = new TtlCache<Set<string>>(10_000);
-const facts = new TtlCache<VersionState>(10_000);
-
-/** Test hook, and for writes in this isolate that must take effect at once (policy sync). */
-export function clearDecisionCaches(): void {
-  views.clear();
-  denied.clear();
-  facts.clear();
-}
-
-/** Drops a package's cached deny set, after this isolate blocked one of its versions. */
-export function forgetDenied(eco: Ecosystem, name: string): void {
-  denied.delete(`${eco}\u0000${name}`);
-}
-
-export interface Loaded<T> {
+export interface Loaded {
   decide: (version: string, pin: PinnedTime | null | undefined) => Decision;
   /** The requested version's state, or null if it has never been pinned (only with opts.version). */
   state: VersionState | null;
-  /** The result of opts.extra, read in the same round trip. */
-  extra: D1Result<T> | null;
+  /** Pinned rows among opts.pins (only with opts.pins). */
+  pinRows: VersionRow[];
 }
 
 export interface LoadOpts {
@@ -65,28 +47,30 @@ export interface LoadOpts {
   version?: string;
   /** The caller serves a stored copy when stored_at is set: a cached state without it is re-read. */
   needStored?: boolean;
-  /** One more read to run in the same batch (e.g. the package's pinned times). */
-  extra?: D1PreparedStatement;
+  /** Also load the pinned rows of these versions. */
+  pins?: string[];
 }
 
 type Row = Record<string, unknown>;
 
 /** Everything one request needs to decide on `eco`/`name`, in at most one D1 round trip. */
-export async function loadDecision<T = Row>(
+export async function loadDecision(
   env: Env,
   deps: Deps,
   rc: RequestCtx,
   eco: Ecosystem,
   name: string,
   opts: LoadOpts = {},
-): Promise<Loaded<T>> {
+): Promise<Loaded> {
   const now = deps.now();
   const t = now.getTime();
-  const pkg = `${eco}\u0000${name}`;
-  const viewKey = `${rc.projectId}\u0000${rc.ref ?? ''}`;
+  const pkg = pkgKey(eco, name);
+  const refKey = `${rc.projectId}\u0000${rc.ref ?? ''}`;
+  const allowKey = `${refKey}\u0000${pkg}`;
   const factKey = opts.version === undefined ? null : `${pkg}\u0000${opts.version}`;
 
-  let view = views.get(viewKey, t);
+  let cooldown = cooldowns.get(refKey, t);
+  let allowed = allows.get(allowKey, t);
   let state: VersionState | null | undefined;
   if (factKey) {
     const f = facts.get(factKey, t);
@@ -95,21 +79,29 @@ export async function loadDecision<T = Row>(
   // About to serve a version for the first time (or re-fetch it): no cached deny set.
   const firstServe = opts.needStored && state === undefined;
   let deny = firstServe ? undefined : denied.get(pkg, t);
+  const wanted = opts.pins ?? [];
+  let pinRows = wanted.length > 0 ? cachedPins(eco, name, wanted, t) : [];
 
   const db = env.DB;
   const stmts: D1PreparedStatement[] = [];
-  const at = { view: -1, deny: -1, state: -1, extra: -1 };
-  if (!view) {
-    at.view = stmts.length;
+  const at = { cooldown: -1, allowed: -1, deny: -1, state: -1, pins: -1 };
+  if (cooldown === undefined) {
+    at.cooldown = stmts.length;
     stmts.push(
       db.prepare(
         'SELECT p.json AS json FROM policies p JOIN projects pr ON pr.id = p.project_id AND pr.main_ref = p.ref WHERE p.project_id = ?',
       ).bind(rc.projectId),
-      // Advisory rows count only once verified.
+    );
+  }
+  if (!allowed) {
+    at.allowed = stmts.length;
+    // Main-ref allows plus the ref's, for this package only (a primary-key range). Advisory rows count once verified.
+    stmts.push(
       db.prepare(
-        `SELECT a.eco AS eco, a.name AS name, a.version AS version FROM allows a JOIN projects pr ON pr.id = a.project_id
-         WHERE a.project_id = ?1 AND a.ref IN (pr.main_ref, ?2) AND (a.advisory IS NULL OR a.verified_at IS NOT NULL)`,
-      ).bind(rc.projectId, rc.ref),
+        `SELECT a.version AS version FROM allows a JOIN projects pr ON pr.id = a.project_id
+         WHERE a.project_id = ?1 AND a.ref IN (pr.main_ref, ?2) AND a.eco = ?3 AND a.name = ?4
+           AND (a.advisory IS NULL OR a.verified_at IS NOT NULL)`,
+      ).bind(rc.projectId, rc.ref, eco, name),
     );
   }
   if (!deny) {
@@ -132,23 +124,21 @@ export async function loadDecision<T = Row>(
       ),
     );
   }
-  if (opts.extra) {
-    at.extra = stmts.length;
-    stmts.push(opts.extra);
+  if (pinRows === null) {
+    at.pins = stmts.length;
+    stmts.push(selectPinnedStmt(env, eco, name, wanted));
   }
 
-  let extra: D1Result<T> | null = null;
   if (stmts.length > 0) {
     const res = await db.batch<Row>(stmts);
-    if (at.view >= 0) {
-      const json = res[at.view]!.results[0]?.json as string | undefined;
-      const allowed = new Set(
-        (res[at.view + 1]!.results as { eco: string; name: string; version: string }[]).map(
-          (r) => `${r.eco}\u0000${r.name}\u0000${r.version}`,
-        ),
-      );
-      view = { cooldownDays: json ? (JSON.parse(json) as Policy).cooldownDays : DEFAULT_COOLDOWN_DAYS, allowed };
-      views.set(viewKey, view, t, POLICY_TTL_MS);
+    if (at.cooldown >= 0) {
+      const json = res[at.cooldown]!.results[0]?.json as string | undefined;
+      cooldown = json ? (JSON.parse(json) as Policy).cooldownDays : DEFAULT_COOLDOWN_DAYS;
+      cooldowns.set(refKey, cooldown, t, POLICY_TTL_MS);
+    }
+    if (at.allowed >= 0) {
+      allowed = new Set((res[at.allowed]!.results as { version: string }[]).map((r) => r.version));
+      allows.set(allowKey, allowed, t, POLICY_TTL_MS);
     }
     if (at.deny >= 0) {
       deny = new Set((res[at.deny]!.results as { version: string }[]).map((r) => r.version));
@@ -163,10 +153,16 @@ export async function loadDecision<T = Row>(
         : null;
       if (state) facts.set(factKey!, state, t, FACTS_TTL_MS);
     }
-    if (at.extra >= 0) extra = res[at.extra] as unknown as D1Result<T>;
+    if (at.pins >= 0) {
+      const rows = res[at.pins]!.results as VersionRow[];
+      rememberPins(eco, name, rows, t); // a long list reads the whole package: keep all of it
+      const want = new Set(wanted);
+      pinRows = rows.filter((r) => want.has(r.version));
+    }
   }
 
-  const v = view!;
+  const cd = cooldown!;
+  const a = allowed!;
   const d = deny!;
   return {
     decide: (version, pin) =>
@@ -174,12 +170,12 @@ export async function loadDecision<T = Row>(
         publishTime: pin?.publishTime ?? null,
         conflict: pin?.conflict ?? false,
         blocked: d.has(version),
-        allowed: v.allowed.has(`${pkg}\u0000${version}`),
-        cooldownDays: v.cooldownDays,
+        allowed: a.has(version),
+        cooldownDays: cd,
         now,
       }),
     state: state ?? null,
-    extra,
+    pinRows: pinRows ?? [],
   };
 }
 

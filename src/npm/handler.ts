@@ -2,7 +2,7 @@ import type { RequestCtx } from '../auth';
 import { json } from '../http';
 import { loadDecision, type VersionState } from '../policy/decider';
 import { osvMalicious, storedObject } from '../policy/first-serve';
-import { logServe, markStored, pinnedFrom, pinPublishTimes, selectPinnedStmt, type PinnedTime, type VersionRow } from '../policy/store';
+import { logServe, markStored, pinnedFrom, pinPublishTimes, type PinnedTime } from '../policy/store';
 import { notePackageLatest, outcomeOf, recordRequest, tagOutcome } from '../stats/record';
 import { pump, readUpTo } from '../streams';
 import { formatPackageId, type Deps, type Env, type PackageRef } from '../types';
@@ -112,9 +112,8 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rec: Rec, rc: 
   // The package's pinned times are read in the same round trip as the decision inputs.
   const docTimes = abbrev ? null : publishTimes(doc);
   const wanted = docTimes ? [...docTimes.keys()] : versions;
-  const extra = wanted.length > 0 ? selectPinnedStmt(env, 'npm', name, wanted) : undefined;
-  const loaded = await loadDecision<VersionRow>(env, deps, rc, 'npm', name, { extra });
-  const rows = loaded.extra?.results ?? [];
+  const loaded = await loadDecision(env, deps, rc, 'npm', name, { pins: wanted });
+  const rows = loaded.pinRows;
 
   let pinned: Map<string, PinnedTime>;
   if (docTimes) {

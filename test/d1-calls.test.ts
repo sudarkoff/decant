@@ -22,11 +22,12 @@ const now = fixedClock('2026-11-19T12:00:00Z');
 interface Count {
   trips: number;
   stmts: number;
+  rows: number; // meta.rows_read, what D1 bills
   stats: number; // request_counts statements (best-effort counters)
   sql: string[];
 }
 
-/** Counts round trips (each first/all/run/raw call, each batch) and statements. */
+/** Counts round trips (each first/all/run/raw call, each batch), statements and rows read. */
 function countingDb(db: D1Database, c: Count): D1Database {
   const real = new WeakMap<object, { s: D1PreparedStatement; sql: string }>();
   const note = (sql: string) => {
@@ -34,25 +35,42 @@ function countingDb(db: D1Database, c: Count): D1Database {
     c.sql.push(sql.replace(/\s+/g, ' ').slice(0, 60));
     if (sql.includes('request_counts')) c.stats++;
   };
+  const rows = (meta: unknown) => {
+    c.rows += (meta as { rows_read?: number } | undefined)?.rows_read ?? 0;
+  };
   const wrap = (s: D1PreparedStatement, sql: string): D1PreparedStatement => {
-    const call =
-      (m: 'first' | 'all' | 'run' | 'raw') =>
-      (...a: unknown[]) => {
-        c.trips++;
-        note(sql);
-        return (s[m] as (...x: unknown[]) => unknown)(...a);
-      };
-    const w = { bind: (...v: unknown[]) => wrap(s.bind(...v), sql), first: call('first'), all: call('all'), run: call('run'), raw: call('raw') };
+    const start = () => {
+      c.trips++;
+      note(sql);
+    };
+    const w = {
+      bind: (...v: unknown[]) => wrap(s.bind(...v), sql),
+      // first() returns no meta: run it as all().
+      first: async (col?: string) => {
+        start();
+        const r = await s.all<Record<string, unknown>>();
+        rows(r.meta);
+        const row = r.results[0];
+        return row === undefined ? null : col === undefined ? row : row[col];
+      },
+      all: async () => (start(), s.all().then((r) => (rows(r.meta), r))),
+      run: async () => (start(), s.run().then((r) => (rows(r.meta), r))),
+      raw: () => {
+        throw new Error('countingDb: raw() not supported');
+      },
+    };
     real.set(w, { s, sql });
     return w as unknown as D1PreparedStatement;
   };
   return {
     prepare: (q: string) => wrap(db.prepare(q), q),
-    batch: (stmts: D1PreparedStatement[]) => {
+    batch: async (stmts: D1PreparedStatement[]) => {
       c.trips++;
       const r = stmts.map((x) => real.get(x)!);
       for (const x of r) note(x.sql);
-      return db.batch(r.map((x) => x.s));
+      const res = await db.batch(r.map((x) => x.s));
+      for (const x of res) rows(x.meta);
+      return res;
     },
     exec: (q: string) => db.exec(q),
   } as unknown as D1Database;
@@ -92,7 +110,7 @@ async function request(path: string, c: Count, accept?: string): Promise<Respons
   return r;
 }
 
-const fresh = (): Count => ({ trips: 0, stmts: 0, stats: 0, sql: [] });
+const fresh = (): Count => ({ trips: 0, stmts: 0, rows: 0, stats: 0, sql: [] });
 
 /**
  * Round trips for one request after a warm-up request has stored and pinned everything: `cold` with this
@@ -120,21 +138,28 @@ const PATHS = {
 } as const;
 
 // Budgets: round trips on the request and its waitUntil work, request counts included (buffered: the
-// test isolate flushes every 10 s or 200 requests, as in production). Before the fix every row was
-// 5–6 round trips and 6–7 statements.
-const BUDGET: Record<keyof typeof PATHS, { cold: number; warm: number }> = {
-  'npm tarball': { cold: 3, warm: 0 },
-  'npm packument (abbrev)': { cold: 2, warm: 1 },
-  'npm packument (full)': { cold: 2, warm: 1 },
-  'go .info': { cold: 2, warm: 0 },
-  'go .mod': { cold: 2, warm: 0 },
-  'go .zip': { cold: 3, warm: 0 },
+// test isolate flushes every 10 s or 200 requests, as in production), and rows read on a cold isolate.
+// The project has 300 allows for other packages: a cold request must not read them.
+// Before the fix every row was 5–6 round trips and 6–7 statements.
+const BUDGET: Record<keyof typeof PATHS, { cold: number; warm: number; coldRows: number }> = {
+  'npm tarball': { cold: 3, warm: 0, coldRows: 10 },
+  'npm packument (abbrev)': { cold: 2, warm: 0, coldRows: 10 },
+  'npm packument (full)': { cold: 2, warm: 0, coldRows: 10 },
+  'go .info': { cold: 2, warm: 0, coldRows: 10 },
+  'go .mod': { cold: 2, warm: 0, coldRows: 10 },
+  'go .zip': { cold: 3, warm: 0, coldRows: 10 },
 };
 
 beforeAll(async () => {
   configureStatsBuffer({ intervalMs: STATS_INTERVAL_MS, maxPending: STATS_MAX_PENDING, timer: false });
   e = env as unknown as Env;
   tok = (await seedProject(e, 'calls')).read;
+  await e.DB.prepare(
+    `INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at)
+     SELECT 'calls', 'main', 'npm', 'other-' || value, '1.0.0', NULL, 'r', NULL FROM json_each(?)`,
+  )
+    .bind(JSON.stringify(Array.from({ length: 300 }, (_, i) => i)))
+    .run();
   // Warm the npm packument so the tarball's version is pinned.
   await request('/npm/calls', fresh());
 });
@@ -146,9 +171,12 @@ describe('D1 round trips per cached request (main ref)', () => {
   for (const [label, [path, accept]] of Object.entries(PATHS) as [keyof typeof PATHS, readonly [string, string?]][]) {
     it(`${label}: within budget`, async () => {
       const { cold, warm } = await measure(path, accept);
-      const line = (c: Count) => `${c.trips} trips/${c.stmts} stmts${c.stats ? ` (${c.stats} stats)` : ''}`;
+      const line = (c: Count) => `${c.trips} trips/${c.stmts} stmts/${c.rows} rows${c.stats ? ` (${c.stats} stats)` : ''}`;
       report[label] = `cold ${line(cold)}, warm ${line(warm)} :: ${cold.sql.join(' | ')}`;
-      expect({ cold: cold.trips, warm: warm.trips }).toEqual(BUDGET[label]);
+      const b = BUDGET[label];
+      expect({ cold: cold.trips, warm: warm.trips }).toEqual({ cold: b.cold, warm: b.warm });
+      expect(cold.rows).toBeLessThanOrEqual(b.coldRows);
+      expect(warm.rows).toBe(0);
     });
   }
   it('report', () => {

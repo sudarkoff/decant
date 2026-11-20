@@ -1,4 +1,5 @@
 import { TtlCache } from '../cache';
+import { forgetConflicts, rememberPins, type VersionRow } from './caches';
 import type { Ecosystem, Env, PackageRef } from '../types';
 import type { Policy } from './schema';
 
@@ -48,7 +49,7 @@ export async function blockedVersions(env: Env, eco: Ecosystem, name: string): P
   return new Set(r.results.map((x) => x.version));
 }
 
-export type VersionRow = { version: string; publish_time: string; conflict: number };
+export type { VersionRow } from './caches';
 
 function toPinned(rows: VersionRow[]): Map<string, PinnedTime> {
   return new Map(rows.map((r) => [r.version, { publishTime: new Date(r.publish_time), conflict: r.conflict === 1 }]));
@@ -129,7 +130,12 @@ export async function pinPublishTimes(
     selectPinnedStmt(env, eco, name, changed),
   );
   const res = await env.DB.batch<VersionRow>(stmts);
-  for (const r of onlyRequested(res[res.length - 1]!.results, changed)) out.set(r.version, r);
+  const after = onlyRequested(res[res.length - 1]!.results, changed);
+  for (const r of after) out.set(r.version, r);
+  // A conflict this isolate just saw must not wait for cached deny sets, facts or pins to expire.
+  const conflicted = after.filter((r) => r.conflict === 1).map((r) => r.version);
+  if (conflicted.length > 0) forgetConflicts(eco, name, conflicted);
+  else rememberPins(eco, name, after, now.getTime());
   return toPinned([...out.values()]);
 }
 

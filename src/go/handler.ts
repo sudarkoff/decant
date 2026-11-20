@@ -3,7 +3,7 @@ import { text } from '../http';
 import type { Decision } from '../policy/decide';
 import { loadDecision, type VersionState } from '../policy/decider';
 import { osvMalicious, storedObject } from '../policy/first-serve';
-import { logServe, markStored, pinnedFrom, pinPublishTimes, selectPinnedStmt, type PinnedTime, type VersionRow } from '../policy/store';
+import { logServe, markStored, pinnedFrom, pinPublishTimes, type PinnedTime } from '../policy/store';
 import { compareVersions, isPrerelease, parseVersion } from '../semver';
 import { notePackageLatest, outcomeOf, recordRequest, tagOutcome } from '../stats/record';
 import { pump, readUpTo } from '../streams';
@@ -114,9 +114,8 @@ async function allowedList(env: Env, deps: Deps, rc: RequestCtx, mod: Mod): Prom
   }
 
   // Pinned times are read in the same round trip as the decision inputs.
-  const extra = versions.length > 0 ? selectPinnedStmt(env, 'go', mod.name, versions) : undefined;
-  const loaded = await loadDecision<VersionRow>(env, deps, rc, 'go', mod.name, { extra });
-  const pinned = pinnedFrom(loaded.extra?.results ?? [], versions);
+  const loaded = await loadDecision(env, deps, rc, 'go', mod.name, { pins: versions });
+  const pinned = pinnedFrom(loaded.pinRows, versions);
   const unpinned = versions
     .filter((v) => !pinned.has(v))
     .sort((a, b) => compareVersions(b, a, 'go'))
@@ -159,10 +158,9 @@ async function handleLatest(
     if (i && parseVersion(i.version, 'go')) {
       if (up.fresh) notePackageLatest(env, ctx, 'go', mod.name, i.version, i.time.toISOString(), now);
       // Pinning here also catches an upstream time change for an already-pinned version.
-      const extra = selectPinnedStmt(env, 'go', mod.name, [i.version]);
-      const loaded = await loadDecision<VersionRow>(env, deps, rc, 'go', mod.name, { extra });
+      const loaded = await loadDecision(env, deps, rc, 'go', mod.name, { pins: [i.version] });
       const times = new Map([[i.version, i.time]]);
-      const pin = (await pinPublishTimes(env, 'go', mod.name, times, now, loaded.extra?.results ?? [])).get(i.version);
+      const pin = (await pinPublishTimes(env, 'go', mod.name, times, now, loaded.pinRows)).get(i.version);
       if (loaded.decide(i.version, pin) === 'allow') return infoResponse(up.body, up.stale);
     }
   }
