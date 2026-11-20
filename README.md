@@ -6,6 +6,10 @@ New releases rest before they're poured: decant serves a version only after it h
 
 **Status:** Worker live; Action ready, unreleased. Docs: [deploy](docs/deploy.md), [adopt](docs/adopt.md), [hardening](docs/hardening.md), [release](docs/release.md).
 
+![decant dashboard: needs attention, activity, security, freshness](docs/images/dashboard.png)
+
+*The private dashboard, behind Cloudflare Access (sample data).*
+
 ## Goals
 
 - **Cooldown.** A new version becomes installable only after it is N days old (default 7).
