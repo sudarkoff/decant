@@ -135,10 +135,10 @@ beforeAll(async () => {
   const allows = [];
   for (let i = 0; i < 500; i++) {
     allows.push(
-      e.DB.prepare("INSERT INTO allows VALUES ('dr', 'main', 'npm', ?, ?, NULL, 'r', NULL)").bind(`other-${i % 200}`, `9.${i}.0`),
+      e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('dr', 'main', 'npm', ?, ?, NULL, 'r', NULL)").bind(`other-${i % 200}`, `9.${i}.0`),
     );
   }
-  allows.push(e.DB.prepare("INSERT INTO allows VALUES ('dr', 'main', 'npm', ?, '1.1.0', NULL, 'r', NULL)").bind(NAME));
+  allows.push(e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('dr', 'main', 'npm', ?, '1.1.0', NULL, 'r', NULL)").bind(NAME));
   allows.push(e.DB.prepare("INSERT INTO global_blocks VALUES ('npm', ?, '1.2.0', 'manual', 'bad', 'x')").bind(NAME));
   allows.push(e.DB.prepare("INSERT INTO global_blocks VALUES ('npm', 'other-1', '0.1.0', 'manual', 'bad', 'x')"));
   await e.DB.batch(allows);
