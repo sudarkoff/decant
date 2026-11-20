@@ -252,11 +252,15 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
       return prs[0] ? toPr(prs[0]) : null;
     },
 
-    /** Number of a closed, unmerged PR from `head` (a declined change), or null. */
-    async findClosedUnmergedPr(head: string): Promise<number | null> {
+    /** The most recently closed, unmerged PR from `head` (a declined change), or null. */
+    async findClosedUnmergedPr(head: string): Promise<{ number: number; body: string } | null> {
       const q = `head=${encodeURIComponent(`${owner}:${head}`)}`;
-      const prs = await json<{ number: number; merged_at?: string | null }[]>('GET', `${R}/pulls?state=closed&${q}&per_page=100`);
-      return prs.find((p) => !p.merged_at)?.number ?? null;
+      const prs = await json<{ number: number; merged_at?: string | null; closed_at?: string | null; body?: string | null }[]>(
+        'GET',
+        `${R}/pulls?state=closed&${q}&per_page=100`,
+      );
+      const declined = prs.filter((p) => !p.merged_at).sort((a, b) => (b.closed_at ?? '').localeCompare(a.closed_at ?? '') || b.number - a.number);
+      return declined[0] ? { number: declined[0].number, body: declined[0].body ?? '' } : null;
     },
 
     /** Head commit sha of branch `name`. */
@@ -270,8 +274,13 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
       await rest('PATCH', `${R}/git/refs/heads/${name.split('/').map(encodeURIComponent).join('/')}`, { sha, force: true });
     },
 
-    async updatePr(n: number, p: { body: string }): Promise<void> {
-      await rest('PATCH', `${R}/pulls/${n}`, { body: p.body });
+    async updatePr(n: number, p: { body: string; title?: string }): Promise<void> {
+      await rest('PATCH', `${R}/pulls/${n}`, p.title === undefined ? { body: p.body } : { title: p.title, body: p.body });
+    },
+
+    /** Adds `labels` to issue/PR `n` (existing labels are kept). */
+    async addLabels(n: number, labels: string[]): Promise<void> {
+      await rest('POST', `${R}/issues/${n}/labels`, { labels });
     },
 
     /** UTF-8 contents of `path` at `ref`; null if it does not exist there. */
