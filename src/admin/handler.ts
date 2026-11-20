@@ -115,6 +115,10 @@ async function route(req: Request, env: Env, deps: Deps, auth: AuthCtx, path: st
         if (m !== 'PUT') return methodNotAllowed();
         if (!isOwnCi(auth, id) && !isOwnSync(auth, id)) return forbidden();
         return syncPolicy(req, env, deps, id, auth.kind === 'sync');
+      case 'deps':
+        if (m !== 'PUT') return methodNotAllowed();
+        if (!isOwnSync(auth, id)) return forbidden();
+        return syncDeps(req, env, deps, id);
       case 'status':
         if (m !== 'GET') return methodNotAllowed();
         if (!isOwnCi(auth, id)) return forbidden();
@@ -256,6 +260,49 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
   }
   await db.batch(stmts);
   return reply({ ref, allows: policy.allow.length, blocks: policy.block.length });
+}
+
+const DEP_ECOS = new Set(['npm', 'go']);
+const MAX_DEP_NAME = 214;
+const MAX_DEP_VERSION = 128;
+const MAX_VIA = 5;
+
+type DepRow = { eco: string; name: string; version: string; direct: boolean; via: string[] };
+
+const shortString = (v: unknown, max: number): v is string => typeof v === 'string' && v !== '' && v.length <= max;
+
+/** Validates one summary entry; returns it with only the known fields, or an error message. */
+function depRow(v: unknown, i: number): DepRow | string {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return `deps[${i}] must be an object`;
+  const d = v as Record<string, unknown>;
+  if (typeof d.eco !== 'string' || !DEP_ECOS.has(d.eco)) return `deps[${i}].eco must be npm or go`;
+  if (!shortString(d.name, MAX_DEP_NAME)) return `deps[${i}].name must be a string of 1-${MAX_DEP_NAME} characters`;
+  if (!shortString(d.version, MAX_DEP_VERSION)) return `deps[${i}].version must be a string of 1-${MAX_DEP_VERSION} characters`;
+  if (typeof d.direct !== 'boolean') return `deps[${i}].direct must be a boolean`;
+  if (!Array.isArray(d.via) || d.via.length > MAX_VIA || !d.via.every((x) => shortString(x, MAX_DEP_NAME))) {
+    return `deps[${i}].via must be at most ${MAX_VIA} package names`;
+  }
+  return { eco: d.eco, name: d.name, version: d.version, direct: d.direct, via: d.via as string[] };
+}
+
+/** Replaces the project's default-branch dependency summary (dashboard: direct vs transitive). */
+async function syncDeps(req: Request, env: Env, deps: Deps, projectId: string): Promise<Response> {
+  const body = await readJsonObject(req);
+  if (typeof body.sha !== 'string' || body.sha === '' || body.sha.length > 100) return err(400, 'sha must be a non-empty string');
+  if (!Array.isArray(body.deps)) return err(400, 'deps must be an array');
+  const rows: DepRow[] = [];
+  for (const [i, v] of body.deps.entries()) {
+    const r = depRow(v, i);
+    if (typeof r === 'string') return err(400, r);
+    rows.push(r);
+  }
+  await env.DB.prepare(
+    `INSERT INTO project_deps (project_id, sha, synced_at, json) VALUES (?, ?, ?, ?)
+     ON CONFLICT (project_id) DO UPDATE SET sha = excluded.sha, synced_at = excluded.synced_at, json = excluded.json`,
+  )
+    .bind(projectId, body.sha, deps.now().toISOString(), JSON.stringify(rows))
+    .run();
+  return reply({ deps: rows.length });
 }
 
 async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): Promise<Response> {
