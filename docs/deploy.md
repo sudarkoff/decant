@@ -148,7 +148,7 @@ A version younger than the cooldown (7 days by default) is hidden until it ages 
 
 ## Dashboard (optional)
 
-A private page at `https://<your-domain>/dashboard`: needs-attention items, request activity, vulnerabilities in cached versions, package freshness, uptime, policy and recently resolved items. It is protected by Cloudflare Access. Request counts start at deploy (no backfill).
+A private page at `https://<your-domain>/dashboard`: needs-attention items, request activity, vulnerabilities in cached versions, package freshness, uptime, policy and recently resolved items. It is protected by Cloudflare Access. Request counts start at deploy (no backfill). They are best-effort: each Worker instance buffers them and writes them every 10 seconds or 200 requests, so a few counts can be lost when an instance shuts down.
 
 1. In Cloudflare, go to Zero Trust → Access → Applications (newer dashboards: Access controls → Applications) and add a Self-hosted application.
 2. Add two paths on your hostname: `/dashboard` and `/dashboard/*`. Never protect the bare host: that would put Access in front of installs and break them.

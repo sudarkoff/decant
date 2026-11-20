@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:workers';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { handle } from '../src/index';
+import { configureStatsBuffer, flushRequestCounts, STATS_MAX_PENDING } from '../src/stats/record';
 import type { Deps, Env } from '../src/types';
 import { fakeFetch, fixedClock, seedProject } from './helpers';
 
@@ -225,5 +226,85 @@ describe('package latest versions', () => {
     expect((await req('/go/example.com/stl/@latest')).status).toBe(200);
     expect(await pkg('go', 'example.com/stl')).toEqual({ latest: 'v1.2.0', latest_time: OLD, checked_at: '2026-11-19T12:00:00.000Z' });
     expect(await counts('s-golatest')).toEqual({ [`${DAY}/go/metadata/served`]: 1 });
+  });
+});
+
+describe('request count buffering', () => {
+  // The test setup flushes on every request (intervalMs 0); these tests use production-like settings.
+  afterEach(() => configureStatsBuffer({ intervalMs: 0, maxPending: STATS_MAX_PENDING }));
+
+  /** go .mod requests whose background work is collected, not awaited (a buffered flush may be waiting). */
+  async function goClient(project: string, mod: string) {
+    const tok = (await seedProject(e, project)).read;
+    const base = `${PROXY}/${mod}/@v/v1.0.0`;
+    const batches: number[] = [];
+    const db = new Proxy(e.DB, {
+      get(target, prop) {
+        if (prop === 'batch')
+          return (stmts: D1PreparedStatement[]) => {
+            batches.push(stmts.length);
+            return target.batch(stmts);
+          };
+        const v = Reflect.get(target, prop, target);
+        return typeof v === 'function' ? v.bind(target) : v;
+      },
+    });
+    const deps: Deps = {
+      fetch: fakeFetch({
+        [`${base}.info`]: () => new Response(JSON.stringify({ Version: 'v1.0.0', Time: OLD })),
+        [`${base}.mod`]: () => new Response(`module ${mod}\n`),
+      }),
+      now,
+    };
+    const pending: Promise<unknown>[] = [];
+    const ctx = { waitUntil: (p: Promise<unknown>) => void pending.push(p), passThroughOnException() {} } as unknown as ExecutionContext;
+    const envX = { ...e, DB: db } as Env;
+    const req = async () => {
+      const r = await handle(new Request(`https://h/go/${mod}/@v/v1.0.0.mod`, { headers: { authorization: `Bearer ${tok}` } }), envX, deps, ctx);
+      expect(r.status).toBe(200);
+      await r.text();
+    };
+    return { req, pending, batches, envX };
+  }
+
+  const settle = (ps: Promise<unknown>[]) => Promise.allSettled(ps.splice(0));
+  const tick = () => new Promise((r) => setTimeout(r, 20));
+
+  it('aggregates increments and writes them as one upsert once maxPending is reached', async () => {
+    configureStatsBuffer({ intervalMs: 60_000, maxPending: 3 });
+    const { req, pending } = await goClient('s-buf', 'example.com/stbuf');
+    await req();
+    await req();
+    await tick();
+    expect(await counts('s-buf')).toEqual({}); // buffered, not yet written
+    await req();
+    await settle(pending); // the flush also wakes the scheduled timer, so this does not wait 60 s
+    expect(await counts('s-buf')).toEqual({ [`${DAY}/go/download/served`]: 3 });
+  });
+
+  it('flushes on a timer when traffic is too low to reach maxPending', async () => {
+    configureStatsBuffer({ intervalMs: 50, maxPending: 1000 });
+    const { req, pending } = await goClient('s-tick', 'example.com/sttick');
+    await req();
+    expect(await counts('s-tick')).toEqual({});
+    await settle(pending); // the scheduled flush sleeps ~50 ms, then writes
+    expect(await counts('s-tick')).toEqual({ [`${DAY}/go/download/served`]: 1 });
+  });
+
+  it('flushRequestCounts writes every buffered key, across projects, in one batch round trip', async () => {
+    configureStatsBuffer({ intervalMs: 60_000, maxPending: 1000 });
+    const a = await goClient('s-fa', 'example.com/stfa');
+    const b = await goClient('s-fb', 'example.com/stfb');
+    await a.req();
+    await b.req();
+    await b.req();
+    await tick();
+    const before = a.batches.length;
+    await flushRequestCounts(a.envX);
+    expect(a.batches.slice(before)).toEqual([2]); // one batch, one upsert per key
+    await settle(a.pending);
+    await settle(b.pending);
+    expect(await counts('s-fa')).toEqual({ [`${DAY}/go/download/served`]: 1 });
+    expect(await counts('s-fb')).toEqual({ [`${DAY}/go/download/served`]: 2 });
   });
 });
