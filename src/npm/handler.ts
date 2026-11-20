@@ -1,15 +1,8 @@
 import type { RequestCtx } from '../auth';
 import { json } from '../http';
-import { decider } from '../policy/decider';
+import { loadDecision, type VersionState } from '../policy/decider';
 import { osvMalicious, storedObject } from '../policy/first-serve';
-import {
-  getPinnedTimes,
-  getVersionState,
-  logServe,
-  markStored,
-  pinPublishTimes,
-  type PinnedTime,
-} from '../policy/store';
+import { logServe, markStored, pinnedFrom, pinPublishTimes, type PinnedTime } from '../policy/store';
 import { notePackageLatest, outcomeOf, recordRequest, tagOutcome } from '../stats/record';
 import { pump, readUpTo } from '../streams';
 import { formatPackageId, type Deps, type Env, type PackageRef } from '../types';
@@ -26,6 +19,7 @@ const NAME_RE = /^(?:@[a-z0-9~-][a-z0-9._~-]*\/)?[a-z0-9~-][a-z0-9._~-]*$/i;
 const NO_STORE = { 'cache-control': 'no-store' };
 
 function err(status: number, message: string, headers: Record<string, string> = {}): Response {
+  if (status >= 500) console.error(`decant: npm ${status}: ${message}`);
   return json({ error: message }, status, { ...NO_STORE, ...headers });
 }
 
@@ -115,11 +109,17 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rec: Rec, rc: 
   const now = rec.now;
   let stale = r.stale;
 
+  // The package's pinned times are read in the same round trip as the decision inputs.
+  const docTimes = abbrev ? null : publishTimes(doc);
+  const wanted = docTimes ? [...docTimes.keys()] : versions;
+  const loaded = await loadDecision(env, deps, rc, 'npm', name, { pins: wanted });
+  const rows = loaded.pinRows;
+
   let pinned: Map<string, PinnedTime>;
-  if (!abbrev) {
-    pinned = await pinPublishTimes(env, 'npm', name, publishTimes(doc), now);
+  if (docTimes) {
+    pinned = await pinPublishTimes(env, 'npm', name, docTimes, now, rows);
   } else {
-    pinned = await getPinnedTimes(env, 'npm', name, versions);
+    pinned = pinnedFrom(rows, versions);
     if (versions.some((v) => !pinned.has(v))) {
       // Times only live in the full document. If it can't be had, unpinned versions stay hidden.
       const times = await fullDocTimes(env, deps, rec, name);
@@ -130,8 +130,7 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rec: Rec, rc: 
     }
   }
 
-  const d = await decider(env, deps, rc, 'npm', name);
-  const allowed = new Set(versions.filter((v) => d(v, pinned.get(v)) === 'allow'));
+  const allowed = new Set(versions.filter((v) => loaded.decide(v, pinned.get(v)) === 'allow'));
   const out = filterPackument(doc, allowed, `${rc.base}/npm`);
   return new Response(JSON.stringify(out), {
     headers: {
@@ -243,7 +242,8 @@ async function handleTarball(
   const id = formatPackageId(ref);
 
   let full: Packument | null = null;
-  let state = await getVersionState(env, ref);
+  const loaded = await loadDecision(env, deps, rc, 'npm', name, { version, needStored: true });
+  let state: VersionState | null = loaded.state;
   if (!state) {
     const r = await fetchDoc(env, deps, rec, name, false);
     if (!r.ok) return r.res;
@@ -254,7 +254,7 @@ async function handleTarball(
     state = pin ? { ...pin, storedAt: null, osvCheckedAt: null } : null;
   }
 
-  const d = (await decider(env, deps, rc, 'npm', name))(version, state);
+  const d = loaded.decide(version, state);
   if (d !== 'allow') return notAvailable(id, d === 'blocked');
 
   const serve = () => ctx.waitUntil(logServe(env, rc.projectId, ref, now).catch(() => console.warn(`serve log failed ${id}`)));

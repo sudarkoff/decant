@@ -81,7 +81,7 @@ curl https://<your-domain>/healthz
 
 The health check should answer `ok`. The Worker's cron runs daily at 04:17 UTC: it re-checks stored versions against OSV for malicious-package advisories and expires PR overlays 14 days after their last sync.
 
-`wrangler.jsonc` turns on Workers Logs (`"observability": { "enabled": true }`), so exceptions and decant's own warnings are kept and searchable in the dashboard. If you deploy from your own config (`wrangler.local.jsonc` or another), add the same line to it: without it, nothing is retained to diagnose a failure after the fact. Decant logs error names and package ids, never tokens.
+`wrangler.jsonc` turns on Workers Logs (`"observability": { "enabled": true }`), so exceptions and decant's own warnings are kept and searchable in the dashboard. If you deploy from your own config (`wrangler.local.jsonc` or another), add the same line to it: without it, nothing is retained to diagnose a failure after the fact. Decant logs package ids and a one-line reason for every 502 (error name and message, with token-like strings masked), never tokens or request URLs.
 
 ### Upgrading an existing deployment
 
@@ -148,7 +148,7 @@ A version younger than the cooldown (7 days by default) is hidden until it ages 
 
 ## Dashboard (optional)
 
-A private page at `https://<your-domain>/dashboard`: needs-attention items, request activity, vulnerabilities in cached versions, package freshness, uptime, policy and recently resolved items. It is protected by Cloudflare Access. Request counts start at deploy (no backfill).
+A private page at `https://<your-domain>/dashboard`: needs-attention items, request activity, vulnerabilities in cached versions, package freshness, uptime, policy and recently resolved items. It is protected by Cloudflare Access. Request counts start at deploy (no backfill). They are best-effort: each Worker instance buffers them and writes them every 10 seconds or 200 requests, so a few counts can be lost when an instance shuts down.
 
 1. In Cloudflare, go to Zero Trust → Access → Applications (newer dashboards: Access controls → Applications) and add a Self-hosted application.
 2. Add two paths on your hostname: `/dashboard` and `/dashboard/*`. Never protect the bare host: that would put Access in front of installs and break them.

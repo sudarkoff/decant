@@ -1,9 +1,23 @@
 import { env } from 'cloudflare:workers';
 import { applyD1Migrations } from 'cloudflare:test';
-import { hashToken, newToken } from '../src/auth';
+import { beforeEach } from 'vitest';
+import { clearAuthCache, hashToken, newToken } from '../src/auth';
+import { configureRetryBudget } from '../src/d1-retry';
+import { clearDecisionCaches } from '../src/policy/decider';
+import { clearServeLogCache } from '../src/policy/store';
+import { configureStatsBuffer } from '../src/stats/record';
 import type { Env } from '../src/types';
 
 // Setup (runs via vitest setupFiles): apply migrations/ to the test D1.
+// Request counts are written on every request in tests (production buffers them; see stats/record.ts).
+configureStatsBuffer({ intervalMs: 0 });
+// Each test starts with empty per-isolate caches (tests share an isolate and a fixed clock).
+beforeEach(() => {
+  clearAuthCache();
+  clearDecisionCaches();
+  clearServeLogCache();
+  configureRetryBudget();
+});
 await applyD1Migrations(
   (env as unknown as Env).DB,
   (env as unknown as { TEST_MIGRATIONS: Parameters<typeof applyD1Migrations>[1] }).TEST_MIGRATIONS,
@@ -90,8 +104,13 @@ export function flakyDb(
     prepare: (q: string) => wrap(db.prepare(q), q),
     batch: async (stmts: D1PreparedStatement[]) => {
       const r = stmts.map((x) => real.get(x)!);
+      if (!opts.lostAck) {
+        for (const x of r) boom(x.sql);
+        return db.batch(r.map((x) => x.s));
+      }
+      const res = await db.batch(r.map((x) => x.s));
       for (const x of r) boom(x.sql);
-      return db.batch(r.map((x) => x.s));
+      return res;
     },
     exec: (q: string) => db.exec(q),
     get failures() {

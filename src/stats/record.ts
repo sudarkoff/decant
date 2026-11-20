@@ -24,9 +24,40 @@ function background(ctx: ExecutionContext, what: string, work: () => Promise<unk
   }
 }
 
+/*
+ * Request counts are buffered per isolate and written as one batch of upserts at most every
+ * STATS_INTERVAL_MS or STATS_MAX_PENDING increments, whichever comes first: one D1 round trip per
+ * flush instead of one per request. Best-effort by design: counts still buffered when the isolate is
+ * evicted, or in a flush that fails, are lost (never retried; see flushRequestCounts).
+ */
+export const STATS_INTERVAL_MS = 10_000;
+export const STATS_MAX_PENDING = 200;
+
+interface Pending {
+  projectId: string;
+  day: string;
+  eco: Ecosystem;
+  kind: Kind;
+  outcome: Outcome;
+  n: number;
+}
+
+const buffer = new Map<string, Pending>();
+let increments = 0;
+let lastFlush = Date.now();
+let wake: (() => void) | null = null; // resolves the scheduled flush's sleep, when one is waiting
+const policy = { intervalMs: STATS_INTERVAL_MS, maxPending: STATS_MAX_PENDING, timer: true };
+
+/** Test hook: the flush interval and size (intervalMs 0 flushes on every request); timer false never schedules a flush. */
+export function configureStatsBuffer(p: Partial<typeof policy>): void {
+  Object.assign(policy, p);
+  lastFlush = Date.now();
+}
+
 /**
- * One upsert into request_counts for (project, UTC day, eco, kind, outcome). Never retried (noRetry):
- * `n = n + 1` is not idempotent, so a retry after a lost acknowledgement would count the request twice.
+ * Adds one to the buffered count for (project, UTC day, eco, kind, outcome). Flushes in the background
+ * when the buffer is due; otherwise makes sure a flush is scheduled for when it will be, so a quiet
+ * isolate's last few counts are written too (as long as it lives that long).
  */
 export function recordRequest(
   env: Env,
@@ -37,14 +68,50 @@ export function recordRequest(
   outcome: Outcome,
   now: Date,
 ): void {
-  background(ctx, 'request count', () =>
-    noRetry(env.DB).prepare(
-      `INSERT INTO request_counts (project_id, day, eco, kind, outcome, n) VALUES (?, ?, ?, ?, ?, 1)
-       ON CONFLICT(project_id, day, eco, kind, outcome) DO UPDATE SET n = n + 1`,
-    )
-      .bind(projectId, now.toISOString().slice(0, 10), eco, kind, outcome)
-      .run(),
+  const day = now.toISOString().slice(0, 10);
+  const key = `${projectId}\u0000${day}\u0000${eco}\u0000${kind}\u0000${outcome}`;
+  const row = buffer.get(key);
+  if (row) row.n++;
+  else buffer.set(key, { projectId, day, eco, kind, outcome, n: 1 });
+  increments++;
+
+  const due = lastFlush + policy.intervalMs - Date.now();
+  if (increments >= policy.maxPending || due <= 0) {
+    background(ctx, 'request counts', () => flushRequestCounts(env));
+  } else if (!wake && policy.timer) {
+    background(ctx, 'request counts', async () => {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(done, due);
+        function done() {
+          clearTimeout(t);
+          if (wake === done) wake = null;
+          resolve();
+        }
+        wake = done;
+      });
+      await flushRequestCounts(env);
+    });
+  }
+}
+
+/**
+ * Writes every buffered count as one batch of upserts and empties the buffer. Never retried (noRetry):
+ * `n = n + ?` is not idempotent, so a retry after a lost acknowledgement would count requests twice.
+ * A failed flush loses its counts.
+ */
+export async function flushRequestCounts(env: Env): Promise<void> {
+  const rows = [...buffer.values()];
+  buffer.clear();
+  increments = 0;
+  lastFlush = Date.now();
+  wake?.();
+  if (rows.length === 0) return;
+  const db = noRetry(env.DB);
+  const upsert = db.prepare(
+    `INSERT INTO request_counts (project_id, day, eco, kind, outcome, n) VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(project_id, day, eco, kind, outcome) DO UPDATE SET n = n + excluded.n`,
   );
+  await db.batch(rows.map((r) => upsert.bind(r.projectId, r.day, r.eco, r.kind, r.outcome, r.n)));
 }
 
 /**

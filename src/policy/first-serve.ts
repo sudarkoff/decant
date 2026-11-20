@@ -1,4 +1,5 @@
 import { maliciousIds } from '../osv';
+import { forgetDenied } from './decider';
 import { formatPackageId, type Deps, type Env, type PackageRef } from '../types';
 import { addGlobalBlock, markOsvChecked } from './store';
 
@@ -30,7 +31,10 @@ export async function osvMalicious(env: Env, deps: Deps, ref: PackageRef, now: D
   if (mal === null) return false;
   const ids = mal.get(id) ?? [];
   try {
-    if (ids.length > 0) await addGlobalBlock(env, ref, 'osv', ids.join(', '), now);
+    if (ids.length > 0) {
+      await addGlobalBlock(env, ref, 'osv', ids.join(', '), now);
+      forgetDenied(ref.eco, ref.name); // this isolate sees the block at once
+    }
     await markOsvChecked(env, [ref], now);
   } catch {
     console.warn(`osv result write failed ${id}`);
