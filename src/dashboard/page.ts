@@ -325,7 +325,8 @@ const SCRIPT = String.raw`
     return row.firstChild ? row : null;
   }
   function titleWithProject(item) {
-    return (item.project ? item.project + ' · ' : 'all · ') + item.title;
+    // A silent title already names its project; a project-less item (conflict) gets no prefix.
+    return item.project && item.kind !== 'silent' ? item.project + ' · ' + item.title : item.title;
   }
   function renderAttention(data) {
     var box = $('attention');

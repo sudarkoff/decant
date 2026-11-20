@@ -246,6 +246,23 @@ describe('dashboard page: needs attention', () => {
     ]);
   });
 
+  it('prefixes the project only when the title does not already name it, and never prefixes project-less items', () => {
+    const { box, resolved } = renderAttention({
+      open: [
+        { ...base, kind: 'vuln' },
+        { ...base, kind: 'silent', project: 'docs-site', title: 'docs-site has had no requests in 14 days' },
+        { ...base, kind: 'conflict', project: null, title: 'tinyrainbow@3.2.0 was republished upstream' },
+      ],
+      resolved: [{ ...base, kind: 'conflict', project: null, title: 'c@1.0.0 was republished upstream', resolvedAt: '2026-11-19T00:00:00Z' }],
+    });
+    expect(all(box).filter((n) => n.className === 'title').map((n) => n.textContent)).toEqual([
+      'web · undici@7.29.0 has GHSA-x',
+      'docs-site has had no requests in 14 days',
+      'tinyrainbow@3.2.0 was republished upstream',
+    ]);
+    expect(all(resolved).map((n) => n.textContent)).toContain('c@1.0.0 was republished upstream');
+  });
+
   it('items without a to-do or links (older Worker) render as before', () => {
     const { box } = renderAttention({ open: [{ ...base, kind: 'blocked' }], resolved: [] });
     expect(all(box).some((n) => n.className === 'todo' || n.className === 'links')).toBe(false);
