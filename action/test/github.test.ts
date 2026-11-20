@@ -201,12 +201,34 @@ describe('upsertIssue', () => {
 
   it('findClosedUnmergedPr ignores merged PRs', async () => {
     const f = route({
-      [`GET ${R}/pulls?state=closed&head=o%3Ab&per_page=100`]: () => jsonRes([{ number: 1, merged_at: '2026-01-01T00:00:00Z' }, { number: 2, merged_at: null }]),
+      [`GET ${R}/pulls?state=closed&head=o%3Ab&per_page=100`]: () =>
+        jsonRes([
+          { number: 1, merged_at: '2026-01-01T00:00:00Z', closed_at: '2026-01-01T00:00:00Z' },
+          { number: 2, merged_at: null, closed_at: '2026-02-01T00:00:00Z', body: 'two' },
+          { number: 3, merged_at: null, closed_at: '2026-03-01T00:00:00Z', body: 'three' },
+        ]),
       [`GET ${R}/pulls?state=closed&head=o%3Ac&per_page=100`]: () => jsonRes([{ number: 1, merged_at: '2026-01-01T00:00:00Z' }]),
     });
     const gh = github(f, TOKEN, 'o/r');
-    expect(await gh.findClosedUnmergedPr('b')).toBe(2);
+    expect(await gh.findClosedUnmergedPr('b')).toEqual({ number: 3, body: 'three' });
     expect(await gh.findClosedUnmergedPr('c')).toBeNull();
+  });
+
+  it('ownSingleCommit: one bot commit on top of base → its files; anything else → null', async () => {
+    const B = 'b'.repeat(40);
+    const one = (author: unknown, parent = B, extra: Record<string, unknown> = {}) =>
+      jsonRes({ status: 'ahead', ahead_by: 1, behind_by: 0, commits: [{ sha: 'h', author, parents: [{ sha: parent }] }], files: [{ filename: 'a' }, { filename: 'b/c' }], ...extra });
+    const cases: [string, () => Response, string[] | null][] = [
+      ['ok', () => one({ login: 'decant-app[bot]', type: 'Bot' }), ['a', 'b/c']],
+      ['human', () => one({ login: 'mallory', type: 'User' }), null],
+      ['parent', () => one({ login: 'decant-app[bot]', type: 'Bot' }, 'x'.repeat(40)), null],
+      ['two', () => one({ login: 'decant-app[bot]', type: 'Bot' }, B, { ahead_by: 2 }), null],
+      ['behind', () => one({ login: 'decant-app[bot]', type: 'Bot' }, B, { status: 'diverged', behind_by: 1 }), null],
+    ];
+    for (const [head, res, want] of cases) {
+      const f = route({ [`GET ${R}/compare/${B}...${head}`]: res });
+      expect(await github(f, TOKEN, 'o/r', { selfLogin: 'decant-app[bot]' }).ownSingleCommit(B, head)).toEqual(want);
+    }
   });
 
   it('closeIssue PATCHes state closed', async () => {
