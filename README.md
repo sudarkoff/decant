@@ -28,3 +28,5 @@ New releases rest before they're poured: decant serves a version only after it h
 - Tokens are per project: `read` for installs, `sync` for main-branch policy sync, `ci` for overlays and verdicts, and one operator token for admin.
 
 v1 supports npm and Go. See [docs/deploy.md](docs/deploy.md) to set it up.
+
+Optional private dashboard (behind Cloudflare Access): [setup](docs/deploy.md#dashboard-optional).

@@ -135,6 +135,32 @@ go list -m -versions github.com/google/uuid
 
 A version younger than the cooldown (7 days by default) is hidden until it ages in, unless the project's policy allows it. Policy files are synced by the GitHub Action; see [adopt.md](adopt.md).
 
+## Dashboard (optional)
+
+A private page at `https://<your-domain>/dashboard`: needs-attention items, request activity, vulnerabilities in cached versions, package freshness, uptime, policy and recently resolved items. It is protected by Cloudflare Access. Request counts start at deploy (no backfill).
+
+1. In Cloudflare Zero Trust, go to Access > Applications > Add an application > Self-hosted.
+2. Add two paths on your hostname: `/dashboard` and `/dashboard/*`. Never protect the bare host: that would put Access in front of installs and break them.
+3. Add a policy with action Allow and your email as the include rule.
+4. Copy the Application Audience (AUD) tag from the application's overview. The team domain is `<team>.cloudflareaccess.com` (Zero Trust > Settings > Custom Pages).
+5. Add both to `wrangler.jsonc`:
+
+```jsonc
+"vars": {
+  "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com",
+  "ACCESS_AUD": "<aud-tag>"
+}
+```
+
+6. Apply the migrations (0004 and 0005) and deploy:
+
+```sh
+npx wrangler d1 migrations apply decant --remote
+npx wrangler deploy
+```
+
+Open `https://<your-domain>/dashboard`. The Worker checks the `Cf-Access-Jwt-Assertion` header Access adds. If either var is unset or invalid, `/dashboard` answers 404; a missing or bad token answers 403.
+
 ## Rotating the operator token
 
 Run `npm run decant -- op-token` again, then `npx wrangler secret put OPERATOR_TOKEN_HASH` with the new hash. The old token stops working immediately.
