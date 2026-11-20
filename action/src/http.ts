@@ -23,9 +23,84 @@ export async function request(f: typeof fetch, url: string, init: RequestInit, o
   try {
     return await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
   } catch (e) {
-    const name = (e as Error)?.name;
-    const why = name === 'TimeoutError' || name === 'AbortError' ? `timed out after ${o.timeoutMs / 1000}s` : String((e as Error)?.message ?? e);
-    throw new Error(redact(`${o.label}: ${why}`, o.secrets ?? []));
+    throw new Error(redact(`${o.label}: ${failure(e, o.timeoutMs)}`, o.secrets ?? []));
+  }
+}
+
+const isTimeout = (e: unknown) => ['TimeoutError', 'AbortError'].includes((e as Error)?.name);
+
+/**
+ * Why a fetch threw. undici says only "fetch failed" and puts the reason in `cause` (a code such as
+ * ECONNRESET or UND_ERR_SOCKET, and a message such as "other side closed"), so the cause is appended.
+ */
+function failure(e: unknown, timeoutMs: number): string {
+  if (isTimeout(e)) return `timed out after ${timeoutMs / 1000}s`;
+  const msg = String((e as Error)?.message ?? e);
+  const cause = (e as { cause?: { code?: unknown; message?: unknown } })?.cause;
+  const code = typeof cause?.code === 'string' ? cause.code : '';
+  const cmsg = typeof cause?.message === 'string' ? cause.message : '';
+  const why = code && cmsg && !cmsg.includes(code) ? `${code}: ${cmsg}` : code || cmsg;
+  return why && !msg.includes(why) ? `${msg} (${why})` : msg;
+}
+
+export type RetryOpts = RequestOpts & {
+  /** Waits between attempts; injected by tests. */
+  sleep: (ms: number) => Promise<void>;
+  /** [0, 1); jitters each delay to 75–125% of its base. */
+  random?: () => number;
+  /** Total time for all attempts of one call (default RETRY_DEADLINE_MS). */
+  deadlineMs?: number;
+  /** Clock in ms; injected by tests. */
+  now?: () => number;
+  /**
+   * Retry a 502/503/504 response (default true). False for writes where a gateway error may mean the
+   * write landed: those are retried only when fetch throws (no response at all).
+   */
+  retryStatuses?: boolean;
+};
+
+export const RETRY_DELAYS_MS = [500, 1000, 2000];
+export const RETRY_DEADLINE_MS = 60_000;
+const RETRY_STATUSES = new Set([502, 503, 504]);
+
+export const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * `request`, retried for connection-level failures: a fetch that throws (reset, socket closed, timeout)
+ * or (unless `retryStatuses` is false) a 502/503/504 from a proxy in front of the server. Up to
+ * RETRY_DELAYS_MS.length + 1 attempts with jittered backoff, all within `deadlineMs`: each attempt's
+ * timeout is cut to the time left, and no attempt starts once the deadline would be past. Only for
+ * idempotent requests. A 4xx or other status is returned at once; a 502–504 that persists is returned as
+ * the last response; a throw that persists names the cause and the attempt count.
+ */
+export async function requestWithRetry(f: typeof fetch, url: string, init: RequestInit, o: RetryOpts): Promise<Response> {
+  const attempts = RETRY_DELAYS_MS.length + 1;
+  const random = o.random ?? Math.random;
+  const now = o.now ?? Date.now;
+  const deadlineMs = o.deadlineMs ?? RETRY_DEADLINE_MS;
+  const end = now() + deadlineMs;
+  const retryStatuses = o.retryStatuses ?? true;
+  for (let i = 0; ; i++) {
+    const delay = i < RETRY_DELAYS_MS.length ? Math.round(RETRY_DELAYS_MS[i]! * (0.75 + 0.5 * random())) : 0;
+    const last = i === attempts - 1;
+    const timeoutMs = Math.max(1, Math.min(o.timeoutMs, end - now()));
+    let res: Response;
+    try {
+      res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (e) {
+      // Another attempt only if one is left and it would start before the deadline.
+      if (last || now() + delay >= end) {
+        const why = isTimeout(e) ? `timed out (${Math.round(timeoutMs / 1000)}s)` : failure(e, timeoutMs);
+        const n = `${i + 1} attempt${i === 0 ? '' : 's'}`;
+        const cut = i < attempts - 1 ? ` (${deadlineMs / 1000}s deadline)` : '';
+        throw new Error(redact(`${o.label}: ${why} after ${n}${cut}`, o.secrets ?? []));
+      }
+      await o.sleep(delay);
+      continue;
+    }
+    if (last || !retryStatuses || !RETRY_STATUSES.has(res.status) || now() + delay >= end) return res;
+    await res.body?.cancel().catch(() => {});
+    await o.sleep(delay);
   }
 }
 

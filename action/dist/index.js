@@ -37,6 +37,84 @@ var defaultExec = (cmd, args, opts = {}) => new Promise((resolve4) => {
   child.stdin.end(opts.input ?? "");
 });
 
+// action/src/http.ts
+var TIMEOUT_MS = 3e4;
+var OSV_TIMEOUT_MS = 1e4;
+function redact(s, secrets) {
+  let out = s;
+  for (const sec of secrets) {
+    if (!sec) continue;
+    out = out.split(sec).join("***");
+  }
+  return out;
+}
+async function request(f, url, init, o) {
+  try {
+    return await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
+  } catch (e) {
+    throw new Error(redact(`${o.label}: ${failure(e, o.timeoutMs)}`, o.secrets ?? []));
+  }
+}
+var isTimeout = (e) => ["TimeoutError", "AbortError"].includes(e?.name);
+function failure(e, timeoutMs) {
+  if (isTimeout(e)) return `timed out after ${timeoutMs / 1e3}s`;
+  const msg = String(e?.message ?? e);
+  const cause = e?.cause;
+  const code = typeof cause?.code === "string" ? cause.code : "";
+  const cmsg = typeof cause?.message === "string" ? cause.message : "";
+  const why = code && cmsg && !cmsg.includes(code) ? `${code}: ${cmsg}` : code || cmsg;
+  return why && !msg.includes(why) ? `${msg} (${why})` : msg;
+}
+var RETRY_DELAYS_MS = [500, 1e3, 2e3];
+var RETRY_DEADLINE_MS = 6e4;
+var RETRY_STATUSES = /* @__PURE__ */ new Set([502, 503, 504]);
+var realSleep = (ms) => new Promise((resolve4) => setTimeout(resolve4, ms));
+async function requestWithRetry(f, url, init, o) {
+  const attempts = RETRY_DELAYS_MS.length + 1;
+  const random = o.random ?? Math.random;
+  const now = o.now ?? Date.now;
+  const deadlineMs = o.deadlineMs ?? RETRY_DEADLINE_MS;
+  const end = now() + deadlineMs;
+  const retryStatuses = o.retryStatuses ?? true;
+  for (let i = 0; ; i++) {
+    const delay = i < RETRY_DELAYS_MS.length ? Math.round(RETRY_DELAYS_MS[i] * (0.75 + 0.5 * random())) : 0;
+    const last = i === attempts - 1;
+    const timeoutMs = Math.max(1, Math.min(o.timeoutMs, end - now()));
+    let res;
+    try {
+      res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    } catch (e) {
+      if (last || now() + delay >= end) {
+        const why = isTimeout(e) ? `timed out (${Math.round(timeoutMs / 1e3)}s)` : failure(e, timeoutMs);
+        const n = `${i + 1} attempt${i === 0 ? "" : "s"}`;
+        const cut = i < attempts - 1 ? ` (${deadlineMs / 1e3}s deadline)` : "";
+        throw new Error(redact(`${o.label}: ${why} after ${n}${cut}`, o.secrets ?? []));
+      }
+      await o.sleep(delay);
+      continue;
+    }
+    if (last || !retryStatuses || !RETRY_STATUSES.has(res.status) || now() + delay >= end) return res;
+    await res.body?.cancel().catch(() => {
+    });
+    await o.sleep(delay);
+  }
+}
+async function httpError(res, o) {
+  let text = "";
+  try {
+    text = (await res.text()).slice(0, 300).replace(/\s+/g, " ").trim();
+  } catch {
+  }
+  return new Error(redact(`${o.label}: HTTP ${res.status}${text ? ` ${text}` : ""}`, o.secrets ?? []));
+}
+async function readJson(res, label) {
+  try {
+    return await res.json();
+  } catch {
+    throw new Error(`${label}: invalid JSON response`);
+  }
+}
+
 // action/src/deps.ts
 var defaultFs = {
   readFile: (p) => nodeFs.readFile(p, "utf8"),
@@ -74,6 +152,7 @@ function defaultDeps() {
     fetch: globalThis.fetch,
     exec: defaultExec,
     now: () => /* @__PURE__ */ new Date(),
+    sleep: realSleep,
     fs: defaultFs
   };
 }
@@ -259,42 +338,6 @@ async function defaultHeadCheckout(gh, env, mode) {
   const sha = env.GITHUB_SHA ?? "";
   if (!sha || await gh.branchHead(base) !== sha) return { ok: false, message: "default branch moved since checkout; re-run" };
   return { ok: true, base, sha };
-}
-
-// action/src/http.ts
-var TIMEOUT_MS = 3e4;
-var OSV_TIMEOUT_MS = 1e4;
-function redact(s, secrets) {
-  let out = s;
-  for (const sec of secrets) {
-    if (!sec) continue;
-    out = out.split(sec).join("***");
-  }
-  return out;
-}
-async function request(f, url, init, o) {
-  try {
-    return await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
-  } catch (e) {
-    const name = e?.name;
-    const why = name === "TimeoutError" || name === "AbortError" ? `timed out after ${o.timeoutMs / 1e3}s` : String(e?.message ?? e);
-    throw new Error(redact(`${o.label}: ${why}`, o.secrets ?? []));
-  }
-}
-async function httpError(res, o) {
-  let text = "";
-  try {
-    text = (await res.text()).slice(0, 300).replace(/\s+/g, " ").trim();
-  } catch {
-  }
-  return new Error(redact(`${o.label}: HTTP ${res.status}${text ? ` ${text}` : ""}`, o.secrets ?? []));
-}
-async function readJson(res, label) {
-  try {
-    return await res.json();
-  } catch {
-    throw new Error(`${label}: invalid JSON response`);
-  }
 }
 
 // action/src/github.ts
@@ -996,7 +1039,7 @@ function classify404(body) {
 function npmMetaPath(name) {
   return name.split("/").map((p) => encodeURIComponent(p).replace(/^%40/, "@")).join("%2f");
 }
-function decant(f, url, token) {
+function decant(f, url, token, retry = {}) {
   const base = url.replace(/\/+$/, "");
   const origin = new URL(base).origin;
   const basic = Buffer.from(`decant:${token}`).toString("base64");
@@ -1011,7 +1054,15 @@ function decant(f, url, token) {
       headers["content-type"] = "application/json";
       body = JSON.stringify(opts.body);
     }
-    return request(f, target2, { method, headers, body }, { label: `decant ${method} ${new URL(target2).pathname}`, timeoutMs: TIMEOUT_MS, secrets });
+    return requestWithRetry(f, target2, { method, headers, body }, {
+      label: `decant ${method} ${new URL(target2).pathname}`,
+      timeoutMs: TIMEOUT_MS,
+      secrets,
+      sleep: retry.sleep ?? realSleep,
+      random: retry.random,
+      now: retry.now,
+      retryStatuses: opts.retryStatuses
+    });
   }
   async function ok(res, label) {
     if (!res.ok) throw await httpError(res, { label, secrets });
@@ -1047,7 +1098,7 @@ function decant(f, url, token) {
     /** PUT the policy for `ref`. Never throws on an HTTP status: the caller reports {status, body}. */
     async syncPolicy(project, policy, sha, ref) {
       const parsed = typeof policy === "string" ? JSON.parse(policy) : policy;
-      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/policy`, { body: { policy: parsed, sha, ref } });
+      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/policy`, { body: { policy: parsed, sha, ref }, retryStatuses: false });
       const text = await res.text();
       let body = text;
       try {
@@ -1058,7 +1109,7 @@ function decant(f, url, token) {
     },
     /** PUT the default branch's dependency summary (sync token). Never throws on an HTTP status. */
     async syncDeps(project, sha, deps) {
-      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps } });
+      const res = await call("PUT", `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps }, retryStatuses: false });
       const text = await res.text();
       let body = text;
       try {
@@ -1527,7 +1578,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
         outcomes.push({ pkg: p, result: "failed", detail: `invalid package name ${safe2(g.name)}` });
       } else pkgs.push(p);
     }
-    const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
+    const client = decant(deps.fetch, inputs.decantUrl, inputs.token, { sleep: deps.sleep });
     const ctx = {
       deps,
       inputs,
@@ -1612,11 +1663,11 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
         );
       }
     } else lines.push("No fixable advisories.");
-    const count = (r) => outcomes.filter((o) => o.result === r).length;
+    const count2 = (r) => outcomes.filter((o) => o.result === r).length;
     lines.push(
       "",
       `Security PR: ${prLine}`,
-      `Packages fixed: ${count("fixed")} \xB7 declined: ${count("declined")} \xB7 unverified: ${count("unverified")} \xB7 unresolvable: ${count("unresolvable")} \xB7 failed: ${count("failed")}`,
+      `Packages fixed: ${count2("fixed")} \xB7 declined: ${count2("declined")} \xB7 unverified: ${count2("unverified")} \xB7 unresolvable: ${count2("unresolvable")} \xB7 failed: ${count2("failed")}`,
       `Unfixed advisories: ${unfixed.length}${unfixedIssue ? ` (issue #${unfixedIssue})` : ""}`,
       `Blocked versions in lockfiles: ${hits.length}${blockedIssue ? ` (issue #${blockedIssue})` : ""}`,
       `Prune: ${prune}`
@@ -1660,12 +1711,12 @@ async function syncOverlay(ctx, pkgs, outcomes) {
     const res = await ctx.client.syncPolicy(ctx.project, next, ctx.sha, OVERLAY_REF);
     if (res.status === 401 || res.status === 403) throw new Error(`decant PUT /api/projects/${ctx.project}/policy: HTTP ${res.status}`);
     if (res.status >= 200 && res.status < 300) return batch;
-    const failure = `overlay sync HTTP ${res.status}: ${errorText(res.body)}`;
+    const failure2 = `overlay sync HTTP ${res.status}: ${errorText(res.body)}`;
     const named = res.body?.entries;
     const rejected = Array.isArray(named) ? named.filter((e) => typeof e === "string") : [];
     const why = (p) => rejected.filter((e) => idsOf(p).includes(e.split(" ")[0]));
     const drop = batch.filter((p) => why(p).length);
-    if (attempt > 0 || !drop.length) throw new FatalError(failure);
+    if (attempt > 0 || !drop.length) throw new FatalError(failure2);
     for (const p of drop) outcomes.push({ pkg: p, result: "unverified", detail: `not verified by decant: ${why(p).join("; ")}` });
     batch = batch.filter((p) => !drop.includes(p));
   }
@@ -2106,6 +2157,35 @@ async function fileAtCommit(deps, wd, sha, rel) {
 // action/src/guarddog.ts
 import { fileURLToPath } from "node:url";
 var GUARDDOG_VERSION = "3.2.0";
+var MAX_LOCATIONS = 5;
+var MAX_MESSAGE = 200;
+var MAX_RULE = 100;
+var MAX_LOCATION = 200;
+function clip(s, n) {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length > n ? `${t.slice(0, n - 1)}\u2026` : t;
+}
+function finding(rule, count2, message, locations) {
+  const f = { rule: clip(rule, MAX_RULE) };
+  if (count2 !== void 0) f.count = count2;
+  if (typeof message === "string" && message.trim()) f.message = clip(message, MAX_MESSAGE);
+  const locs = [...new Set(locations.filter((l) => typeof l === "string" && l.trim() !== "").map((l) => clip(l, MAX_LOCATION)))];
+  if (locs.length) f.locations = locs.slice(0, MAX_LOCATIONS);
+  return f;
+}
+function normalizeFindings(details) {
+  if (!Array.isArray(details)) return [];
+  const out = [];
+  for (const d of details) {
+    if (typeof d === "string" && d.trim()) out.push({ rule: clip(d, MAX_RULE) });
+    else if (d && typeof d === "object" && typeof d.rule === "string") {
+      const o = d;
+      const count2 = typeof o.count === "number" && Number.isInteger(o.count) && o.count >= 0 ? o.count : void 0;
+      out.push(finding(o.rule, count2, o.message, Array.isArray(o.locations) ? o.locations : []));
+    }
+  }
+  return out;
+}
 function tail(s) {
   return s.trim().split("\n").slice(-5).join(" ").slice(0, 500);
 }
@@ -2168,17 +2248,52 @@ function parseGuardDogJson(stdout) {
   const details = [];
   for (const [rule, v] of Object.entries(doc.results).sort(([a], [b]) => a < b ? -1 : 1)) {
     if (rule.startsWith("capability-") || !hasFindings(v)) continue;
-    details.push(Array.isArray(v) ? `${rule} (${v.length})` : rule);
+    if (Array.isArray(v)) {
+      const hits = v.map((h) => h && typeof h === "object" ? h : {});
+      details.push(finding(rule, v.length, hits.map((h) => h.message).find((m) => typeof m === "string" && m.trim()), hits.map((h) => h.location)));
+    } else {
+      details.push(finding(rule, void 0, v, []));
+    }
   }
   if (Array.isArray(doc.risks) && doc.risks.length > 0) {
     const label = typeof doc.risk_score?.label === "string" ? doc.risk_score.label : "unlabelled";
-    details.push(`risk: ${label}`);
+    const locs = doc.risks.map((r) => r && typeof r === "object" ? r.threat_location : void 0);
+    details.push(finding("risk", doc.risks.length, label, locs));
   }
   return { result: details.length > 0 ? "flagged" : "clean", details };
 }
+var ARCHIVE_ANOMALY = "archive-anomaly";
+var ANOMALY_REASONS = [
+  {
+    re: /^multiple End-Of-Central-Directory records \(possible scan evasion via duplicate EOCD\)$/,
+    text: () => "multiple End-Of-Central-Directory records (possible scan evasion via duplicate EOCD)"
+  },
+  {
+    re: /^(\d{1,9}) ZIP local file headers but zipfile enumerates (\d{1,9}) members from the central directory \(possible scan evasion via EOCD size\/offset differential\)$/,
+    text: (m) => `${Number(m[1])} ZIP local file headers but zipfile enumerates ${Number(m[2])} members from the central directory (possible scan evasion via EOCD size/offset differential)`
+  }
+];
+function archiveAnomaly(r, path) {
+  if (r.code !== 1 || r.stdout.trim() !== "") return null;
+  const lines = r.stderr.split("\n").filter((l) => l.trim() !== "");
+  if (lines.length !== 1) return null;
+  const prefix = `ERROR: Error occurred while scanning target ${path}: 'archive parser anomaly: `;
+  const line2 = lines[0].replace(/\r$/, "");
+  if (!line2.startsWith(prefix) || !line2.endsWith("'")) return null;
+  const reason = line2.slice(prefix.length, -1);
+  for (const { re, text } of ANOMALY_REASONS) {
+    const m = re.exec(reason);
+    if (m) return `archive parser anomaly: ${text(m)}`;
+  }
+  return null;
+}
 async function scan(exec, bin, eco, path) {
   const r = await exec(bin, [eco, "scan", path, "--output-format", "json", "--sandbox"]);
-  if (r.code !== 0) throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+  if (r.code !== 0) {
+    const anomaly = archiveAnomaly(r, path);
+    if (anomaly) return { result: "flagged", details: [{ rule: ARCHIVE_ANOMALY, message: anomaly }] };
+    throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+  }
   return parseGuardDogJson(r.stdout);
 }
 var scanNpm = (exec, bin, tgzPath) => scan(exec, bin, "npm", tgzPath);
@@ -2201,6 +2316,20 @@ function fail(msg) {
   return 1;
 }
 var safe3 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var safeText = (s) => s.replace(/\s+/g, " ").replace(/[^A-Za-z0-9._~/+:,;=!?#%&*()'"{}$^ -]/g, "?");
+var count = (f) => f.count !== void 0 ? ` (${f.count})` : "";
+var NOT_SCANNED = "contents NOT scanned by GuardDog (archive anomaly; can be deliberate scan evasion). Inspect the archive manually before adding decant:reviewed";
+var notScanned = (f) => f.rule === ARCHIVE_ANOMALY;
+function findingText(f) {
+  const msg = f.message ? `: ${safeText(f.message)}` : "";
+  const at = f.locations?.length ? ` at ${f.locations.map(safeText).join(", ")}` : "";
+  return `${safe3(f.rule)}${count(f)}${msg}${at}${notScanned(f) ? ` - ${NOT_SCANNED}` : ""}`;
+}
+function findingLine(r, f) {
+  const msg = f.message ? `: \`${safeText(f.message)}\`` : "";
+  const at = f.locations?.length ? ` at ${f.locations.map((l) => `\`${safeText(l)}\``).join(", ")}` : "";
+  return `- \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` \`${safe3(f.rule)}\`${count(f)}${msg}${at}${notScanned(f) ? ` \u26A0\uFE0F **${NOT_SCANNED}**` : ""}`;
+}
 var isPackageLock2 = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
 var shellQuote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
 function newReviewScope(p) {
@@ -2241,6 +2370,7 @@ function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
   ].join("\n");
   const lines = [];
   let size2 = head.length;
+  let cut = false;
   for (const [i, r] of rows.entries()) {
     const vulns = r.vulns.length ? r.vulns.map((v) => `${safe3(v.id)} (${v.malicious ? "malicious" : v.severity})`).join(", ") : "\u2014";
     const status = r.problems.length ? `\u274C ${r.problems.join("; ")}` : r.warn ? `\u26A0\uFE0F ${r.notes.join("; ")}` : `\u2705 ${r.notes.length ? r.notes.join("; ") : "ok"}`;
@@ -2249,10 +2379,26 @@ function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
     if (size2 + line2.length + 1 > limit) {
       lines.push(`
 \u2026 and ${rows.length - i} more (see the job summary).`);
+      cut = true;
       break;
     }
     lines.push(line2);
     size2 += line2.length + 1;
+  }
+  const findings = rows.filter((r) => r.flagged).flatMap((r) => r.findings.length ? r.findings.map((f) => findingLine(r, f)) : [`- \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` (no rule details recorded)`]);
+  if (findings.length && !cut) {
+    const title = "\n### GuardDog findings\n";
+    lines.push(title);
+    size2 += title.length + 1;
+    for (const [i, line2] of findings.entries()) {
+      if (size2 + line2.length + 1 > limit) {
+        lines.push(`
+\u2026 and ${findings.length - i} more finding${findings.length - i === 1 ? "" : "s"} (see the job summary).`);
+        break;
+      }
+      lines.push(line2);
+      size2 += line2.length + 1;
+    }
   }
   return `${head}
 ${lines.join("\n")}
@@ -2374,7 +2520,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     }
     const registry = /* @__PURE__ */ new Map();
     const rows = [];
-    const row = (dep) => ({ dep, osv: "\u2014", guarddog: "\u2014", vulns: [], problems: [], notes: [], warn: false, flagged: false });
+    const row = (dep) => ({ dep, osv: "\u2014", guarddog: "\u2014", vulns: [], problems: [], notes: [], warn: false, flagged: false, findings: [] });
     for (const d of added) {
       if (d.source === "registry") {
         if (!registry.has(formatPackageId(d))) registry.set(formatPackageId(d), d);
@@ -2392,7 +2538,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     if (registry.size > MAX_DEPS2) return stop(`too many new dependencies (${registry.size}); split the change`);
     const regDeps = [...registry.values()];
     const vulnsByKey = regDeps.length ? await createOsv(deps.fetch).queryVulns(regDeps) : /* @__PURE__ */ new Map();
-    const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
+    const client = decant(deps.fetch, inputs.decantUrl, inputs.token, { sleep: deps.sleep });
     const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
     let gd = null;
     const guarddog = () => {
@@ -2442,6 +2588,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       if (cGd) {
         gdResult = cGd.result;
         r.guarddog = `${cGd.result} (cached)`;
+        r.findings = normalizeFindings(cGd.details);
         const status = await client.availability(d.eco, d.name, d.version, ref);
         if (status !== "ok") await unavailable(status);
       } else {
@@ -2456,15 +2603,18 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
           await client.putVerdict({ package: id, scanner: "guarddog", scannerVersion: GUARDDOG_VERSION, result: res.result, details: res.details });
           gdResult = res.result;
           r.guarddog = res.result;
-          if (res.details.length) r.notes.push(`GuardDog: ${res.details.map(safe3).join(", ")}`);
+          r.findings = res.details;
         }
       }
+      if (gdResult !== "clean" && r.findings.length) r.notes.push(`GuardDog: ${r.findings.map((f) => `${safe3(f.rule)}${count(f)}`).join(", ")}`);
       if (gdResult === "flagged") r.flagged = true;
     }
     const anyFlagged = regRows.some((r) => r.flagged);
     const reviewed = anyFlagged ? await gh.labelAddedByWriter(n, REVIEWED) : false;
     for (const r of regRows) {
       if (!r.flagged) continue;
+      const what = r.findings.length ? r.findings.map(findingText).join("; ") : "no rule details recorded";
+      warning(`${safe3(r.dep.name)}@${safe3(r.dep.version)} flagged by GuardDog: ${what}`);
       if (reviewed) r.notes.unshift(`flagged; ${REVIEWED} by a writer`);
       else r.problems.push(`flagged by GuardDog (needs ${REVIEWED} from a writer)`);
     }
@@ -2832,7 +2982,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     return fail3(`unsupported event ${event}`);
   }
   const project = inputs.project || policy.project;
-  const client = decant(deps.fetch, inputs.decantUrl, token);
+  const client = decant(deps.fetch, inputs.decantUrl, token, { sleep: deps.sleep });
   const res = await client.syncPolicy(project, raw, env.GITHUB_SHA ?? "", ref);
   if (res.status < 200 || res.status >= 300) return fail3(`decant rejected the policy (HTTP ${res.status}): ${errorText2(res.body)}`);
   if (event !== "pull_request") await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? "");

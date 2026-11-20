@@ -83,6 +83,7 @@ export function fakeDeps(over: Partial<ActionDeps> = {}): ActionDeps {
     fetch: (async () => new Response('not stubbed', { status: 599 })) as typeof fetch,
     exec: fakeExec(),
     now: () => new Date('2026-11-19T00:00:00Z'),
+    sleep: async () => {},
     fs: memFs(),
     ...over,
   };
