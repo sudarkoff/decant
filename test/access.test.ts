@@ -409,10 +409,13 @@ describe('/dashboard routing', () => {
     expect(res.status).toBe(200);
   });
 
-  it('/dashboard/api/* reaches the API stub (404) after auth', async () => {
+  it('/dashboard/api/* reaches the API after auth', async () => {
     const { e, deps, domain } = setup();
     const res = await handle(req('/dashboard/api/projects', await signRS256(kA, claims(domain))), e, deps, ctx);
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    const missing = await handle(req('/dashboard/api/nope', await signRS256(kA, claims(domain))), e, deps, ctx);
+    expect(missing.status).toBe(404);
   });
 
   it('non-GET methods get 405 after auth, 403 before', async () => {
