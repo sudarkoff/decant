@@ -2,6 +2,7 @@ import { env } from 'cloudflare:workers';
 import { applyD1Migrations } from 'cloudflare:test';
 import { beforeEach } from 'vitest';
 import { clearAuthCache, hashToken, newToken } from '../src/auth';
+import { configureRetryBudget } from '../src/d1-retry';
 import { clearDecisionCaches } from '../src/policy/decider';
 import { clearServeLogCache } from '../src/policy/store';
 import { configureStatsBuffer } from '../src/stats/record';
@@ -15,6 +16,7 @@ beforeEach(() => {
   clearAuthCache();
   clearDecisionCaches();
   clearServeLogCache();
+  configureRetryBudget();
 });
 await applyD1Migrations(
   (env as unknown as Env).DB,
