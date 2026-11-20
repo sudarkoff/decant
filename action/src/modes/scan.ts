@@ -264,7 +264,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
     let gd: Promise<GuardDog> | null = null;
     const guarddog = () => {
-      gd ??= installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionDir(env.GITHUB_ACTION_PATH));
+      gd ??= installGuardDog(deps.exec, deps.fs.readFile, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionDir(env.GITHUB_ACTION_PATH), env);
       return gd;
     };
     if (regDeps.length) await deps.fs.mkdir(scratch);

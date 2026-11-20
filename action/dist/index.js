@@ -2115,10 +2115,31 @@ function actionDir(override, moduleUrl = import.meta.url) {
 function requirementsPath(actionPath) {
   return `${actionPath.replace(/\/+$/, "")}/guarddog-requirements.txt`;
 }
-async function installGuardDog(exec, dir, actionPath) {
-  const venv = await exec("python3", ["-m", "venv", dir]);
-  if (venv.code !== 0) throw new Error(`python3 -m venv failed: ${tail(venv.stderr)}`);
+function pythonInterpreter(env) {
+  if (env.DECANT_PYTHON) return env.DECANT_PYTHON;
+  if (env.pythonLocation) return `${env.pythonLocation.replace(/\/+$/, "")}/bin/python`;
+  return "python3";
+}
+function supportedPythons(requirements) {
+  const m = /^# decant-python:([ \d.]+)$/m.exec(requirements);
+  const versions = (m?.[1] ?? "").trim().split(/\s+/).filter((v) => /^3\.\d+$/.test(v));
+  if (versions.length === 0) throw new Error('guarddog-requirements.txt has no "# decant-python:" header');
+  return versions;
+}
+async function installGuardDog(exec, readFile2, dir, actionPath, env) {
   const req = requirementsPath(actionPath);
+  const supported = supportedPythons(await readFile2(req));
+  const python = pythonInterpreter(env);
+  const ver = await exec(python, ["-c", 'import sys; print("%d.%d" % sys.version_info[:2])']);
+  if (ver.code !== 0) throw new Error(`${python} failed to run: ${tail(ver.stderr)}`);
+  const found = ver.stdout.trim();
+  if (!supported.includes(found)) {
+    throw new Error(
+      `GuardDog's pinned dependencies are built for Python ${supported.join(" or ")}, but ${python} is ${found || "unknown"}; add actions/setup-python with python-version: '${supported[0]}' before the decant scan step (see docs/adopt.md)`
+    );
+  }
+  const venv = await exec(python, ["-m", "venv", dir]);
+  if (venv.code !== 0) throw new Error(`${python} -m venv failed: ${tail(venv.stderr)}`);
   const pip = await exec(`${dir}/bin/pip`, [
     "install",
     "--disable-pip-version-check",
@@ -2375,7 +2396,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
     let gd = null;
     const guarddog = () => {
-      gd ??= installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionDir(env.GITHUB_ACTION_PATH));
+      gd ??= installGuardDog(deps.exec, deps.fs.readFile, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionDir(env.GITHUB_ACTION_PATH), env);
       return gd;
     };
     if (regDeps.length) await deps.fs.mkdir(scratch);

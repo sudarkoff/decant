@@ -25,13 +25,52 @@ export function requirementsPath(actionPath: string): string {
 }
 
 /**
- * Creates a venv at `dir` and installs the hash-locked GuardDog from `<actionPath>/guarddog-requirements.txt`.
- * Binary wheels only: no sdist build (and so no package build code) ever runs.
+ * The Python that builds GuardDog's venv: DECANT_PYTHON if set, else the one actions/setup-python
+ * installed (it exports pythonLocation), else python3 on PATH.
  */
-export async function installGuardDog(exec: Exec, dir: string, actionPath: string): Promise<GuardDog> {
-  const venv = await exec('python3', ['-m', 'venv', dir]);
-  if (venv.code !== 0) throw new Error(`python3 -m venv failed: ${tail(venv.stderr)}`);
+export function pythonInterpreter(env: Record<string, string | undefined>): string {
+  if (env.DECANT_PYTHON) return env.DECANT_PYTHON;
+  if (env.pythonLocation) return `${env.pythonLocation.replace(/\/+$/, '')}/bin/python`;
+  return 'python3';
+}
+
+/**
+ * The Python minor versions the requirements were compiled for, from their `# decant-python: 3.12 3.13`
+ * header line. A file without one throws: an unverified pairing is never installed.
+ */
+export function supportedPythons(requirements: string): string[] {
+  const m = /^# decant-python:([ \d.]+)$/m.exec(requirements);
+  const versions = (m?.[1] ?? '').trim().split(/\s+/).filter((v) => /^3\.\d+$/.test(v));
+  if (versions.length === 0) throw new Error('guarddog-requirements.txt has no "# decant-python:" header');
+  return versions;
+}
+
+/**
+ * Creates a venv at `dir` and installs the hash-locked GuardDog from `<actionPath>/guarddog-requirements.txt`.
+ * Binary wheels only: no sdist build (and so no package build code) ever runs. The pinned wheels exist only
+ * for the Python versions in the file's header, so any other interpreter fails before pip runs.
+ */
+export async function installGuardDog(
+  exec: Exec,
+  readFile: (p: string) => Promise<string>,
+  dir: string,
+  actionPath: string,
+  env: Record<string, string | undefined>,
+): Promise<GuardDog> {
   const req = requirementsPath(actionPath);
+  const supported = supportedPythons(await readFile(req));
+  const python = pythonInterpreter(env);
+  const ver = await exec(python, ['-c', 'import sys; print("%d.%d" % sys.version_info[:2])']);
+  if (ver.code !== 0) throw new Error(`${python} failed to run: ${tail(ver.stderr)}`);
+  const found = ver.stdout.trim();
+  if (!supported.includes(found)) {
+    throw new Error(
+      `GuardDog's pinned dependencies are built for Python ${supported.join(' or ')}, but ${python} is ${found || 'unknown'}; ` +
+        `add actions/setup-python with python-version: '${supported[0]}' before the decant scan step (see docs/adopt.md)`,
+    );
+  }
+  const venv = await exec(python, ['-m', 'venv', dir]);
+  if (venv.code !== 0) throw new Error(`${python} -m venv failed: ${tail(venv.stderr)}`);
   const pip = await exec(`${dir}/bin/pip`, [
     'install',
     '--disable-pip-version-check',
