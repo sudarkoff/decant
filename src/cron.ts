@@ -1,12 +1,90 @@
-import { maliciousIds } from './osv';
+import { vulnDetails, vulnIds, type VulnDetails } from './osv';
 import { addGlobalBlock, markOsvChecked } from './policy/store';
 import { formatPackageId, type Deps, type Ecosystem, type Env, type PackageRef } from './types';
 
 const BATCH = 1000;
 const MAX_BATCHES = 20;
 const OVERLAY_TTL_MS = 14 * 86400_000;
+const MAX_DETAIL_FETCHES = 200;
 
 interface VersionRow { eco: Ecosystem; name: string; version: string }
+
+type Details = Pick<VulnDetails, 'severity' | 'summary' | 'published'> & { pending?: true };
+/** Stored with checked_at = '' so a later run knows its details were never fetched (as opposed to fetched-but-empty). */
+const PLACEHOLDER: Details = { severity: 'unknown', summary: '', published: null, pending: true };
+
+/**
+ * Details per advisory id for one batch: reuse what `vulns` already holds, then fetch the rest from OSV
+ * (pending placeholders first, then new ids) until `budget.left` runs out. Ids left over get a pending placeholder.
+ */
+async function detailsFor(
+  env: Env,
+  deps: Deps,
+  ids: string[],
+  cache: Map<string, VulnDetails>,
+  budget: { left: number },
+): Promise<Map<string, Details>> {
+  const out = new Map<string, Details>();
+  if (ids.length === 0) return out;
+  const { results } = await env.DB.prepare(
+    'SELECT id, severity, summary, published, checked_at FROM vulns WHERE id IN (SELECT value FROM json_each(?))',
+  ).bind(JSON.stringify(ids)).all<{ id: string; severity: string; summary: string | null; published: string | null; checked_at: string }>();
+  const pending = new Set<string>();
+  for (const r of results) {
+    if (r.checked_at === '') pending.add(r.id);
+    else out.set(r.id, { severity: r.severity as Details['severity'], summary: r.summary ?? '', published: r.published });
+  }
+  const todo = ids.filter((id) => !out.has(id)).sort((a, b) => Number(pending.has(b)) - Number(pending.has(a)));
+  for (const id of todo) {
+    const cached = cache.get(id);
+    if (cached) { out.set(id, cached); continue; }
+    if (budget.left <= 0) { out.set(id, PLACEHOLDER); continue; }
+    budget.left--;
+    out.set(id, (await vulnDetails(deps, id, cache)) ?? PLACEHOLDER);
+  }
+  return out;
+}
+
+const RECORD_CHUNK = 200;
+
+/** Writes the vulns rows for a batch and drops rows of those versions whose id is gone, one D1 batch per 200 versions. */
+async function recordVulns(
+  env: Env,
+  batch: PackageRef[],
+  hits: Map<string, string[]>,
+  details: Map<string, Details>,
+  now: Date,
+): Promise<void> {
+  for (let i = 0; i < batch.length; i += RECORD_CHUNK) {
+    const chunk = batch.slice(i, i + RECORD_CHUNK);
+    const rows: (string | number | null)[][] = [];
+    for (const ref of chunk) {
+      for (const id of hits.get(formatPackageId(ref)) ?? []) {
+        const d = details.get(id) ?? PLACEHOLDER;
+        rows.push([ref.eco, ref.name, ref.version, id, d.severity, d.summary, d.published, d.pending ? 0 : 1]);
+      }
+    }
+    const rowsJson = JSON.stringify(rows);
+    const refsJson = JSON.stringify(chunk.map((r) => [r.eco, r.name, r.version]));
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT OR REPLACE INTO vulns (eco, name, version, id, severity, summary, published, checked_at)
+         SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+                json_extract(value, '$[4]'), json_extract(value, '$[5]'), json_extract(value, '$[6]'),
+                CASE WHEN json_extract(value, '$[7]') = 1 THEN ?2 ELSE '' END
+         FROM json_each(?1)`,
+      ).bind(rowsJson, now.toISOString()),
+      env.DB.prepare(
+        `DELETE FROM vulns
+         WHERE (eco, name, version) IN (
+           SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?1))
+         AND (eco, name, version, id) NOT IN (
+           SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]')
+           FROM json_each(?2))`,
+      ).bind(refsJson, rowsJson),
+    ]);
+  }
+}
 
 async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; blocked: number }> {
   const now = deps.now();
@@ -18,13 +96,16 @@ async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; bloc
 
   let checked = 0;
   let blocked = 0;
+  const cache = new Map<string, VulnDetails>(); // per run, never across requests
+  const budget = { left: MAX_DETAIL_FETCHES };
+  const done: { batch: PackageRef[]; hits: Map<string, string[]> }[] = [];
   for (let i = 0; i < refs.length; i += BATCH) {
     const batch = refs.slice(i, i + BATCH);
-    const hits = await maliciousIds(deps, batch);
+    const hits = await vulnIds(deps, batch);
     if (hits === null) break;
     for (const ref of batch) {
-      const ids = hits.get(formatPackageId(ref));
-      if (!ids) continue;
+      const ids = hits.get(formatPackageId(ref))?.filter((id) => id.startsWith('MAL-'));
+      if (!ids || ids.length === 0) continue;
       const existing = await env.DB.prepare(
         "SELECT 1 AS x FROM global_blocks WHERE eco = ? AND name = ? AND version = ? AND source = 'osv'",
       ).bind(ref.eco, ref.name, ref.version).first();
@@ -32,7 +113,18 @@ async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; bloc
       if (!existing) blocked++;
     }
     await markOsvChecked(env, batch, now);
+    done.push({ batch, hits });
     checked += batch.length;
+  }
+  // Best effort, and only after MAL blocking over ALL batches: detail fetches must never use up
+  // subrequests that a later batch's OSV query needs.
+  try {
+    for (const { batch, hits } of done) {
+      const details = await detailsFor(env, deps, [...new Set([...hits.values()].flat())], cache, budget);
+      await recordVulns(env, batch, hits, details, now);
+    }
+  } catch (err) {
+    console.error('cron: recording vulns failed', err instanceof Error ? err.name : 'error');
   }
   return { checked, blocked };
 }

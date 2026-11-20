@@ -1,5 +1,7 @@
 import { formatPackageId, type Deps, type Ecosystem, type PackageRef } from './types';
+import type { Severity } from './policy/schema';
 import { upstreamTimeout } from './upstream';
+import { severityOf } from './vuln-severity';
 
 const OSV = 'https://api.osv.dev';
 const OSV_ECO: Record<Ecosystem, string> = { npm: 'npm', go: 'Go' };
@@ -13,6 +15,10 @@ class Unavailable extends Error {}
 interface OsvVuln {
   id?: string;
   aliases?: string[];
+  published?: string;
+  summary?: string;
+  database_specific?: { severity?: unknown };
+  severity?: { type?: string; score?: string }[];
   affected?: { package?: { ecosystem?: string; name?: string } }[];
 }
 
@@ -56,14 +62,21 @@ async function okJson<T>(res: Response): Promise<T> {
  * Confirms that `advisory` covers ref.name in ref's ecosystem and that ref.version is NOT affected by it.
  * A CVE id that OSV does not index directly 404s → 'unknown-advisory' (cite the GHSA instead).
  */
-export async function verifyAdvisoryFix(deps: Deps, advisory: string, ref: PackageRef): Promise<AdvisoryCheck> {
+export async function verifyAdvisoryFix(
+  deps: Deps,
+  advisory: string,
+  ref: PackageRef,
+): Promise<{ result: AdvisoryCheck; published: string | null }> {
+  let published: string | null = null;
+  const done = (result: AdvisoryCheck) => ({ result, published });
   try {
     const res = await osvFetch(deps, `/v1/vulns/${encodeURIComponent(advisory)}`);
-    if (res.status >= 400 && res.status < 500) return 'unknown-advisory';
+    if (res.status >= 400 && res.status < 500) return done('unknown-advisory');
     const vuln = await okJson<OsvVuln>(res);
+    published = typeof vuln.published === 'string' ? vuln.published : null;
     const eco = OSV_ECO[ref.eco];
     const lists = (vuln.affected ?? []).some((a) => a.package?.ecosystem === eco && a.package?.name === ref.name);
-    if (!lists) return 'unknown-advisory';
+    if (!lists) return done('unknown-advisory');
 
     // Match the advisory under any of its names: the cited id, OSV's canonical id and its aliases
     // (e.g. a cited GHSA can come back from /v1/query as its GO- alias).
@@ -73,19 +86,21 @@ export async function verifyAdvisoryFix(deps: Deps, advisory: string, ref: Packa
       const q = { ...osvQuery(ref), ...(pageToken ? { page_token: pageToken } : {}) };
       const r = await okJson<{ vulns?: OsvVuln[]; next_page_token?: string }>(await osvFetch(deps, '/v1/query', q));
       const hit = (r.vulns ?? []).some((v) => (v.id !== undefined && ids.has(v.id)) || (v.aliases ?? []).some((a) => ids.has(a)));
-      if (hit) return 'not-fixed';
-      if (!r.next_page_token) return 'verified';
+      if (hit) return done('not-fixed');
+      if (!r.next_page_token) return done('verified');
       pageToken = r.next_page_token;
     }
-    return 'unavailable'; // too many pages to be sure: fail closed
+    return done('unavailable'); // too many pages to be sure: fail closed
   } catch (err) {
-    if (err instanceof Unavailable) return 'unavailable';
+    if (err instanceof Unavailable) return done('unavailable');
     throw err;
   }
 }
 
-/** packageId → MAL- advisory IDs, for refs with at least one. null if OSV is unavailable. */
-export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<string, string[]> | null> {
+export interface VulnDetails { severity: Severity | 'unknown'; summary: string; published: string | null }
+
+/** packageId → all advisory IDs, for refs with at least one. null if OSV is unavailable. */
+export async function vulnIds(deps: Deps, refs: PackageRef[]): Promise<Map<string, string[]> | null> {
   const out = new Map<string, string[]>();
   try {
     for (let i = 0; i < refs.length; i += BATCH_SIZE) {
@@ -102,10 +117,10 @@ export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<
         const next: typeof pending = [];
         results.forEach((res, j) => {
           const ref = pending[j]!.ref;
-          const mal = (res.vulns ?? []).map((v) => v.id).filter((id): id is string => !!id && id.startsWith('MAL-'));
-          if (mal.length > 0) {
+          const ids = (res.vulns ?? []).map((v) => v.id).filter((id): id is string => !!id);
+          if (ids.length > 0) {
             const key = formatPackageId(ref);
-            out.set(key, [...(out.get(key) ?? []), ...mal]);
+            out.set(key, [...new Set([...(out.get(key) ?? []), ...ids])]);
           }
           if (res.next_page_token) next.push({ ref, token: res.next_page_token });
         });
@@ -113,6 +128,42 @@ export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<
       }
     }
     return out;
+  } catch (err) {
+    if (err instanceof Unavailable) return null;
+    throw err;
+  }
+}
+
+/** packageId → MAL- advisory IDs, for refs with at least one. null if OSV is unavailable. */
+export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<string, string[]> | null> {
+  const all = await vulnIds(deps, refs);
+  if (all === null) return null;
+  const out = new Map<string, string[]>();
+  for (const [key, ids] of all) {
+    const mal = ids.filter((id) => id.startsWith('MAL-'));
+    if (mal.length > 0) out.set(key, mal);
+  }
+  return out;
+}
+
+/**
+ * Severity, summary (first 200 chars) and publish time of one OSV record (empty details if OSV 404s); null if OSV is unavailable.
+ * Successful lookups are memoised in `cache`, which the caller scopes to one run.
+ */
+export async function vulnDetails(deps: Deps, id: string, cache?: Map<string, VulnDetails>): Promise<VulnDetails | null> {
+  const hit = cache?.get(id);
+  if (hit) return hit;
+  try {
+    const res = await osvFetch(deps, `/v1/vulns/${encodeURIComponent(id)}`);
+    // A record OSV does not have (4xx) is a settled answer: empty details, so it is never re-fetched.
+    const v = res.status >= 400 && res.status < 500 ? {} : await okJson<OsvVuln>(res);
+    const d: VulnDetails = {
+      severity: severityOf(v),
+      summary: typeof v.summary === 'string' ? v.summary.slice(0, 200) : '',
+      published: typeof v.published === 'string' ? v.published : null,
+    };
+    cache?.set(id, d);
+    return d;
   } catch (err) {
     if (err instanceof Unavailable) return null;
     throw err;

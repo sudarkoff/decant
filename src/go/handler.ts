@@ -14,6 +14,7 @@ import {
   type PinnedTime,
 } from '../policy/store';
 import { compareVersions, isPrerelease, parseVersion } from '../semver';
+import { notePackageLatest, outcomeOf, recordRequest, tagOutcome } from '../stats/record';
 import { pump, readUpTo } from '../streams';
 import { formatPackageId, type Deps, type Env, type PackageRef } from '../types';
 import { cachedFetch, fetchHeaders } from '../upstream';
@@ -148,13 +149,21 @@ function infoResponse(body: ArrayBuffer, stale = false): Response {
   return new Response(body, { headers: { 'content-type': 'application/json', ...NO_STORE, ...staleHeader(stale) } });
 }
 
-async function handleLatest(env: Env, deps: Deps, rc: RequestCtx, mod: Mod): Promise<Response> {
+async function handleLatest(
+  env: Env,
+  deps: Deps,
+  ctx: ExecutionContext,
+  now: Date,
+  rc: RequestCtx,
+  mod: Mod,
+): Promise<Response> {
   const up = await cachedFetch(env, deps, { key: `go/${mod.esc}/@latest.raw`, url: `${PROXY}/${mod.esc}/@latest` });
   if (up.status === 'ok') {
     const i = parseInfo(up.body);
     if (i && parseVersion(i.version, 'go')) {
+      if (up.fresh) notePackageLatest(env, ctx, 'go', mod.name, i.version, i.time.toISOString(), now);
       // Pinning here also catches an upstream time change for an already-pinned version.
-      const pin = (await pinPublishTimes(env, 'go', mod.name, new Map([[i.version, i.time]]), deps.now())).get(i.version);
+      const pin = (await pinPublishTimes(env, 'go', mod.name, new Map([[i.version, i.time]]), now)).get(i.version);
       const d = await decider(env, deps, rc, 'go', mod.name);
       if (d(i.version, pin) === 'allow') return infoResponse(up.body, up.stale);
     }
@@ -173,7 +182,8 @@ async function handleLatest(env: Env, deps: Deps, rc: RequestCtx, mod: Mod): Pro
 }
 
 function notAvailable(id: string, d: Decision): Response {
-  return err(404, `${id} is not available: ${d === 'blocked' ? 'blocked' : 'in cooldown'}`);
+  const blocked = d === 'blocked';
+  return tagOutcome(err(404, `${id} is not available: ${blocked ? 'blocked' : 'in cooldown'}`), blocked ? 'blocked' : 'cooldown');
 }
 
 /**
@@ -230,13 +240,13 @@ async function handleFile(
   env: Env,
   deps: Deps,
   ctx: ExecutionContext,
+  now: Date,
   rc: RequestCtx,
   route: Extract<Route, { kind: 'file' }>,
 ): Promise<Response> {
   const { mod, escVer, version, ext } = route;
   const ref: PackageRef = { eco: 'go', name: mod.name, version };
   const id = `${mod.name}@${version}`;
-  const now = deps.now();
 
   let state = await getVersionState(env, ref);
   if (!state) {
@@ -315,12 +325,22 @@ export async function handleGo(
   if (path === '/sumdb' || path.startsWith('/sumdb/')) return err(404, 'not found');
   const route = parsePath(path);
   if (!route) return err(404, 'not found');
+  const now = deps.now();
+  let res: Response;
   switch (route.kind) {
     case 'list':
-      return handleList(env, deps, rc, route.mod);
+      res = await handleList(env, deps, rc, route.mod);
+      break;
     case 'latest':
-      return handleLatest(env, deps, rc, route.mod);
+      res = await handleLatest(env, deps, ctx, now, rc, route.mod);
+      break;
     case 'file':
-      return handleFile(env, deps, ctx, rc, route);
+      res = await handleFile(env, deps, ctx, now, rc, route);
+      break;
   }
+  // list, .info and @latest are metadata; .mod and .zip are downloads.
+  const kind = route.kind === 'file' && route.ext !== 'info' ? 'download' : 'metadata';
+  const outcome = outcomeOf(res);
+  if (outcome) recordRequest(env, ctx, rc.projectId, 'go', kind, outcome, now);
+  return res;
 }

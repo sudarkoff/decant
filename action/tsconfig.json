@@ -10,5 +10,5 @@
     "skipLibCheck": true,
     "isolatedModules": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "build.d.mts", "../src/ids.ts", "../src/policy/schema.ts", "../src/go/escape.ts", "../src/semver.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "build.d.mts", "../src/ids.ts", "../src/policy/schema.ts", "../src/go/escape.ts", "../src/semver.ts", "../src/vuln-severity.ts"]
 }

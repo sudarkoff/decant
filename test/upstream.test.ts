@@ -21,9 +21,9 @@ describe('cachedFetch', () => {
     const t = { ms: T0 };
     const d = mk(f, t);
     const r1 = await cachedFetch(e, d, { key, url });
-    expect(r1).toMatchObject({ status: 'ok', stale: false });
+    expect(r1).toMatchObject({ status: 'ok', stale: false, fresh: true });
     t.ms = T0 + 300_000;
-    await cachedFetch(e, d, { key, url });
+    expect(await cachedFetch(e, d, { key, url })).toMatchObject({ status: 'ok', stale: false, fresh: false });
     expect(f.calls.length).toBe(1);
     t.ms = T0 + 301_000;
     await cachedFetch(e, d, { key, url });
@@ -91,7 +91,7 @@ describe('cachedFetch', () => {
     await cachedFetch(e, d, { key, url });
     status = 404;
     t.ms = T0 + 400_000;
-    expect(await cachedFetch(e, d, { key, url })).toMatchObject({ status: 'ok', stale: true });
+    expect(await cachedFetch(e, d, { key, url })).toMatchObject({ status: 'ok', stale: true, fresh: false });
     const key2 = k();
     expect(await cachedFetch(e, d, { key: key2, url })).toEqual({ status: 'not-found' });
     expect(await e.BUCKET.head(key2)).toBeNull();

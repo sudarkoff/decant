@@ -9,7 +9,8 @@ export interface CachedFetchOpts {
 }
 
 export type CachedFetchResult =
-  | { status: 'ok'; body: ArrayBuffer; stale: boolean }
+  /** fresh: this call fetched the body from upstream (not served from R2). */
+  | { status: 'ok'; body: ArrayBuffer; stale: boolean; fresh: boolean }
   | { status: 'not-found' }
   | { status: 'unavailable' };
 
@@ -52,16 +53,16 @@ async function run(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedF
   let storedBody: ArrayBuffer | null = null;
   if (stored) {
     storedBody = await stored.arrayBuffer();
-    if (opts.immutable) return { status: 'ok', body: storedBody, stale: false };
+    if (opts.immutable) return { status: 'ok', body: storedBody, stale: false, fresh: false };
     const fetchedAt = Date.parse(stored.customMetadata?.fetchedAt ?? '');
     const maxAgeMs = (opts.maxAgeSec ?? DEFAULT_MAX_AGE_SEC) * 1000;
     if (!Number.isNaN(fetchedAt) && deps.now().getTime() - fetchedAt <= maxAgeMs) {
-      return { status: 'ok', body: storedBody, stale: false };
+      return { status: 'ok', body: storedBody, stale: false, fresh: false };
     }
   }
 
   const fallback = (): CachedFetchResult =>
-    storedBody ? { status: 'ok', body: storedBody, stale: true } : { status: 'unavailable' };
+    storedBody ? { status: 'ok', body: storedBody, stale: true, fresh: false } : { status: 'unavailable' };
 
   // The whole exchange (headers and body) shares one timeout: a hung upstream falls back to the stored copy.
   const signal = AbortSignal.timeout(upstreamTimeout(deps));
@@ -86,10 +87,10 @@ async function run(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedF
       // Cache write is best-effort; we already have the body.
       console.warn(`upstream cache write failed for key ${opts.key}`);
     }
-    return { status: 'ok', body, stale: false };
+    return { status: 'ok', body, stale: false, fresh: true };
   }
   if (res.status === 404) {
-    return storedBody ? { status: 'ok', body: storedBody, stale: true } : { status: 'not-found' };
+    return storedBody ? { status: 'ok', body: storedBody, stale: true, fresh: false } : { status: 'not-found' };
   }
   // 5xx (incl. 429) and anything else unexpected: serve stored copy if any.
   return fallback();

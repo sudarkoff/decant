@@ -250,6 +250,46 @@ describe('policy sync', () => {
     expect((await loadPolicyView(e, 'pb', null, 'npm', 'plain')).allowed).toEqual(new Set(['1.0.0']));
   });
 
+  it('stores advisory_published and keeps first_synced_at across re-syncs of main', async () => {
+    const T = await seedProject(e, 'pfirst');
+    const f = fakeFetch({
+      [`${OSV}/v1/vulns/${GHSA}`]: Response.json({ id: GHSA, published: '2021-02-15T00:00:00Z', affected: [{ package: { ecosystem: 'npm', name: 'lodash' } }] }),
+      [`${OSV}/v1/query`]: Response.json({}),
+    });
+    const at = (iso: string, p: unknown) =>
+      handle(
+        new Request('https://h/api/projects/pfirst/policy', {
+          method: 'PUT',
+          headers: { authorization: `Bearer ${T.sync}` },
+          body: JSON.stringify({ policy: p, sha: 'abc123', ref: 'main' }),
+        }),
+        e,
+        { fetch: f, now: fixedClock(iso) },
+        ctx,
+      );
+    const rows = async () =>
+      (await e.DB.prepare("SELECT name, advisory_published, first_synced_at FROM allows WHERE project_id = 'pfirst' ORDER BY name").all()).results;
+
+    expect((await at('2026-11-10T00:00:00Z', policy('pfirst', { allow: [allow('npm:lodash@4.17.21', GHSA), allow('npm:plain@1.0.0')] }))).status).toBe(200);
+    expect(await rows()).toEqual([
+      { name: 'lodash', advisory_published: '2021-02-15T00:00:00Z', first_synced_at: '2026-11-10T00:00:00.000Z' },
+      { name: 'plain', advisory_published: null, first_synced_at: '2026-11-10T00:00:00.000Z' },
+    ]);
+
+    // Re-sync with a new entry: existing rows keep their first sync, the new one gets now.
+    const next = policy('pfirst', { allow: [allow('npm:lodash@4.17.21', GHSA), allow('npm:plain@1.0.0'), allow('npm:fresh@2.0.0')] });
+    expect((await at('2026-11-18T00:00:00Z', next)).status).toBe(200);
+    expect(await rows()).toEqual([
+      { name: 'fresh', advisory_published: null, first_synced_at: '2026-11-18T00:00:00.000Z' },
+      { name: 'lodash', advisory_published: '2021-02-15T00:00:00Z', first_synced_at: '2026-11-10T00:00:00.000Z' },
+      { name: 'plain', advisory_published: null, first_synced_at: '2026-11-10T00:00:00.000Z' },
+    ]);
+
+    // Dropped entries are removed.
+    expect((await at('2026-11-19T00:00:00Z', policy('pfirst', { allow: [allow('npm:plain@1.0.0')] }))).status).toBe(200);
+    expect(await rows()).toEqual([{ name: 'plain', advisory_published: null, first_synced_at: '2026-11-10T00:00:00.000Z' }]);
+  });
+
   it('syncs a large policy (200 plain allows, 100 blocks) in a handful of statements', async () => {
     const pd = await seedProject(e, 'pd');
     const allows = Array.from({ length: 200 }, (_, i) => allow(`npm:many@1.0.${i}`));

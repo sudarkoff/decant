@@ -93,11 +93,11 @@ describe('loadPolicyView', () => {
       e.DB.prepare(
         "INSERT INTO policies VALUES ('lv', 'main', ?, 'sha', 'x')",
       ).bind(JSON.stringify({ project: 'lv', cooldownDays: 3, autoShip: {}, allow: [], block: [] })),
-      e.DB.prepare("INSERT INTO allows VALUES ('lv','main','npm','a','1.0.0',NULL,'r',NULL)"),
-      e.DB.prepare("INSERT INTO allows VALUES ('lv','main','npm','a','2.0.0','GHSA-aaaa-bbbb-cccc','r',NULL)"),
-      e.DB.prepare("INSERT INTO allows VALUES ('lv','main','npm','a','3.0.0','GHSA-aaaa-bbbb-cccc','r','x')"),
-      e.DB.prepare("INSERT INTO allows VALUES ('lv','main','npm','b','1.0.0',NULL,'r',NULL)"),
-      e.DB.prepare("INSERT INTO allows VALUES ('lv','main','go','a','1.5.0',NULL,'r',NULL)"),
+      e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('lv','main','npm','a','1.0.0',NULL,'r',NULL)"),
+      e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('lv','main','npm','a','2.0.0','GHSA-aaaa-bbbb-cccc','r',NULL)"),
+      e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('lv','main','npm','a','3.0.0','GHSA-aaaa-bbbb-cccc','r','x')"),
+      e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('lv','main','npm','b','1.0.0',NULL,'r',NULL)"),
+      e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('lv','main','go','a','1.5.0',NULL,'r',NULL)"),
     ]);
     const v = await loadPolicyView(e, 'lv', null, 'npm', 'a');
     expect(v.cooldownDays).toBe(3);
@@ -106,8 +106,8 @@ describe('loadPolicyView', () => {
 
   it('includes the overlay ref and is scoped to one package', async () => {
     await e.DB.batch([
-      e.DB.prepare("INSERT INTO allows VALUES ('lv','pr-9','npm','a','4.0.0',NULL,'r',NULL)"),
-      e.DB.prepare("INSERT INTO allows VALUES ('lv','pr-8','npm','a','5.0.0',NULL,'r',NULL)"),
+      e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('lv','pr-9','npm','a','4.0.0',NULL,'r',NULL)"),
+      e.DB.prepare("INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at) VALUES ('lv','pr-8','npm','a','5.0.0',NULL,'r',NULL)"),
     ]);
     expect((await loadPolicyView(e, 'lv', 'pr-9', 'npm', 'a')).allowed).toEqual(new Set(['1.0.0', '3.0.0', '4.0.0']));
     expect((await loadPolicyView(e, 'lv', null, 'npm', 'b')).allowed).toEqual(new Set(['1.0.0']));

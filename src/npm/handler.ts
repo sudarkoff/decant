@@ -12,6 +12,7 @@ import {
   pinPublishTimes,
   type PinnedTime,
 } from '../policy/store';
+import { notePackageLatest, outcomeOf, recordRequest, tagOutcome } from '../stats/record';
 import { pump, readUpTo } from '../streams';
 import { formatPackageId, type Deps, type Env, type PackageRef } from '../types';
 import { cachedFetch, fetchHeaders } from '../upstream';
@@ -45,7 +46,13 @@ function parsePath(path: string): { name: string; file: string | null } | null {
 
 type DocResult = { ok: true; doc: Packument; stale: boolean } | { ok: false; res: Response };
 
-async function fetchDoc(env: Env, deps: Deps, name: string, abbrev: boolean): Promise<DocResult> {
+/** Recording context: notes the upstream latest version whenever a document is refetched. */
+interface Rec {
+  ctx: ExecutionContext;
+  now: Date;
+}
+
+async function fetchDoc(env: Env, deps: Deps, rec: Rec, name: string, abbrev: boolean): Promise<DocResult> {
   const r = await cachedFetch(env, deps, {
     key: `npm/meta/${abbrev ? 'abbrev' : 'full'}/${name}.json`,
     url: `${REGISTRY}/${name.replace('/', '%2f')}`,
@@ -56,6 +63,7 @@ async function fetchDoc(env: Env, deps: Deps, name: string, abbrev: boolean): Pr
   // Only the parsed object leaves this function: the raw bytes and decoded text become garbage on return,
   // before the caller filters and re-stringifies. Each call parses its own object, so callers may mutate it.
   const doc = parseDoc(r.body);
+  if (doc && r.fresh) noteLatest(env, rec, name, doc, abbrev);
   return doc ? { ok: true, doc, stale: r.stale } : { ok: false, res: err(502, 'invalid upstream document') };
 }
 
@@ -67,6 +75,14 @@ function parseDoc(body: ArrayBuffer): Packument | null {
     // fall through
   }
   return null;
+}
+
+/** Abbreviated documents carry no `time`, so their latest is noted without one. */
+function noteLatest(env: Env, rec: Rec, name: string, doc: Packument, abbrev: boolean): void {
+  const latest: unknown = doc['dist-tags']?.latest;
+  if (typeof latest !== 'string') return;
+  const t: unknown = abbrev ? null : doc.time?.[latest];
+  notePackageLatest(env, rec.ctx, 'npm', name, latest, typeof t === 'string' ? t : null, rec.now);
 }
 
 /** Publish times of listed versions, from a full document's `time`. */
@@ -82,18 +98,23 @@ function publishTimes(full: Packument): Map<string, Date> {
 }
 
 /** Publish times from the full document; the (large) full document itself is dropped on return. */
-async function fullDocTimes(env: Env, deps: Deps, name: string): Promise<{ times: Map<string, Date>; stale: boolean } | null> {
-  const full = await fetchDoc(env, deps, name, false);
+async function fullDocTimes(
+  env: Env,
+  deps: Deps,
+  rec: Rec,
+  name: string,
+): Promise<{ times: Map<string, Date>; stale: boolean } | null> {
+  const full = await fetchDoc(env, deps, rec, name, false);
   return full.ok ? { times: publishTimes(full.doc), stale: full.stale } : null;
 }
 
-async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx, name: string): Promise<Response> {
+async function handleMetadata(req: Request, env: Env, deps: Deps, rec: Rec, rc: RequestCtx, name: string): Promise<Response> {
   const abbrev = (req.headers.get('accept') ?? '').includes(ABBREV);
-  const r = await fetchDoc(env, deps, name, abbrev);
+  const r = await fetchDoc(env, deps, rec, name, abbrev);
   if (!r.ok) return r.res;
   const doc = r.doc;
   const versions = Object.keys(doc.versions ?? {});
-  const now = deps.now();
+  const now = rec.now;
   let stale = r.stale;
 
   let pinned: Map<string, PinnedTime>;
@@ -103,7 +124,7 @@ async function handleMetadata(req: Request, env: Env, deps: Deps, rc: RequestCtx
     pinned = await getPinnedTimes(env, 'npm', name, versions);
     if (versions.some((v) => !pinned.has(v))) {
       // Times only live in the full document. If it can't be had, unpinned versions stay hidden.
-      const times = await fullDocTimes(env, deps, name);
+      const times = await fullDocTimes(env, deps, rec, name);
       if (times) {
         stale ||= times.stale;
         for (const [v, p] of await pinPublishTimes(env, 'npm', name, times.times, now)) pinned.set(v, p);
@@ -203,26 +224,30 @@ async function storeTarball(
   }
 }
 
+function notAvailable(id: string, blocked: boolean): Response {
+  return tagOutcome(err(404, `${id} is not available: ${blocked ? 'blocked' : 'in cooldown'}`), blocked ? 'blocked' : 'cooldown');
+}
+
 async function handleTarball(
   env: Env,
   deps: Deps,
-  ctx: ExecutionContext,
+  rec: Rec,
   rc: RequestCtx,
   name: string,
   file: string,
 ): Promise<Response> {
+  const { ctx, now } = rec;
   const basename = name.split('/').pop()!;
   if (!file.startsWith(`${basename}-`) || !file.endsWith('.tgz')) return err(404, 'not found');
   const version = file.slice(basename.length + 1, -'.tgz'.length);
   if (!version) return err(404, 'not found');
   const ref: PackageRef = { eco: 'npm', name, version };
   const id = formatPackageId(ref);
-  const now = deps.now();
 
   let full: Packument | null = null;
   let state = await getVersionState(env, ref);
   if (!state) {
-    const r = await fetchDoc(env, deps, name, false);
+    const r = await fetchDoc(env, deps, rec, name, false);
     if (!r.ok) return r.res;
     full = r.doc;
     if (!full.versions?.[version]) return err(404, `${id} not found`);
@@ -231,7 +256,7 @@ async function handleTarball(
   }
 
   const d = (await decider(env, deps, rc, 'npm', name))(version, state);
-  if (d !== 'allow') return err(404, `${id} is not available: ${d === 'blocked' ? 'blocked' : 'in cooldown'}`);
+  if (d !== 'allow') return notAvailable(id, d === 'blocked');
 
   const serve = () => ctx.waitUntil(logServe(env, rc.projectId, ref, now).catch(() => console.warn(`serve log failed ${id}`)));
   const key = `npm/tar/${name}/${file}`;
@@ -250,13 +275,13 @@ async function handleTarball(
       const ids = mal.get(id);
       if (ids && ids.length > 0) {
         await addGlobalBlock(env, ref, 'osv', ids.join(', '), now);
-        return err(404, `${id} is not available: blocked`);
+        return notAvailable(id, true);
       }
     }
   }
 
   if (!full) {
-    const r = await fetchDoc(env, deps, name, false);
+    const r = await fetchDoc(env, deps, rec, name, false);
     if (!r.ok) return r.res;
     full = r.doc;
   }
@@ -321,7 +346,12 @@ export async function handleNpm(
 
   const parsed = parsePath(path);
   if (!parsed) return err(404, 'not found');
-  return parsed.file === null
-    ? handleMetadata(req, env, deps, rc, parsed.name)
-    : handleTarball(env, deps, ctx, rc, parsed.name, parsed.file);
+  const rec: Rec = { ctx, now: deps.now() };
+  const res =
+    parsed.file === null
+      ? await handleMetadata(req, env, deps, rec, rc, parsed.name)
+      : await handleTarball(env, deps, rec, rc, parsed.name, parsed.file);
+  const outcome = outcomeOf(res);
+  if (outcome) recordRequest(env, ctx, rc.projectId, 'npm', parsed.file === null ? 'metadata' : 'download', outcome, rec.now);
+  return res;
 }
