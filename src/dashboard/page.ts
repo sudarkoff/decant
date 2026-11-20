@@ -14,7 +14,7 @@ const STYLE = String.raw`
   color-scheme: light dark;
   --bg: #f6f7f9; --surface: #ffffff; --text: #15171b; --muted: #555c68;
   --accent: #0e6e5c; --on-accent: #ffffff; --warn: #8a4a06; --danger: #a1290f;
-  --border: #e3e6ea; --control: #d5d9df;
+  --border: #e3e6ea; --control: #868e99;
   --danger-edge: #f0c9c0; --warn-edge: #ecd9b5;
   --c-served: #0e6e5c; --c-cooldown: #b0650a; --c-blocked: #a1290f; --c-stale: #4b62a8; --c-failed: #6b2a7a;
 }
@@ -22,7 +22,7 @@ const STYLE = String.raw`
   :root {
     --bg: #111315; --surface: #1a1d21; --text: #e8eaed; --muted: #a8afba;
     --accent: #4fc3a8; --on-accent: #0b1a16; --warn: #f0a54a; --danger: #ff8f78;
-    --border: #2d3238; --control: #454b54;
+    --border: #2d3238; --control: #6b737e;
     --danger-edge: #6a2a1e; --warn-edge: #5e4320;
     --c-served: #4fc3a8; --c-cooldown: #f0a54a; --c-blocked: #ff8f78; --c-stale: #8ea6f0; --c-failed: #d39ae2;
   }
@@ -222,14 +222,32 @@ const SCRIPT = String.raw`
   }
 
   /** Loads one section, ignoring responses that arrive after a newer request for the same section. */
-  function load(name, path, targets, render) {
+  function load(name, path, targets, render, onError) {
     var n = (seq[name] || 0) + 1;
     seq[name] = n;
+    var fail = function (msg) {
+      targets.forEach(function (t) { clear(t); line(t, msg, 'error'); });
+      if (onError) onError();
+    };
     targets.forEach(function (t) { clear(t); line(t, 'Loading…', 'status'); });
     return getJson(path).then(
-      function (data) { if (seq[name] === n) { targets.forEach(clear); render(data); } },
-      function (e) { if (seq[name] === n) targets.forEach(function (t) { clear(t); line(t, e.message, 'error'); }); }
+      function (data) {
+        if (seq[name] !== n) return;
+        targets.forEach(clear);
+        try { render(data); } catch (e) { fail('Could not render.'); }
+      },
+      function (e) { if (seq[name] === n) fail(e.message); }
     );
+  }
+  /** One line of counts; each count is its own span, coloured only when it is non-zero. */
+  function counts(parent, prefix, parts) {
+    var p = el('p');
+    if (prefix) p.appendChild(document.createTextNode(prefix));
+    parts.forEach(function (x, i) {
+      if (i) p.appendChild(document.createTextNode(' · '));
+      p.appendChild(el('span', x[0] > 0 ? x[2] : null, fmt(x[0]) + ' ' + x[1]));
+    });
+    parent.appendChild(p);
   }
 
   // ---- Needs attention / Recently resolved ----
@@ -336,12 +354,16 @@ const SCRIPT = String.raw`
   // ---- Security / Freshness / Uptime / Policy ----
   function renderSecurity(s) {
     var box = $('security');
-    line(box, plural(s.blocksHit, 'block hit', 'blocks hit') + ' · ' + plural(s.maliciousHits, 'malicious hit', 'malicious hits'),
-      s.blocksHit || s.maliciousHits ? 'danger' : null);
+    counts(box, '', [
+      [s.blocksHit, s.blocksHit === 1 ? 'block hit' : 'blocks hit', 'danger'],
+      [s.maliciousHits, s.maliciousHits === 1 ? 'malicious hit' : 'malicious hits', 'danger']
+    ]);
     var v = s.vulnsBySeverity;
-    line(box, 'Known vulnerabilities installed: ' + fmt(v.critical) + ' critical · ' + fmt(v.high) + ' high · ' + fmt(v.moderate) +
-      ' moderate · ' + fmt(v.low) + ' low · ' + fmt(v.unknown) + ' unknown', v.critical || v.high ? 'warn' : null);
-    line(box, plural(s.flagged.length, 'scanner flag', 'scanner flags'), s.flagged.length ? 'warn' : null);
+    counts(box, 'Known vulnerabilities installed: ', [
+      [v.critical, 'critical', 'danger'], [v.high, 'high', 'warn'], [v.moderate, 'moderate', 'warn'],
+      [v.low, 'low', null], [v.unknown, 'unknown', null]
+    ]);
+    counts(box, '', [[s.flagged.length, s.flagged.length === 1 ? 'scanner flag' : 'scanner flags', 'warn']]);
     if (s.flagged.length) {
       var fl = el('ul', 'plain muted');
       s.flagged.forEach(function (f) { fl.appendChild(el('li', null, f.package + ' · ' + f.scanner)); });
@@ -422,10 +444,16 @@ const SCRIPT = String.raw`
     wrap.appendChild(table);
     box.appendChild(wrap);
   }
-  function loadPackages() {
+  /** fromPage: the page shown before a Prev/Next click, restored if that request fails. */
+  function loadPackages(fromPage) {
     $('prev').disabled = true;
     $('next').disabled = true;
-    return load('packages', 'packages?' + scope() + '&page=' + state.page + '&q=' + encodeURIComponent(state.q), [$('packages')], renderPackages);
+    return load('packages', 'packages?' + scope() + '&page=' + state.page + '&q=' + encodeURIComponent(state.q), [$('packages')], renderPackages,
+      function () {
+        if (fromPage !== undefined) state.page = fromPage;
+        $('prev').disabled = state.page <= 1;
+        $('next').disabled = false;
+      });
   }
 
   function loadAll() {
@@ -463,8 +491,8 @@ const SCRIPT = String.raw`
     var v = e.target.value;
     timer = setTimeout(function () { state.q = v.trim(); state.page = 1; loadPackages(); }, 300);
   });
-  $('prev').addEventListener('click', function () { if (state.page > 1) { state.page--; loadPackages(); } });
-  $('next').addEventListener('click', function () { state.page++; loadPackages(); });
+  $('prev').addEventListener('click', function () { if (state.page > 1) { state.page--; loadPackages(state.page + 1); } });
+  $('next').addEventListener('click', function () { state.page++; loadPackages(state.page - 1); });
 
   function start() {
     readUrl();
