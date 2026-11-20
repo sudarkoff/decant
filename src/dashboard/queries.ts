@@ -253,14 +253,11 @@ export async function freshness(db: D1Database, project: string, from: string, n
   const direct: (MajorBehind & { classified: boolean })[] = [];
   const transitive: (MajorBehind & { via: string[] })[] = [];
   for (const x of majorBehind) {
-    const s = summaries.get(x.project);
-    if (!s) {
-      direct.push({ ...x, classified: false });
-      continue;
-    }
-    const info = s.get(x.package);
-    if (info?.direct) direct.push({ ...x, classified: true });
-    else transitive.push({ ...x, via: [...(info?.via ?? [])].sort().slice(0, MAX_VIA) });
+    // No summary for the project, or the package is not in it (served outside the lockfiles): unknown.
+    const info = summaries.get(x.project)?.get(x.package);
+    if (!info) direct.push({ ...x, classified: false });
+    else if (info.direct) direct.push({ ...x, classified: true });
+    else transitive.push({ ...x, via: [...info.via].sort().slice(0, MAX_VIA) });
   }
   return { medianAgeDays: median(ages), majorBehind: { direct, transitive }, transitiveMajorBehindCount: transitive.length, minorAvailable };
 }
@@ -268,15 +265,22 @@ export async function freshness(db: D1Database, project: string, from: string, n
 type MajorBehind = { project: string; package: string; version: string; latest: string };
 const MAX_VIA = 5;
 
-/** project → (eco:name → direct anywhere in the summary, union of via). Missing or corrupt rows are absent. */
+/** project → (eco:name → direct anywhere in the summary, union of via). Missing or corrupt rows, or a failed read, are absent. */
 async function depSummaries(db: D1Database, projects: string[]): Promise<Map<string, Map<string, { direct: boolean; via: Set<string> }>>> {
   const out = new Map<string, Map<string, { direct: boolean; via: Set<string> }>>();
   if (projects.length === 0) return out;
-  const r = await db
-    .prepare('SELECT project_id, json FROM project_deps WHERE project_id IN (SELECT value FROM json_each(?1))')
-    .bind(JSON.stringify(projects))
-    .all<{ project_id: string; json: string }>();
-  for (const row of r.results) {
+  let rows: { project_id: string; json: string }[];
+  try {
+    const r = await db
+      .prepare('SELECT project_id, json FROM project_deps WHERE project_id IN (SELECT value FROM json_each(?1))')
+      .bind(JSON.stringify(projects))
+      .all<{ project_id: string; json: string }>();
+    rows = r.results;
+  } catch {
+    // e.g. migration 0006 not applied yet: Freshness still works, unclassified.
+    return out;
+  }
+  for (const row of rows) {
     let list: unknown;
     try {
       list = JSON.parse(row.json);

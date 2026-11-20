@@ -57,14 +57,16 @@ describe('freshness: direct vs transitive', () => {
 
   it('splits by the synced summary; transitive lists who holds it back', async () => {
     const body = await freshness('fa');
-    expect(body.majorBehind.direct).toEqual([{ project: 'fa', package: 'npm:react', version: '17.0.0', latest: '19.0.0', classified: true }]);
+    expect(body.majorBehind.direct).toEqual([
+      { project: 'fa', package: 'npm:react', version: '17.0.0', latest: '19.0.0', classified: true },
+      // served but absent from the summary: unknown, so listed as direct and unclassified
+      { project: 'fa', package: 'npm:unlisted', version: '1.0.0', latest: '2.0.0', classified: false },
+    ]);
     expect(body.majorBehind.transitive).toEqual([
       { project: 'fa', package: 'go:example.com/m', version: 'v1.0.0', latest: 'v3.0.0', via: [] },
       { project: 'fa', package: 'npm:glob', version: '7.2.0', latest: '11.0.0', via: ['eslint', 'jest', 'rimraf'] },
-      // served but absent from the summary: not direct
-      { project: 'fa', package: 'npm:unlisted', version: '1.0.0', latest: '2.0.0', via: [] },
     ]);
-    expect(body.transitiveMajorBehindCount).toBe(3);
+    expect(body.transitiveMajorBehindCount).toBe(2);
   });
 
   it('a project without a summary stays unclassified (listed as direct)', async () => {
@@ -81,13 +83,38 @@ describe('freshness: direct vs transitive', () => {
     expect(body.majorBehind.direct).toEqual([
       { project: 'fb', package: 'npm:glob', version: '7.2.0', latest: '11.0.0', classified: false },
       { project: 'fa', package: 'npm:react', version: '17.0.0', latest: '19.0.0', classified: true },
+      { project: 'fa', package: 'npm:unlisted', version: '1.0.0', latest: '2.0.0', classified: false },
     ]);
     expect(body.majorBehind.transitive.map((x: { project: string; package: string }) => `${x.project} ${x.package}`)).toEqual([
       'fa go:example.com/m',
       'fa npm:glob',
-      'fa npm:unlisted',
     ]);
-    expect(body.transitiveMajorBehindCount).toBe(3);
+    expect(body.transitiveMajorBehindCount).toBe(2);
+  });
+
+  it('before migration 0006 (no project_deps table) everything is unclassified, not an error', async () => {
+    const real = e.DB;
+    const db = new Proxy(real, {
+      get(t, k) {
+        if (k === 'prepare') {
+          return (sql: string) => {
+            if (sql.includes('project_deps')) throw new Error('D1_ERROR: no such table: project_deps');
+            return t.prepare(sql);
+          };
+        }
+        const v = Reflect.get(t, k);
+        return typeof v === 'function' ? v.bind(t) : v;
+      },
+    });
+    e = { ...e, DB: db };
+    try {
+      const body = await freshness('fa');
+      expect(body.majorBehind.transitive).toEqual([]);
+      expect(body.majorBehind.direct.every((x: { classified: boolean }) => !x.classified)).toBe(true);
+      expect(body.majorBehind.direct).toHaveLength(4);
+    } finally {
+      e = { ...e, DB: real };
+    }
   });
 
   it('a corrupt summary row is treated as missing', async () => {
