@@ -56,7 +56,10 @@ export async function handleDashboardApi(req: Request, env: Env, deps: Deps, pat
       case 'attention': {
         range();
         const r = Number(qs.get('range') ?? '30') as 7 | 30 | 90;
-        return ok(await attention(env, await project(), r, deps.now()));
+        const p = await project();
+        // attention() writes alerts_state; a HEAD must not run the diff.
+        if (req.method === 'HEAD') return new Response(null, { status: 200, headers: { 'content-type': 'application/json', ...NO_STORE } });
+        return ok(await attention(env, p, r, deps.now()));
       }
       case 'policy':
         return ok(await policies(db, await project()));

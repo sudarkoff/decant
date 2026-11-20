@@ -160,6 +160,20 @@ describe('dashboard api: seeded', () => {
     }
   });
 
+  it('HEAD attention returns an empty 200 without touching alerts_state', async () => {
+    const count = async () => (await e.DB.prepare('SELECT COUNT(*) AS n FROM alerts_state').first<{ n: number }>())!.n;
+    await e.DB.prepare('DELETE FROM alerts_state').run();
+    const r = await get('attention', 'HEAD');
+    expect(r.status).toBe(200);
+    expect(r.body).toBeNull();
+    expect(r.res.headers.get('content-type')).toBe('application/json');
+    expect(r.res.headers.get('cache-control')).toBe('no-store');
+    expect(await count()).toBe(0);
+    // The same request as GET does run the diff (the seed has open items).
+    expect((await get('attention')).body.open.length).toBeGreaterThan(0);
+    expect(await count()).toBeGreaterThan(0);
+  });
+
   it('projects lists ids', async () => {
     expect((await get('projects')).body).toEqual({ projects: [{ id: 'other' }, { id: 'twocal' }] });
   });

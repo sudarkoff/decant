@@ -391,7 +391,7 @@ describe('/dashboard routing', () => {
     return { e: accessEnv(domain, aud), deps: { fetch, now: fixedClock(T0) } as Deps, fetch, domain: domain ?? '' };
   }
 
-  it('serves the page placeholder at /dashboard and /dashboard/ with a valid token', async () => {
+  it('serves the page at /dashboard and /dashboard/ with a valid token', async () => {
     const { e, deps, domain } = setup();
     const tok = await signRS256(kA, claims(domain));
     for (const path of ['/dashboard', '/dashboard/']) {
@@ -399,7 +399,10 @@ describe('/dashboard routing', () => {
       expect(res.status).toBe(200);
       expect(res.headers.get('content-type')).toMatch(/^text\/html/);
       expect(res.headers.get('cache-control')).toBe('no-store');
-      expect(await res.text()).toContain('decant dashboard');
+      expect(res.headers.get('content-security-policy')).toBe(
+        "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'",
+      );
+      expect(await res.text()).toContain('Needs attention');
     }
   });
 
