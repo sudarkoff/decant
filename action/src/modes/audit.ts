@@ -230,7 +230,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       } else pkgs.push(p);
     }
 
-    const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
+    const client = decant(deps.fetch, inputs.decantUrl, inputs.token, { sleep: deps.sleep });
     const ctx: FixCtx = {
       deps,
       inputs,

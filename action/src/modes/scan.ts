@@ -302,7 +302,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     // 3. OSV for all at once, then verdicts / download / GuardDog per package.
     const regDeps = [...registry.values()];
     const vulnsByKey = regDeps.length ? await createOsv(deps.fetch).queryVulns(regDeps) : new Map<string, Vuln[]>();
-    const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
+    const client = decant(deps.fetch, inputs.decantUrl, inputs.token, { sleep: deps.sleep });
     const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
     let gd: Promise<GuardDog> | null = null;
     const guarddog = () => {

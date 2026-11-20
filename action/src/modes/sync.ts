@@ -144,7 +144,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   }
 
   const project = inputs.project || policy.project;
-  const client = decant(deps.fetch, inputs.decantUrl, token);
+  const client = decant(deps.fetch, inputs.decantUrl, token, { sleep: deps.sleep });
   const res = await client.syncPolicy(project, raw, env.GITHUB_SHA ?? '', ref);
   if (res.status < 200 || res.status >= 300) return fail(`decant rejected the policy (HTTP ${res.status}): ${errorText(res.body)}`);
   if (event !== 'pull_request') await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? '');

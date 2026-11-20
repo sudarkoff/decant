@@ -1,5 +1,6 @@
 import * as nodeFs from 'node:fs/promises';
 import { defaultExec, type Exec } from './exec';
+import { realSleep } from './http';
 
 export type Fs = {
   readFile(p: string): Promise<string>;
@@ -20,6 +21,8 @@ export type ActionDeps = {
   fetch: typeof fetch;
   exec: Exec;
   now: () => Date;
+  /** Waits `ms` (retry backoff); tests inject a no-op. */
+  sleep: (ms: number) => Promise<void>;
   fs: Fs;
 };
 
@@ -61,6 +64,7 @@ export function defaultDeps(): ActionDeps {
     fetch: globalThis.fetch,
     exec: defaultExec,
     now: () => new Date(),
+    sleep: realSleep,
     fs: defaultFs,
   };
 }

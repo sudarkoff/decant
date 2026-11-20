@@ -100,6 +100,106 @@ describe('decant client', () => {
   });
 });
 
+describe('retries connection-level failures', () => {
+  /** What undici's fetch throws when the connection drops before a response. */
+  const netErr = (code: string, message = `read ${code}`) => new TypeError('fetch failed', { cause: Object.assign(new Error(message), { code }) });
+  const v = { package: 'npm:a@1.0.0', scanner: 's', scannerVersion: '1', result: 'clean' as const };
+
+  /** A fetch that plays `script` in order (a thrown Error or a Response), recording calls. */
+  function scripted(script: (Error | Response)[]) {
+    const calls: { method: string; url: string; body: unknown }[] = [];
+    const f = (async (u: string, init: RequestInit) => {
+      calls.push({ method: init.method ?? 'GET', url: u, body: init.body });
+      const next = script.shift();
+      if (!next) throw new Error('script exhausted');
+      if (next instanceof Error) throw next;
+      return next;
+    }) as unknown as typeof fetch;
+    const sleeps: number[] = [];
+    const client = decant(f, URL_, TOKEN, { sleep: async (ms) => void sleeps.push(ms), random: () => 0.5 });
+    return { client, calls, sleeps };
+  }
+
+  it('a GET that drops twice then succeeds returns the result after backoff', async () => {
+    const s = scripted([netErr('ECONNRESET'), netErr('ECONNRESET'), jsonRes({ verdicts: [v] })]);
+    expect(await s.client.getVerdicts('npm:a@1.0.0')).toEqual([v]);
+    expect(s.calls).toHaveLength(3);
+    expect(s.sleeps).toEqual([500, 1000]);
+  });
+
+  it('gives up after 4 attempts with the cause in the message', async () => {
+    const s = scripted([netErr('ECONNRESET'), netErr('ECONNRESET'), netErr('ECONNRESET'), netErr('ECONNRESET')]);
+    await expect(s.client.getVerdicts('npm:a@1.0.0')).rejects.toThrow(/^decant GET \/api\/verdicts: fetch failed \(ECONNRESET\) after 4 attempts$/);
+    expect(s.calls).toHaveLength(4);
+    expect(s.sleeps).toEqual([500, 1000, 2000]);
+  });
+
+  it('names a cause without its code in the message', async () => {
+    const s = scripted(Array.from({ length: 4 }, () => netErr('UND_ERR_SOCKET', 'other side closed')));
+    await expect(s.client.blocks()).rejects.toThrow('decant GET /api/blocks: fetch failed (UND_ERR_SOCKET: other side closed) after 4 attempts');
+  });
+
+  it('jitters the backoff', async () => {
+    const sleeps: number[] = [];
+    let n = 0;
+    const f = (async () => {
+      if (n++ < 3) throw netErr('ETIMEDOUT');
+      return jsonRes({ blocks: [] });
+    }) as unknown as typeof fetch;
+    await decant(f, URL_, TOKEN, { sleep: async (ms) => void sleeps.push(ms), random: () => 0 }).blocks();
+    const hi: number[] = [];
+    n = 0;
+    await decant(f, URL_, TOKEN, { sleep: async (ms) => void hi.push(ms), random: () => 0.999 }).blocks();
+    for (const [i, base] of [500, 1000, 2000].entries()) {
+      expect(sleeps[i]).toBeGreaterThanOrEqual(base * 0.75);
+      expect(hi[i]).toBeLessThanOrEqual(base * 1.25);
+      expect(hi[i]).toBeGreaterThan(sleeps[i]!);
+    }
+  });
+
+  it('PUT /api/verdicts retries 502/503/504 with the same body', async () => {
+    const s = scripted([new Response('bad gateway', { status: 502 }), new Response('', { status: 503 }), new Response('', { status: 504 }), new Response(null, { status: 204 })]);
+    await s.client.putVerdict(v);
+    expect(s.calls.map((c) => c.method)).toEqual(['PUT', 'PUT', 'PUT', 'PUT']);
+    expect(new Set(s.calls.map((c) => c.body)).size).toBe(1);
+  });
+
+  it('a 5xx that persists is reported as that HTTP status after 4 attempts', async () => {
+    const s = scripted(Array.from({ length: 4 }, () => new Response('unavailable', { status: 503 })));
+    await expect(s.client.putVerdict(v)).rejects.toThrow(/^decant PUT \/api\/verdicts: HTTP 503 unavailable$/);
+    expect(s.calls).toHaveLength(4);
+  });
+
+  it('the policy sync (idempotent PUT) retries a 503 and returns the final status', async () => {
+    const s = scripted([new Response('', { status: 503 }), jsonRes({ ref: 'pr-3' })]);
+    expect(await s.client.syncPolicy('proj', { project: 'proj' }, 'abc', 'pr-3')).toEqual({ status: 200, body: { ref: 'pr-3' } });
+    expect(s.calls).toHaveLength(2);
+  });
+
+  it('never retries a 4xx or a plain 500', async () => {
+    for (const status of [400, 401, 404, 409, 429, 500]) {
+      const s = scripted([new Response('no', { status }), new Response(null, { status: 204 })]);
+      await s.client.putVerdict(v).catch(() => {});
+      expect(s.calls).toHaveLength(1);
+      expect(s.sleeps).toEqual([]);
+    }
+  });
+
+  it('retries a timeout', async () => {
+    const t = () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' });
+    const s = scripted([t(), t(), t(), t()]);
+    await expect(s.client.blocks()).rejects.toThrow('decant GET /api/blocks: timed out (30s) after 4 attempts');
+  });
+
+  it('never puts the token in the final error', async () => {
+    const leaky = new TypeError('fetch failed', { cause: Object.assign(new Error(`socket for Bearer ${TOKEN}`), { code: 'ECONNRESET' }) });
+    const s = scripted([leaky, leaky, leaky, leaky]);
+    const err = await s.client.blocks().catch((e: Error) => e);
+    expect((err as Error).message).toContain('after 4 attempts');
+    expect((err as Error).message).not.toContain(TOKEN);
+  });
+});
+
 describe('availability (review fix: cached verdicts still check the ref)', () => {
   it('npm: a listed version is ok after one metadata GET, with no tarball download', async () => {
     const f = fakeFetch(() => jsonRes({ versions: { '1.0.0': { dist: { tarball: `${URL_}/r/pr-1/npm/a/-/a-1.0.0.tgz` } } } }));

@@ -37,6 +37,75 @@ var defaultExec = (cmd, args, opts = {}) => new Promise((resolve4) => {
   child.stdin.end(opts.input ?? "");
 });
 
+// action/src/http.ts
+var TIMEOUT_MS = 3e4;
+var OSV_TIMEOUT_MS = 1e4;
+function redact(s, secrets) {
+  let out = s;
+  for (const sec of secrets) {
+    if (!sec) continue;
+    out = out.split(sec).join("***");
+  }
+  return out;
+}
+async function request(f, url, init, o) {
+  try {
+    return await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
+  } catch (e) {
+    throw new Error(redact(`${o.label}: ${failure(e, o.timeoutMs)}`, o.secrets ?? []));
+  }
+}
+var isTimeout = (e) => ["TimeoutError", "AbortError"].includes(e?.name);
+function failure(e, timeoutMs) {
+  if (isTimeout(e)) return `timed out after ${timeoutMs / 1e3}s`;
+  const msg = String(e?.message ?? e);
+  const cause = e?.cause;
+  const code = typeof cause?.code === "string" ? cause.code : "";
+  const cmsg = typeof cause?.message === "string" ? cause.message : "";
+  const why = code && cmsg && !cmsg.includes(code) ? `${code}: ${cmsg}` : code || cmsg;
+  return why && !msg.includes(why) ? `${msg} (${why})` : msg;
+}
+var RETRY_DELAYS_MS = [500, 1e3, 2e3];
+var RETRY_STATUSES = /* @__PURE__ */ new Set([502, 503, 504]);
+var realSleep = (ms) => new Promise((resolve4) => setTimeout(resolve4, ms));
+async function requestWithRetry(f, url, init, o) {
+  const attempts = RETRY_DELAYS_MS.length + 1;
+  const random = o.random ?? Math.random;
+  for (let i = 0; ; i++) {
+    const last = i === attempts - 1;
+    let res;
+    try {
+      res = await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
+    } catch (e) {
+      if (last) {
+        const why = isTimeout(e) ? `timed out (${o.timeoutMs / 1e3}s)` : failure(e, o.timeoutMs);
+        throw new Error(redact(`${o.label}: ${why} after ${attempts} attempts`, o.secrets ?? []));
+      }
+      await o.sleep(Math.round(RETRY_DELAYS_MS[i] * (0.75 + 0.5 * random())));
+      continue;
+    }
+    if (last || !RETRY_STATUSES.has(res.status)) return res;
+    await res.body?.cancel().catch(() => {
+    });
+    await o.sleep(Math.round(RETRY_DELAYS_MS[i] * (0.75 + 0.5 * random())));
+  }
+}
+async function httpError(res, o) {
+  let text = "";
+  try {
+    text = (await res.text()).slice(0, 300).replace(/\s+/g, " ").trim();
+  } catch {
+  }
+  return new Error(redact(`${o.label}: HTTP ${res.status}${text ? ` ${text}` : ""}`, o.secrets ?? []));
+}
+async function readJson(res, label) {
+  try {
+    return await res.json();
+  } catch {
+    throw new Error(`${label}: invalid JSON response`);
+  }
+}
+
 // action/src/deps.ts
 var defaultFs = {
   readFile: (p) => nodeFs.readFile(p, "utf8"),
@@ -74,6 +143,7 @@ function defaultDeps() {
     fetch: globalThis.fetch,
     exec: defaultExec,
     now: () => /* @__PURE__ */ new Date(),
+    sleep: realSleep,
     fs: defaultFs
   };
 }
@@ -259,42 +329,6 @@ async function defaultHeadCheckout(gh, env, mode) {
   const sha = env.GITHUB_SHA ?? "";
   if (!sha || await gh.branchHead(base) !== sha) return { ok: false, message: "default branch moved since checkout; re-run" };
   return { ok: true, base, sha };
-}
-
-// action/src/http.ts
-var TIMEOUT_MS = 3e4;
-var OSV_TIMEOUT_MS = 1e4;
-function redact(s, secrets) {
-  let out = s;
-  for (const sec of secrets) {
-    if (!sec) continue;
-    out = out.split(sec).join("***");
-  }
-  return out;
-}
-async function request(f, url, init, o) {
-  try {
-    return await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
-  } catch (e) {
-    const name = e?.name;
-    const why = name === "TimeoutError" || name === "AbortError" ? `timed out after ${o.timeoutMs / 1e3}s` : String(e?.message ?? e);
-    throw new Error(redact(`${o.label}: ${why}`, o.secrets ?? []));
-  }
-}
-async function httpError(res, o) {
-  let text = "";
-  try {
-    text = (await res.text()).slice(0, 300).replace(/\s+/g, " ").trim();
-  } catch {
-  }
-  return new Error(redact(`${o.label}: HTTP ${res.status}${text ? ` ${text}` : ""}`, o.secrets ?? []));
-}
-async function readJson(res, label) {
-  try {
-    return await res.json();
-  } catch {
-    throw new Error(`${label}: invalid JSON response`);
-  }
 }
 
 // action/src/github.ts
@@ -996,7 +1030,7 @@ function classify404(body) {
 function npmMetaPath(name) {
   return name.split("/").map((p) => encodeURIComponent(p).replace(/^%40/, "@")).join("%2f");
 }
-function decant(f, url, token) {
+function decant(f, url, token, retry = {}) {
   const base = url.replace(/\/+$/, "");
   const origin = new URL(base).origin;
   const basic = Buffer.from(`decant:${token}`).toString("base64");
@@ -1011,7 +1045,13 @@ function decant(f, url, token) {
       headers["content-type"] = "application/json";
       body = JSON.stringify(opts.body);
     }
-    return request(f, target2, { method, headers, body }, { label: `decant ${method} ${new URL(target2).pathname}`, timeoutMs: TIMEOUT_MS, secrets });
+    return requestWithRetry(f, target2, { method, headers, body }, {
+      label: `decant ${method} ${new URL(target2).pathname}`,
+      timeoutMs: TIMEOUT_MS,
+      secrets,
+      sleep: retry.sleep ?? realSleep,
+      random: retry.random
+    });
   }
   async function ok(res, label) {
     if (!res.ok) throw await httpError(res, { label, secrets });
@@ -1527,7 +1567,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
         outcomes.push({ pkg: p, result: "failed", detail: `invalid package name ${safe2(g.name)}` });
       } else pkgs.push(p);
     }
-    const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
+    const client = decant(deps.fetch, inputs.decantUrl, inputs.token, { sleep: deps.sleep });
     const ctx = {
       deps,
       inputs,
@@ -1660,12 +1700,12 @@ async function syncOverlay(ctx, pkgs, outcomes) {
     const res = await ctx.client.syncPolicy(ctx.project, next, ctx.sha, OVERLAY_REF);
     if (res.status === 401 || res.status === 403) throw new Error(`decant PUT /api/projects/${ctx.project}/policy: HTTP ${res.status}`);
     if (res.status >= 200 && res.status < 300) return batch;
-    const failure = `overlay sync HTTP ${res.status}: ${errorText(res.body)}`;
+    const failure2 = `overlay sync HTTP ${res.status}: ${errorText(res.body)}`;
     const named = res.body?.entries;
     const rejected = Array.isArray(named) ? named.filter((e) => typeof e === "string") : [];
     const why = (p) => rejected.filter((e) => idsOf(p).includes(e.split(" ")[0]));
     const drop = batch.filter((p) => why(p).length);
-    if (attempt > 0 || !drop.length) throw new FatalError(failure);
+    if (attempt > 0 || !drop.length) throw new FatalError(failure2);
     for (const p of drop) outcomes.push({ pkg: p, result: "unverified", detail: `not verified by decant: ${why(p).join("; ")}` });
     batch = batch.filter((p) => !drop.includes(p));
   }
@@ -2462,7 +2502,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     if (registry.size > MAX_DEPS2) return stop(`too many new dependencies (${registry.size}); split the change`);
     const regDeps = [...registry.values()];
     const vulnsByKey = regDeps.length ? await createOsv(deps.fetch).queryVulns(regDeps) : /* @__PURE__ */ new Map();
-    const client = decant(deps.fetch, inputs.decantUrl, inputs.token);
+    const client = decant(deps.fetch, inputs.decantUrl, inputs.token, { sleep: deps.sleep });
     const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
     let gd = null;
     const guarddog = () => {
@@ -2906,7 +2946,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     return fail3(`unsupported event ${event}`);
   }
   const project = inputs.project || policy.project;
-  const client = decant(deps.fetch, inputs.decantUrl, token);
+  const client = decant(deps.fetch, inputs.decantUrl, token, { sleep: deps.sleep });
   const res = await client.syncPolicy(project, raw, env.GITHUB_SHA ?? "", ref);
   if (res.status < 200 || res.status >= 300) return fail3(`decant rejected the policy (HTTP ${res.status}): ${errorText2(res.body)}`);
   if (event !== "pull_request") await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? "");

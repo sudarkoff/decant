@@ -54,7 +54,8 @@ type World = {
   priorComment?: boolean;
   autoMerge?: boolean;
   python?: string;
-  gdExit?: { code: number; stderr: string };
+  gdExit?: { code: number; stderr: string; stdout?: string };
+  dropVerdictGets?: number;
 };
 
 function harness(w: World) {
@@ -85,9 +86,14 @@ function harness(w: World) {
   const removed: string[] = [];
   const patched: string[] = [];
   const graphql: { query: string; variables: Record<string, unknown> }[] = [];
+  let drops = w.dropVerdictGets ?? 0;
   const f = fakeFetch((c: FetchCall) => {
     const u = new URL(c.url);
     const key = `${c.method} ${c.url}`;
+    if (drops > 0 && key.startsWith(`GET ${D}/api/verdicts?`)) {
+      drops--;
+      throw new TypeError('fetch failed', { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) });
+    }
     if (key.startsWith(`GET ${D}/api/verdicts?`)) {
       const pkg = u.searchParams.get('package')!;
       return jsonRes({ verdicts: (w.verdicts?.[pkg] ?? []).map((v) => ({ package: pkg, scannerVersion: 'x', ...v })) });
@@ -581,6 +587,20 @@ describe('scan: GuardDog findings in the report', () => {
     expect(await h.run()).toBe(1);
     expect(h.comments[0]).toContain('scan error');
     expect(h.puts).not.toContainEqual(expect.objectContaining({ scanner: 'guarddog' }));
+  });
+});
+
+describe('scan: retries to decant', () => {
+  it('a dropped connection on GET /api/verdicts is retried and the scan passes', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), dropVerdictGets: 2 });
+    expect(await h.run()).toBe(0);
+    expect(h.f.calls.filter((c) => c.url.startsWith(`${D}/api/verdicts?`))).toHaveLength(3);
+  });
+
+  it('a connection that stays down is a scan error naming the cause and attempts', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), dropVerdictGets: 4 });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('left-pad@1.3.0: decant GET /api/verdicts: fetch failed (UND_ERR_SOCKET: other side closed) after 4 attempts');
   });
 });
 

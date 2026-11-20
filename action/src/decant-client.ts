@@ -1,5 +1,5 @@
 import { escapeModulePath } from '../../src/go/escape';
-import { httpError, readJson, request, TIMEOUT_MS } from './http';
+import { httpError, readJson, realSleep, requestWithRetry, TIMEOUT_MS } from './http';
 
 export type VerdictResult = 'clean' | 'flagged' | 'malicious';
 export type Verdict = {
@@ -39,8 +39,17 @@ function npmMetaPath(name: string): string {
 /**
  * Client for the decant Worker. `token` is a ci token for /api (verdicts, blocks, status, overlay
  * syncs) or a sync token for main-ref policy syncs. The token goes only to `url`'s origin.
+ *
+ * Every request is retried on a connection-level failure or a 502/503/504 (see requestWithRetry). That
+ * is safe because every call is idempotent: GETs; PUT /api/verdicts, which never lowers a stored
+ * verdict's severity; and the policy and deps PUTs, which replace the ref's whole state.
  */
-export function decant(f: typeof fetch, url: string, token: string) {
+export function decant(
+  f: typeof fetch,
+  url: string,
+  token: string,
+  retry: { sleep?: (ms: number) => Promise<void>; random?: () => number } = {},
+) {
   const base = url.replace(/\/+$/, '');
   const origin = new URL(base).origin;
   const basic = Buffer.from(`decant:${token}`).toString('base64');
@@ -56,7 +65,13 @@ export function decant(f: typeof fetch, url: string, token: string) {
       headers['content-type'] = 'application/json';
       body = JSON.stringify(opts.body);
     }
-    return request(f, target, { method, headers, body }, { label: `decant ${method} ${new URL(target).pathname}`, timeoutMs: TIMEOUT_MS, secrets });
+    return requestWithRetry(f, target, { method, headers, body }, {
+      label: `decant ${method} ${new URL(target).pathname}`,
+      timeoutMs: TIMEOUT_MS,
+      secrets,
+      sleep: retry.sleep ?? realSleep,
+      random: retry.random,
+    });
   }
 
   async function ok<T>(res: Response, label: string): Promise<T> {
