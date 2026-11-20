@@ -1,12 +1,21 @@
 import { env } from 'cloudflare:workers';
 import { applyD1Migrations } from 'cloudflare:test';
-import { hashToken, newToken } from '../src/auth';
+import { beforeEach } from 'vitest';
+import { clearAuthCache, hashToken, newToken } from '../src/auth';
+import { clearDecisionCaches } from '../src/policy/decider';
+import { clearServeLogCache } from '../src/policy/store';
 import { configureStatsBuffer } from '../src/stats/record';
 import type { Env } from '../src/types';
 
 // Setup (runs via vitest setupFiles): apply migrations/ to the test D1.
 // Request counts are written on every request in tests (production buffers them; see stats/record.ts).
 configureStatsBuffer({ intervalMs: 0 });
+// Each test starts with empty per-isolate caches (tests share an isolate and a fixed clock).
+beforeEach(() => {
+  clearAuthCache();
+  clearDecisionCaches();
+  clearServeLogCache();
+});
 await applyD1Migrations(
   (env as unknown as Env).DB,
   (env as unknown as { TEST_MIGRATIONS: Parameters<typeof applyD1Migrations>[1] }).TEST_MIGRATIONS,

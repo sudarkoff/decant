@@ -1,6 +1,7 @@
 import { hashToken, newToken, type AuthCtx } from '../auth';
 import { json } from '../http';
 import { verifyAdvisoryFix } from '../osv';
+import { clearDecisionCaches, forgetDenied } from '../policy/decider';
 import { parsePolicy, type Policy } from '../policy/schema';
 import { globalBlockStmt } from '../policy/store';
 import { PROJECT_ID_RE as ID_RE } from '../ids';
@@ -259,6 +260,7 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
     }
   }
   await db.batch(stmts);
+  clearDecisionCaches(); // this isolate at once; others within POLICY_TTL_MS
   return reply({ ref, allows: policy.allow.length, blocks: policy.block.length });
 }
 
@@ -344,6 +346,7 @@ async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): P
     stmts.push(globalBlockStmt(env, ref, `verdict:${scanner}`, `malicious verdict from ${scanner} ${scannerVersion}`, now));
   }
   await env.DB.batch(stmts);
+  if (result === 'malicious') forgetDenied(ref.eco, ref.name);
   return new Response(null, { status: 204, headers: NO_STORE });
 }
 

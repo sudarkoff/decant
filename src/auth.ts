@@ -1,3 +1,4 @@
+import { TtlCache } from './cache';
 import type { Env } from './types';
 
 export type AuthCtx = { kind: 'operator' } | { kind: 'read' | 'ci' | 'sync'; projectId: string };
@@ -47,16 +48,31 @@ function extractToken(req: Request): string | null {
   }
 }
 
-export async function authenticate(req: Request, env: Env): Promise<AuthCtx | null> {
+/**
+ * Token rows found in D1, cached per isolate for TOKEN_TTL_MS: a deleted (revoked) token stops working
+ * within that bound. A token not found is never cached, so a new token works at once.
+ */
+export const TOKEN_TTL_MS = 60_000;
+const tokens = new TtlCache<AuthCtx>(1_000);
+
+export function clearAuthCache(): void {
+  tokens.clear();
+}
+
+export async function authenticate(req: Request, env: Env, nowMs: number = Date.now()): Promise<AuthCtx | null> {
   const token = extractToken(req);
   if (!token) return null;
   const hash = await hashToken(token);
   // Tolerate a pasted secret with stray whitespace or uppercase hex. An empty hash never authenticates.
   const op = (env.OPERATOR_TOKEN_HASH ?? '').trim().toLowerCase();
   if (op !== '' && constantTimeEqual(hash, op)) return { kind: 'operator' };
+  const cached = tokens.get(hash, nowMs);
+  if (cached) return cached;
   const row = await env.DB.prepare('SELECT project_id, kind FROM tokens WHERE hash = ?')
     .bind(hash)
     .first<{ project_id: string; kind: 'read' | 'ci' | 'sync' }>();
   if (!row) return null;
-  return { kind: row.kind, projectId: row.project_id };
+  const auth: AuthCtx = { kind: row.kind, projectId: row.project_id };
+  tokens.set(hash, auth, nowMs, TOKEN_TTL_MS);
+  return auth;
 }

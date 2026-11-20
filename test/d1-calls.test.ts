@@ -1,6 +1,10 @@
 import { env } from 'cloudflare:workers';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { clearAuthCache } from '../src/auth';
 import { handle } from '../src/index';
+import { clearDecisionCaches } from '../src/policy/decider';
+import { clearServeLogCache } from '../src/policy/store';
+import { configureStatsBuffer, STATS_INTERVAL_MS, STATS_MAX_PENDING } from '../src/stats/record';
 import type { Deps, Env } from '../src/types';
 import { fakeFetch, fixedClock, seedProject } from './helpers';
 
@@ -90,12 +94,20 @@ async function request(path: string, c: Count, accept?: string): Promise<Respons
 
 const fresh = (): Count => ({ trips: 0, stmts: 0, stats: 0, sql: [] });
 
-/** Round trips for one request, after a warm-up request has cached and pinned everything. */
-async function measure(path: string, accept?: string): Promise<Count> {
+/**
+ * Round trips for one request after a warm-up request has stored and pinned everything: `cold` with this
+ * isolate's caches emptied first (a new isolate, or 30 s later), `warm` right after another request.
+ */
+async function measure(path: string, accept?: string): Promise<{ cold: Count; warm: Count }> {
   expect((await request(path, fresh(), accept)).status).toBe(200);
-  const c = fresh();
-  expect((await request(path, c, accept)).status).toBe(200);
-  return c;
+  clearAuthCache();
+  clearDecisionCaches();
+  clearServeLogCache();
+  const cold = fresh();
+  expect((await request(path, cold, accept)).status).toBe(200);
+  const warm = fresh();
+  expect((await request(path, warm, accept)).status).toBe(200);
+  return { cold, warm };
 }
 
 const PATHS = {
@@ -107,30 +119,36 @@ const PATHS = {
   'go .zip': ['/go/example.com/calls/@v/v1.0.0.zip'],
 } as const;
 
-// Budgets: round trips on the request (and its waitUntil work), stats counters excluded.
-const BUDGET: Record<keyof typeof PATHS, number> = {
-  'npm tarball': 6,
-  'npm packument (abbrev)': 5,
-  'npm packument (full)': 5,
-  'go .info': 5,
-  'go .mod': 5,
-  'go .zip': 6,
+// Budgets: round trips on the request and its waitUntil work, request counts included (buffered: the
+// test isolate flushes every 10 s or 200 requests, as in production). Before the fix every row was
+// 5–6 round trips and 6–7 statements.
+const BUDGET: Record<keyof typeof PATHS, { cold: number; warm: number }> = {
+  'npm tarball': { cold: 3, warm: 0 },
+  'npm packument (abbrev)': { cold: 2, warm: 1 },
+  'npm packument (full)': { cold: 2, warm: 1 },
+  'go .info': { cold: 2, warm: 0 },
+  'go .mod': { cold: 2, warm: 0 },
+  'go .zip': { cold: 3, warm: 0 },
 };
 
 beforeAll(async () => {
+  configureStatsBuffer({ intervalMs: STATS_INTERVAL_MS, maxPending: STATS_MAX_PENDING, timer: false });
   e = env as unknown as Env;
   tok = (await seedProject(e, 'calls')).read;
   // Warm the npm packument so the tarball's version is pinned.
   await request('/npm/calls', fresh());
 });
 
+afterAll(() => configureStatsBuffer({ intervalMs: 0, timer: true }));
+
 describe('D1 round trips per cached request (main ref)', () => {
   const report: Record<string, string> = {};
   for (const [label, [path, accept]] of Object.entries(PATHS) as [keyof typeof PATHS, readonly [string, string?]][]) {
     it(`${label}: within budget`, async () => {
-      const c = await measure(path, accept);
-      report[label] = `${c.trips} trips, ${c.stmts} stmts (${c.stats} stats) :: ${c.sql.join(' | ')}`;
-      expect(c.trips - c.stats).toBeLessThanOrEqual(BUDGET[label]);
+      const { cold, warm } = await measure(path, accept);
+      const line = (c: Count) => `${c.trips} trips/${c.stmts} stmts${c.stats ? ` (${c.stats} stats)` : ''}`;
+      report[label] = `cold ${line(cold)}, warm ${line(warm)} :: ${cold.sql.join(' | ')}`;
+      expect({ cold: cold.trips, warm: warm.trips }).toEqual(BUDGET[label]);
     });
   }
   it('report', () => {

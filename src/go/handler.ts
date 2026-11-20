@@ -1,16 +1,9 @@
 import type { RequestCtx } from '../auth';
 import { text } from '../http';
 import type { Decision } from '../policy/decide';
-import { decider } from '../policy/decider';
+import { loadDecision, type VersionState } from '../policy/decider';
 import { osvMalicious, storedObject } from '../policy/first-serve';
-import {
-  getPinnedTimes,
-  getVersionState,
-  logServe,
-  markStored,
-  pinPublishTimes,
-  type PinnedTime,
-} from '../policy/store';
+import { logServe, markStored, pinnedFrom, pinPublishTimes, selectPinnedStmt, type PinnedTime, type VersionRow } from '../policy/store';
 import { compareVersions, isPrerelease, parseVersion } from '../semver';
 import { notePackageLatest, outcomeOf, recordRequest, tagOutcome } from '../stats/record';
 import { pump, readUpTo } from '../streams';
@@ -27,6 +20,7 @@ const NO_STORE = { 'cache-control': 'no-store' };
 const ESCAPED_RE = /^[a-z0-9._~!-]+(?:\/[a-z0-9._~!-]+)*$/;
 
 function err(status: number, message: string): Response {
+  if (status >= 500) console.error(`decant: go ${status}: ${message}`);
   return text(message, status, NO_STORE);
 }
 
@@ -119,7 +113,10 @@ async function allowedList(env: Env, deps: Deps, rc: RequestCtx, mod: Mod): Prom
     }
   }
 
-  const pinned = await getPinnedTimes(env, 'go', mod.name, versions);
+  // Pinned times are read in the same round trip as the decision inputs.
+  const extra = versions.length > 0 ? selectPinnedStmt(env, 'go', mod.name, versions) : undefined;
+  const loaded = await loadDecision<VersionRow>(env, deps, rc, 'go', mod.name, { extra });
+  const pinned = pinnedFrom(loaded.extra?.results ?? [], versions);
   const unpinned = versions
     .filter((v) => !pinned.has(v))
     .sort((a, b) => compareVersions(b, a, 'go'))
@@ -130,8 +127,7 @@ async function allowedList(env: Env, deps: Deps, rc: RequestCtx, mod: Mod): Prom
     if (p) pinned.set(v, p);
   });
 
-  const d = await decider(env, deps, rc, 'go', mod.name);
-  return { ok: true, allowed: versions.filter((v) => d(v, pinned.get(v)) === 'allow'), stale: r.stale };
+  return { ok: true, allowed: versions.filter((v) => loaded.decide(v, pinned.get(v)) === 'allow'), stale: r.stale };
 }
 
 function staleHeader(stale: boolean): Record<string, string> {
@@ -163,9 +159,11 @@ async function handleLatest(
     if (i && parseVersion(i.version, 'go')) {
       if (up.fresh) notePackageLatest(env, ctx, 'go', mod.name, i.version, i.time.toISOString(), now);
       // Pinning here also catches an upstream time change for an already-pinned version.
-      const pin = (await pinPublishTimes(env, 'go', mod.name, new Map([[i.version, i.time]]), now)).get(i.version);
-      const d = await decider(env, deps, rc, 'go', mod.name);
-      if (d(i.version, pin) === 'allow') return infoResponse(up.body, up.stale);
+      const extra = selectPinnedStmt(env, 'go', mod.name, [i.version]);
+      const loaded = await loadDecision<VersionRow>(env, deps, rc, 'go', mod.name, { extra });
+      const times = new Map([[i.version, i.time]]);
+      const pin = (await pinPublishTimes(env, 'go', mod.name, times, now, loaded.extra?.results ?? [])).get(i.version);
+      if (loaded.decide(i.version, pin) === 'allow') return infoResponse(up.body, up.stale);
     }
   }
 
@@ -248,7 +246,8 @@ async function handleFile(
   const ref: PackageRef = { eco: 'go', name: mod.name, version };
   const id = `${mod.name}@${version}`;
 
-  let state = await getVersionState(env, ref);
+  const loaded = await loadDecision(env, deps, rc, 'go', mod.name, { version, needStored: ext === 'zip' });
+  let state: VersionState | null = loaded.state;
   if (!state) {
     const r = await fetchInfo(env, deps, mod, version);
     if (r.status === 'not-found') return err(404, `${id} not found`);
@@ -261,7 +260,7 @@ async function handleFile(
     state = pin ? { ...pin, storedAt: null, osvCheckedAt: null } : null;
   }
 
-  const d = (await decider(env, deps, rc, 'go', mod.name))(version, state);
+  const d = loaded.decide(version, state);
   if (d !== 'allow') return notAvailable(id, d);
 
   if (ext !== 'zip') {

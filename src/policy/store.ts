@@ -1,3 +1,4 @@
+import { TtlCache } from '../cache';
 import type { Ecosystem, Env, PackageRef } from '../types';
 import type { Policy } from './schema';
 
@@ -47,7 +48,7 @@ export async function blockedVersions(env: Env, eco: Ecosystem, name: string): P
   return new Set(r.results.map((x) => x.version));
 }
 
-type VersionRow = { version: string; publish_time: string; conflict: number };
+export type VersionRow = { version: string; publish_time: string; conflict: number };
 
 function toPinned(rows: VersionRow[]): Map<string, PinnedTime> {
   return new Map(rows.map((r) => [r.version, { publishTime: new Date(r.publish_time), conflict: r.conflict === 1 }]));
@@ -58,7 +59,8 @@ function toPinned(rows: VersionRow[]): Map<string, PinnedTime> {
 const PINNED_LOOKUP_MAX = 10;
 const SELECT_PACKAGE = 'SELECT version, publish_time, conflict FROM versions WHERE eco = ?1 AND name = ?2';
 
-function selectPinnedStmt(env: Env, eco: Ecosystem, name: string, versions: string[]): D1PreparedStatement {
+/** Pinned rows for `versions` (a superset when the list is long; filter with pinnedFrom). */
+export function selectPinnedStmt(env: Env, eco: Ecosystem, name: string, versions: string[]): D1PreparedStatement {
   return versions.length > PINNED_LOOKUP_MAX
     ? env.DB.prepare(SELECT_PACKAGE).bind(eco, name)
     : env.DB.prepare(`${SELECT_PACKAGE} AND version IN (SELECT value FROM json_each(?3))`).bind(eco, name, JSON.stringify(versions));
@@ -69,12 +71,18 @@ function onlyRequested(rows: VersionRow[], versions: Iterable<string>): VersionR
   return rows.filter((r) => want.has(r.version));
 }
 
+/** The pins among rows read by selectPinnedStmt(versions). */
+export function pinnedFrom(rows: VersionRow[], versions: string[]): Map<string, PinnedTime> {
+  return toPinned(onlyRequested(rows, versions));
+}
+
 /**
  * First-seen publish times win. A later differing upstream time marks the version as conflicted
  * (stored time kept; the flag is sticky).
  *
  * Reads the package's pinned rows first, then writes only what changed: inserts for unseen versions and a
- * conflict update for versions whose time differs. A warm call is a single read. Never match json_each
+ * conflict update for versions whose time differs. A warm call is a single read, or none when the caller
+ * already read selectPinnedStmt(times' versions) and passes its rows as `current`. Never match json_each
  * against versions row by row: json_each has no index, so that reads O(N²) rows.
  */
 export async function pinPublishTimes(
@@ -83,11 +91,12 @@ export async function pinPublishTimes(
   name: string,
   times: Map<string, Date>,
   now: Date,
+  current?: VersionRow[],
 ): Promise<Map<string, PinnedTime>> {
   if (times.size === 0) return new Map();
   const requested = [...times.keys()];
-  const current = await selectPinnedStmt(env, eco, name, requested).all<VersionRow>();
-  const out = new Map(onlyRequested(current.results, requested).map((r) => [r.version, r]));
+  current ??= (await selectPinnedStmt(env, eco, name, requested).all<VersionRow>()).results;
+  const out = new Map(onlyRequested(current, requested).map((r) => [r.version, r]));
   const missing: Record<string, string> = {};
   const check: Record<string, string> = {}; // missing + differing: versions the conflict update must see
   for (const [v, t] of times) {
@@ -161,10 +170,22 @@ export async function markStored(env: Env, ref: PackageRef, now: Date): Promise<
     .run();
 }
 
+// serve_log rows this isolate has already written: the insert is a no-op after the first, so skip the write.
+const logged = new TtlCache<true>(10_000);
+
+export function clearServeLogCache(): void {
+  logged.clear();
+}
+
+/** One serve_log row per (project, version, UTC day); repeat serves in the same isolate skip D1. */
 export async function logServe(env: Env, projectId: string, ref: PackageRef, now: Date): Promise<void> {
+  const day = now.toISOString().slice(0, 10);
+  const key = `${projectId}\u0000${ref.eco}\u0000${ref.name}\u0000${ref.version}\u0000${day}`;
+  if (logged.get(key, now.getTime())) return;
   await env.DB.prepare('INSERT OR IGNORE INTO serve_log (project_id, eco, name, version, day) VALUES (?, ?, ?, ?, ?)')
-    .bind(projectId, ref.eco, ref.name, ref.version, now.toISOString().slice(0, 10))
+    .bind(projectId, ref.eco, ref.name, ref.version, day)
     .run();
+  logged.set(key, true, now.getTime(), 86_400_000);
 }
 
 /** Statement form so callers can include it in a batch. First (source, version) row wins. */

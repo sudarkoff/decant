@@ -46,9 +46,9 @@ const buffer = new Map<string, Pending>();
 let increments = 0;
 let lastFlush = Date.now();
 let wake: (() => void) | null = null; // resolves the scheduled flush's sleep, when one is waiting
-const policy = { intervalMs: STATS_INTERVAL_MS, maxPending: STATS_MAX_PENDING };
+const policy = { intervalMs: STATS_INTERVAL_MS, maxPending: STATS_MAX_PENDING, timer: true };
 
-/** Test hook: the flush interval and size. intervalMs 0 flushes on every request. */
+/** Test hook: the flush interval and size (intervalMs 0 flushes on every request); timer false never schedules a flush. */
 export function configureStatsBuffer(p: Partial<typeof policy>): void {
   Object.assign(policy, p);
   lastFlush = Date.now();
@@ -78,7 +78,7 @@ export function recordRequest(
   const due = lastFlush + policy.intervalMs - Date.now();
   if (increments >= policy.maxPending || due <= 0) {
     background(ctx, 'request counts', () => flushRequestCounts(env));
-  } else if (!wake) {
+  } else if (!wake && policy.timer) {
     background(ctx, 'request counts', async () => {
       await new Promise<void>((resolve) => {
         const t = setTimeout(done, due);
