@@ -81,6 +81,8 @@ curl https://<your-domain>/healthz
 
 The health check should answer `ok`. The Worker's cron runs daily at 04:17 UTC: it re-checks stored versions against OSV for malicious-package advisories and expires PR overlays 14 days after their last sync.
 
+`wrangler.jsonc` turns on Workers Logs (`"observability": { "enabled": true }`), so exceptions and decant's own warnings are kept and searchable in the dashboard. If you deploy from your own config (`wrangler.local.jsonc` or another), add the same line to it: without it, nothing is retained to diagnose a failure after the fact. Decant logs error names and package ids, never tokens.
+
 ### Upgrading an existing deployment
 
 Migrations 0004 and 0005 are required for every deploy of this version: policy sync writes the new `allows` columns. Run them BEFORE `npx wrangler deploy` (add `-c <config>` if you use a local config):

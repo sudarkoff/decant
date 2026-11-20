@@ -35,26 +35,69 @@ export async function fetchHeaders(deps: Deps, url: string, init: RequestInit = 
   }
 }
 
-// One in-flight promise per key within this isolate.
+// One in-flight promise per key within this isolate, shared by concurrent requests.
 const inflight = new Map<string, Promise<CachedFetchResult>>();
+
+/**
+ * The shared promise belongs to the request that started it. If that request is cancelled (its client
+ * went away) the promise may never settle, so a joining request waits at most this long and then
+ * fetches for itself.
+ */
+function joinWaitMs(deps: Deps): number {
+  return 2 * upstreamTimeout(deps) + 1000;
+}
 
 export function cachedFetch(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedFetchResult> {
   const existing = inflight.get(opts.key);
-  if (existing) return existing;
-  const p = run(env, deps, opts).finally(() => {
+  if (existing) return join(existing, () => safeRun(env, deps, opts), joinWaitMs(deps));
+  const p = safeRun(env, deps, opts).finally(() => {
     if (inflight.get(opts.key) === p) inflight.delete(opts.key);
   });
   inflight.set(opts.key, p);
   return p;
 }
 
+async function join(shared: Promise<CachedFetchResult>, own: () => Promise<CachedFetchResult>, waitMs: number): Promise<CachedFetchResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<null>((r) => {
+    timer = setTimeout(() => r(null), waitMs);
+  });
+  try {
+    return (await Promise.race([shared, timedOut])) ?? (await own());
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Never rejects: an R2 or runtime failure is 'unavailable', like an upstream outage, for every waiter. */
+async function safeRun(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedFetchResult> {
+  try {
+    return await run(env, deps, opts);
+  } catch (err) {
+    console.warn(`cached fetch failed for key ${opts.key}: ${err instanceof Error ? err.name : typeof err}`);
+    return { status: 'unavailable' };
+  }
+}
+
+/** The stored object and its body, or null if there is none or R2 can't be read (then upstream decides). */
+async function readStored(env: Env, key: string): Promise<{ body: ArrayBuffer; fetchedAt: number } | null> {
+  try {
+    const stored = await env.BUCKET.get(key);
+    if (!stored) return null;
+    return { body: await stored.arrayBuffer(), fetchedAt: Date.parse(stored.customMetadata?.fetchedAt ?? '') };
+  } catch {
+    console.warn(`upstream cache read failed for key ${key}`);
+    return null;
+  }
+}
+
 async function run(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedFetchResult> {
-  const stored = await env.BUCKET.get(opts.key);
+  const stored = await readStored(env, opts.key);
   let storedBody: ArrayBuffer | null = null;
   if (stored) {
-    storedBody = await stored.arrayBuffer();
+    storedBody = stored.body;
     if (opts.immutable) return { status: 'ok', body: storedBody, stale: false, fresh: false };
-    const fetchedAt = Date.parse(stored.customMetadata?.fetchedAt ?? '');
+    const fetchedAt = stored.fetchedAt;
     const maxAgeMs = (opts.maxAgeSec ?? DEFAULT_MAX_AGE_SEC) * 1000;
     if (!Number.isNaN(fetchedAt) && deps.now().getTime() - fetchedAt <= maxAgeMs) {
       return { status: 'ok', body: storedBody, stale: false, fresh: false };

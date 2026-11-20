@@ -1,13 +1,11 @@
 import type { RequestCtx } from '../auth';
 import { json } from '../http';
-import { maliciousIds } from '../osv';
 import { decider } from '../policy/decider';
+import { osvMalicious, storedObject } from '../policy/first-serve';
 import {
-  addGlobalBlock,
   getPinnedTimes,
   getVersionState,
   logServe,
-  markOsvChecked,
   markStored,
   pinPublishTimes,
   type PinnedTime,
@@ -251,8 +249,9 @@ async function handleTarball(
     if (!r.ok) return r.res;
     full = r.doc;
     if (!full.versions?.[version]) return err(404, `${id} not found`);
-    await pinPublishTimes(env, 'npm', name, publishTimes(full), now);
-    state = await getVersionState(env, ref);
+    // As in the go handler: a just-pinned version is neither stored nor OSV-checked. Saves a D1 read.
+    const pin = (await pinPublishTimes(env, 'npm', name, publishTimes(full), now)).get(version);
+    state = pin ? { ...pin, storedAt: null, osvCheckedAt: null } : null;
   }
 
   const d = (await decider(env, deps, rc, 'npm', name))(version, state);
@@ -261,24 +260,13 @@ async function handleTarball(
   const serve = () => ctx.waitUntil(logServe(env, rc.projectId, ref, now).catch(() => console.warn(`serve log failed ${id}`)));
   const key = `npm/tar/${name}/${file}`;
   // Only a verified copy (stored_at set) is served from R2; anything else goes upstream again.
-  const obj = state?.storedAt ? await env.BUCKET.get(key) : null;
+  const obj = state?.storedAt ? await storedObject(env, key) : null;
   if (obj) {
     serve();
     return tarballResponse(obj.body);
   }
 
-  if (!state?.osvCheckedAt) {
-    const mal = await maliciousIds(deps, [ref]);
-    if (mal !== null) {
-      // The cron re-checks anything left with osv_checked_at null (including OSV-down cases).
-      await markOsvChecked(env, [ref], now);
-      const ids = mal.get(id);
-      if (ids && ids.length > 0) {
-        await addGlobalBlock(env, ref, 'osv', ids.join(', '), now);
-        return notAvailable(id, true);
-      }
-    }
-  }
+  if (!state?.osvCheckedAt && (await osvMalicious(env, deps, ref, now))) return notAvailable(id, true);
 
   if (!full) {
     const r = await fetchDoc(env, deps, rec, name, false);

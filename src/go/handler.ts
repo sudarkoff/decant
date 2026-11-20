@@ -1,14 +1,12 @@
 import type { RequestCtx } from '../auth';
 import { text } from '../http';
-import { maliciousIds } from '../osv';
 import type { Decision } from '../policy/decide';
 import { decider } from '../policy/decider';
+import { osvMalicious, storedObject } from '../policy/first-serve';
 import {
-  addGlobalBlock,
   getPinnedTimes,
   getVersionState,
   logServe,
-  markOsvChecked,
   markStored,
   pinPublishTimes,
   type PinnedTime,
@@ -257,8 +255,10 @@ async function handleFile(
     if (r.status === 'unavailable') return unavailable();
     const i = parseInfo(r.body);
     if (!i || i.version !== version) return err(502, 'invalid upstream .info');
-    await pinPublishTimes(env, 'go', mod.name, new Map([[version, i.time]]), now);
-    state = await getVersionState(env, ref);
+    // The pin is the state of a version just seen: nothing stored or OSV-checked yet (if a concurrent
+    // request did either, redoing it is harmless). Saves a D1 read per cold request.
+    const pin = (await pinPublishTimes(env, 'go', mod.name, new Map([[version, i.time]]), now)).get(version);
+    state = pin ? { ...pin, storedAt: null, osvCheckedAt: null } : null;
   }
 
   const d = (await decider(env, deps, rc, 'go', mod.name))(version, state);
@@ -275,24 +275,13 @@ async function handleFile(
   const serve = () =>
     ctx.waitUntil(logServe(env, rc.projectId, ref, now).catch(() => console.warn(`serve log failed ${formatPackageId(ref)}`)));
   const key = fileKey(mod, escVer, 'zip');
-  const obj = state?.storedAt ? await env.BUCKET.get(key) : null;
+  const obj = state?.storedAt ? await storedObject(env, key) : null;
   if (obj) {
     serve();
     return zipResponse(obj.body);
   }
 
-  if (!state?.osvCheckedAt) {
-    const mal = await maliciousIds(deps, [ref]);
-    if (mal !== null) {
-      // The cron re-checks anything left with osv_checked_at null (including OSV-down cases).
-      await markOsvChecked(env, [ref], now);
-      const ids = mal.get(formatPackageId(ref));
-      if (ids && ids.length > 0) {
-        await addGlobalBlock(env, ref, 'osv', ids.join(', '), now);
-        return notAvailable(id, 'blocked');
-      }
-    }
-  }
+  if (!state?.osvCheckedAt && (await osvMalicious(env, deps, ref, now))) return notAvailable(id, 'blocked');
 
   const url = fileUrl(mod, escVer, 'zip');
   // Built here from a validated path, but assert the host anyway before fetching.
