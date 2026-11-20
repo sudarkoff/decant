@@ -301,6 +301,16 @@ describe('scan', () => {
     expect(gd.args.slice(0, 3)).toEqual(['npm', 'scan', '/rt/decant-scan/0.tgz']);
   });
 
+  it('installs GuardDog without GITHUB_ACTION_PATH (a node action never gets it)', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]) });
+    delete h.env.GITHUB_ACTION_PATH;
+    expect(await h.run()).toBe(0);
+    expect(h.log()).not.toContain('GITHUB_ACTION_PATH');
+    const pip = h.exec.calls.find((c) => c.cmd.endsWith('/bin/pip'))!;
+    expect(pip.args.at(-1)).toMatch(/\/action\/guarddog-requirements\.txt$/);
+    expect(h.puts).toContainEqual(expect.objectContaining({ scanner: 'guarddog', result: 'clean' }));
+  });
+
   it('a lockfile new since base (git show fails with path-not-in-base) treats every dep as new', async () => {
     const h = harness({ head: lock([LP]), base: null });
     expect(await h.run()).toBe(0);

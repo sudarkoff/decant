@@ -1,5 +1,17 @@
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { build } from 'esbuild';
 import { describe, expect, it } from 'vitest';
-import { GUARDDOG_VERSION, installGuardDog, parseGuardDogJson, scanGo, scanNpm } from '../src/guarddog';
+import { buildOptions } from '../build.mjs';
+import {
+  actionDir,
+  GUARDDOG_VERSION,
+  installGuardDog,
+  parseGuardDogJson,
+  requirementsPath,
+  scanGo,
+  scanNpm,
+} from '../src/guarddog';
 import { fakeExec } from './fakes';
 
 const clean = { package: '/t/0.tgz', results: { 'threat-npm-preinstall-script': {}, 'capability-network-outbound': [] }, errors: {}, issues: 0, risks: [] };
@@ -24,6 +36,30 @@ describe('installGuardDog', () => {
     ]);
     expect(gd.bin).toBe('/rt/decant-guarddog/bin/guarddog');
     expect(GUARDDOG_VERSION).toBe('3.2.0');
+  });
+
+  // GitHub sets GITHUB_ACTION_PATH only for composite actions; decant runs as a node action.
+  it('locates the action directory from the bundle when GITHUB_ACTION_PATH is unset', () => {
+    const bundle = new URL('../dist/index.js', import.meta.url).href;
+    expect(existsSync(fileURLToPath(bundle))).toBe(true);
+    const req = requirementsPath(actionDir(undefined, bundle));
+    expect(req).toMatch(/\/action\/guarddog-requirements\.txt$/);
+    expect(existsSync(req)).toBe(true);
+    // Unbundled (this module's own location) resolves to the same file.
+    expect(requirementsPath(actionDir(undefined))).toBe(req);
+  });
+
+  it('prefers GITHUB_ACTION_PATH when set', () => {
+    expect(requirementsPath(actionDir('/act/'))).toBe('/act/guarddog-requirements.txt');
+  });
+
+  it('the built bundle resolves its directory from its own URL', async () => {
+    const r = await build({ ...buildOptions, write: false });
+    const js = new TextDecoder().decode(r.outputFiles[0]!.contents);
+    // ESM output keeps import.meta.url (a CJS bundle would turn it into undefined).
+    expect(js).toMatch(/function actionDir\(override, moduleUrl = import\.meta\.url\)/);
+    expect(js).toContain('new URL("..", moduleUrl)');
+    expect(js).not.toMatch(/GITHUB_ACTION_PATH is not set/);
   });
 
   it('throws when pip fails', async () => {

@@ -2104,14 +2104,21 @@ async function fileAtCommit(deps, wd, sha, rel) {
 }
 
 // action/src/guarddog.ts
+import { fileURLToPath } from "node:url";
 var GUARDDOG_VERSION = "3.2.0";
 function tail(s) {
   return s.trim().split("\n").slice(-5).join(" ").slice(0, 500);
 }
+function actionDir(override, moduleUrl = import.meta.url) {
+  return override || fileURLToPath(new URL("..", moduleUrl));
+}
+function requirementsPath(actionPath) {
+  return `${actionPath.replace(/\/+$/, "")}/guarddog-requirements.txt`;
+}
 async function installGuardDog(exec, dir, actionPath) {
   const venv = await exec("python3", ["-m", "venv", dir]);
   if (venv.code !== 0) throw new Error(`python3 -m venv failed: ${tail(venv.stderr)}`);
-  const req = `${actionPath.replace(/\/+$/, "")}/guarddog-requirements.txt`;
+  const req = requirementsPath(actionPath);
   const pip = await exec(`${dir}/bin/pip`, [
     "install",
     "--disable-pip-version-check",
@@ -2368,10 +2375,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
     let gd = null;
     const guarddog = () => {
-      if (!gd) {
-        const actionPath = env.GITHUB_ACTION_PATH;
-        gd = actionPath ? installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionPath) : Promise.reject(new Error("GITHUB_ACTION_PATH is not set"));
-      }
+      gd ??= installGuardDog(deps.exec, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionDir(env.GITHUB_ACTION_PATH));
       return gd;
     };
     if (regDeps.length) await deps.fs.mkdir(scratch);
