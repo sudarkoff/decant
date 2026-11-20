@@ -266,6 +266,9 @@ const DEP_ECOS = new Set(['npm', 'go']);
 const MAX_DEP_NAME = 214;
 const MAX_DEP_VERSION = 128;
 const MAX_VIA = 5;
+/** GitHub owner/name (owner: letters, digits, '-'; repo: also '.' and '_'). */
+const REPO_RE = /^[A-Za-z0-9-]+\/(?!\.\.?$)[A-Za-z0-9._-]+$/; // owner/name; name is never . or ..
+const MAX_REPO = 140;
 
 type DepRow = { eco: string; name: string; version: string; direct: boolean; via: string[] };
 
@@ -290,18 +293,25 @@ async function syncDeps(req: Request, env: Env, deps: Deps, projectId: string): 
   const body = await readJsonObject(req);
   if (typeof body.sha !== 'string' || body.sha === '' || body.sha.length > 100) return err(400, 'sha must be a non-empty string');
   if (!Array.isArray(body.deps)) return err(400, 'deps must be an array');
+  // Optional (older actions omit it): the GitHub repo, for the dashboard's links to open PRs.
+  const repo = body.repo;
+  if (repo !== undefined && (typeof repo !== 'string' || repo.length > MAX_REPO || !REPO_RE.test(repo))) {
+    return err(400, 'repo must be a GitHub owner/name');
+  }
   const rows: DepRow[] = [];
   for (const [i, v] of body.deps.entries()) {
     const r = depRow(v, i);
     if (typeof r === 'string') return err(400, r);
     rows.push(r);
   }
-  await env.DB.prepare(
-    `INSERT INTO project_deps (project_id, sha, synced_at, json) VALUES (?, ?, ?, ?)
-     ON CONFLICT (project_id) DO UPDATE SET sha = excluded.sha, synced_at = excluded.synced_at, json = excluded.json`,
-  )
-    .bind(projectId, body.sha, deps.now().toISOString(), JSON.stringify(rows))
-    .run();
+  const stmts = [
+    env.DB.prepare(
+      `INSERT INTO project_deps (project_id, sha, synced_at, json) VALUES (?, ?, ?, ?)
+       ON CONFLICT (project_id) DO UPDATE SET sha = excluded.sha, synced_at = excluded.synced_at, json = excluded.json`,
+    ).bind(projectId, body.sha, deps.now().toISOString(), JSON.stringify(rows)),
+  ];
+  if (typeof repo === 'string') stmts.push(env.DB.prepare('UPDATE projects SET repo = ? WHERE id = ?').bind(repo, projectId));
+  await env.DB.batch(stmts);
   return reply({ deps: rows.length });
 }
 

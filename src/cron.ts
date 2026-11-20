@@ -6,43 +6,109 @@ const BATCH = 1000;
 const MAX_BATCHES = 20;
 const OVERLAY_TTL_MS = 14 * 86400_000;
 const MAX_DETAIL_FETCHES = 200;
+/** Per run, at most this many advisories with no fixed version yet are re-fetched (oldest fetch first). */
+const MAX_NOFIX_REFRESH = 20;
+/** ...and only when their last fetch is at least this old (MAL advisories never get a fix and are skipped). */
+const NOFIX_REFRESH_AGE_MS = 20 * 3600_000;
 
 interface VersionRow { eco: Ecosystem; name: string; version: string }
 
-type Details = Pick<VulnDetails, 'severity' | 'summary' | 'published'> & { pending?: true };
+/**
+ * `fixed`: fixed versions per package ("eco:name"). `fixedAll` is true when they came from the OSV record itself,
+ * so a package missing from `fixed` has none; reused rows only know the packages they were stored for.
+ */
+type Details = Pick<VulnDetails, 'severity' | 'summary' | 'published'> & {
+  pending?: true; fixed: Record<string, string[]>; fixedAll: boolean;
+  /** When the details were last fetched from OSV (null: unknown, or never). */
+  fetchedAt: string | null;
+};
 /** Stored with checked_at = '' so a later run knows its details were never fetched (as opposed to fetched-but-empty). */
-const PLACEHOLDER: Details = { severity: 'unknown', summary: '', published: null, pending: true };
+const PLACEHOLDER: Details = { severity: 'unknown', summary: '', published: null, pending: true, fixed: {}, fixedAll: false, fetchedAt: null };
+
+const fromOsv = (d: VulnDetails, at: string): Details => ({
+  severity: d.severity, summary: d.summary, published: d.published, fixed: d.fixed, fixedAll: true, fetchedAt: at,
+});
 
 /**
  * Details per advisory id for one batch: reuse what `vulns` already holds, then fetch the rest from OSV
  * (pending placeholders first, then new ids) until `budget.left` runs out. Ids left over get a pending placeholder.
+ * With budget to spare, ids whose stored rows predate fixed versions (fixed_versions NULL) are re-fetched, then up to
+ * `budget.refresh` ids whose stored lists are all empty (no fix yet), oldest fetch first, so a fix that ships is picked up.
  */
 async function detailsFor(
   env: Env,
   deps: Deps,
   ids: string[],
   cache: Map<string, VulnDetails>,
-  budget: { left: number },
+  budget: { left: number; refresh: number },
+  now: Date,
 ): Promise<Map<string, Details>> {
+  const at = now.toISOString();
   const out = new Map<string, Details>();
   if (ids.length === 0) return out;
   const { results } = await env.DB.prepare(
-    'SELECT id, severity, summary, published, checked_at FROM vulns WHERE id IN (SELECT value FROM json_each(?))',
-  ).bind(JSON.stringify(ids)).all<{ id: string; severity: string; summary: string | null; published: string | null; checked_at: string }>();
+    `SELECT id, eco, name, severity, summary, published, checked_at, fixed_versions, details_fetched_at FROM vulns
+     WHERE id IN (SELECT value FROM json_each(?))`,
+  ).bind(JSON.stringify(ids)).all<{
+    id: string; eco: string; name: string; severity: string; summary: string | null; published: string | null; checked_at: string; fixed_versions: string | null; details_fetched_at: string | null;
+  }>();
   const pending = new Set<string>();
+  const stale = new Set<string>();
   for (const r of results) {
-    if (r.checked_at === '') pending.add(r.id);
-    else out.set(r.id, { severity: r.severity as Details['severity'], summary: r.summary ?? '', published: r.published });
+    if (r.checked_at === '') {
+      pending.add(r.id);
+      continue;
+    }
+    const d = out.get(r.id) ?? { severity: r.severity as Details['severity'], summary: r.summary ?? '', published: r.published, fixed: {}, fixedAll: false, fetchedAt: null };
+    if (r.details_fetched_at !== null && (d.fetchedAt === null || r.details_fetched_at > d.fetchedAt)) d.fetchedAt = r.details_fetched_at;
+    let list: unknown = null;
+    try {
+      list = r.fixed_versions === null ? null : JSON.parse(r.fixed_versions);
+    } catch {
+      // treated as unknown
+    }
+    if (Array.isArray(list) && list.every((x) => typeof x === 'string')) d.fixed[`${r.eco}:${r.name}`] = list as string[];
+    else stale.add(r.id);
+    out.set(r.id, d);
   }
   const todo = ids.filter((id) => !out.has(id)).sort((a, b) => Number(pending.has(b)) - Number(pending.has(a)));
   for (const id of todo) {
     const cached = cache.get(id);
-    if (cached) { out.set(id, cached); continue; }
+    if (cached) { out.set(id, fromOsv(cached, at)); continue; }
     if (budget.left <= 0) { out.set(id, PLACEHOLDER); continue; }
     budget.left--;
-    out.set(id, (await vulnDetails(deps, id, cache)) ?? PLACEHOLDER);
+    const d = await vulnDetails(deps, id, cache);
+    out.set(id, d ? fromOsv(d, at) : PLACEHOLDER);
+  }
+  /** Re-fetches one stored id if the budget allows; false when it does not. */
+  const refetch = async (id: string): Promise<boolean> => {
+    const cached = cache.get(id);
+    if (cached) { out.set(id, fromOsv(cached, at)); return true; }
+    if (budget.left <= 0) return false;
+    budget.left--;
+    const d = await vulnDetails(deps, id, cache);
+    if (d) out.set(id, fromOsv(d, at));
+    return true;
+  };
+  for (const id of stale) if (!(await refetch(id))) break;
+  const dueBefore = new Date(now.getTime() - NOFIX_REFRESH_AGE_MS).toISOString();
+  const noFix = [...out.entries()]
+    .filter(([id, d]) => !id.startsWith('MAL-') && !stale.has(id) && !d.fixedAll && !pending.has(id) && (d.fetchedAt ?? '') <= dueBefore)
+    .filter(([, d]) => Object.values(d.fixed).every((l) => l.length === 0))
+    .sort(([, a], [, b]) => (a.fetchedAt ?? '').localeCompare(b.fetchedAt ?? ''))
+    .map(([id]) => id);
+  for (const id of noFix) {
+    if (budget.refresh <= 0 || budget.left <= 0) break;
+    if (!cache.has(id)) budget.refresh--;
+    await refetch(id);
   }
   return out;
+}
+
+/** The JSON stored in vulns.fixed_versions for one row, or null when not known. */
+function fixedJson(d: Details, ref: PackageRef): string[] | null {
+  const list = d.fixed[`${ref.eco}:${ref.name}`];
+  return list ?? (d.fixedAll ? [] : null);
 }
 
 const RECORD_CHUNK = 200;
@@ -57,21 +123,21 @@ async function recordVulns(
 ): Promise<void> {
   for (let i = 0; i < batch.length; i += RECORD_CHUNK) {
     const chunk = batch.slice(i, i + RECORD_CHUNK);
-    const rows: (string | number | null)[][] = [];
+    const rows: (string | number | string[] | null)[][] = [];
     for (const ref of chunk) {
       for (const id of hits.get(formatPackageId(ref)) ?? []) {
         const d = details.get(id) ?? PLACEHOLDER;
-        rows.push([ref.eco, ref.name, ref.version, id, d.severity, d.summary, d.published, d.pending ? 0 : 1]);
+        rows.push([ref.eco, ref.name, ref.version, id, d.severity, d.summary, d.published, d.pending ? 0 : 1, fixedJson(d, ref), d.fetchedAt]);
       }
     }
     const rowsJson = JSON.stringify(rows);
     const refsJson = JSON.stringify(chunk.map((r) => [r.eco, r.name, r.version]));
     await env.DB.batch([
       env.DB.prepare(
-        `INSERT OR REPLACE INTO vulns (eco, name, version, id, severity, summary, published, checked_at)
+        `INSERT OR REPLACE INTO vulns (eco, name, version, id, severity, summary, published, checked_at, fixed_versions, details_fetched_at)
          SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'),
                 json_extract(value, '$[4]'), json_extract(value, '$[5]'), json_extract(value, '$[6]'),
-                CASE WHEN json_extract(value, '$[7]') = 1 THEN ?2 ELSE '' END
+                CASE WHEN json_extract(value, '$[7]') = 1 THEN ?2 ELSE '' END, json_extract(value, '$[8]'), json_extract(value, '$[9]')
          FROM json_each(?1)`,
       ).bind(rowsJson, now.toISOString()),
       env.DB.prepare(
@@ -97,7 +163,7 @@ async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; bloc
   let checked = 0;
   let blocked = 0;
   const cache = new Map<string, VulnDetails>(); // per run, never across requests
-  const budget = { left: MAX_DETAIL_FETCHES };
+  const budget = { left: MAX_DETAIL_FETCHES, refresh: MAX_NOFIX_REFRESH };
   const done: { batch: PackageRef[]; hits: Map<string, string[]> }[] = [];
   for (let i = 0; i < refs.length; i += BATCH) {
     const batch = refs.slice(i, i + BATCH);
@@ -120,7 +186,7 @@ async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; bloc
   // subrequests that a later batch's OSV query needs.
   try {
     for (const { batch, hits } of done) {
-      const details = await detailsFor(env, deps, [...new Set([...hits.values()].flat())], cache, budget);
+      const details = await detailsFor(env, deps, [...new Set([...hits.values()].flat())], cache, budget, now);
       await recordVulns(env, batch, hits, details, now);
     }
   } catch (err) {

@@ -87,6 +87,8 @@ describe('attention items', () => {
       title: 'x@1.0.0 is blocked',
       detail: 'policy:twocal: bad build',
       firstSeen: NOW.toISOString(),
+      todo: 'Blocked by your policy. Remove or replace it, or lift the block in `decant.json`.',
+      links: [{ label: 'View on npm', url: 'https://www.npmjs.com/package/x/v/1.0.0' }],
     });
     expect(byKey['blocked:npm:y@1.0.0:twocal']!.detail).toBe('policy: policy only');
     expect(byKey['malicious:npm:m@1.0.0:twocal']!.title).toBe('m@1.0.0 is malicious');
@@ -95,9 +97,67 @@ describe('attention items', () => {
     expect(byKey['flagged:npm:f@1.0.0:twocal']!.detail).toBe('flagged by guarddog');
     expect(byKey['conflict:npm:c@1.0.0']!.project).toBeNull();
     expect(byKey['silent:quiet']!.detail).toBe('last activity 2026-10-01');
+    expect(byKey['silent:quiet']!.links.map((l) => l.label)).toEqual(['Setup guide']);
+    expect(byKey['conflict:npm:c@1.0.0']!.links).toEqual([{ label: 'View on npm', url: 'https://www.npmjs.com/package/c/v/1.0.0' }]);
+    // no repo synced: no PR links
+    expect(byKey['vuln:GHSA-aaaa-aaaa-aaaa:npm:v@1.0.0:twocal']!.links.map((l) => l.label)).toEqual(['Advisory']);
+    expect(byKey['flagged:npm:f@1.0.0:twocal']!.findings).toEqual([]);
+    expect(byKey['flagged:npm:f@1.0.0:twocal']!.todo).toMatch(/^decant didn't record which checks fired/);
 
     // conflicts are listed under "all" only
     expect(keys((await attention(e, 'twocal', 30, NOW)).open)).not.toContain('conflict:npm:c@1.0.0');
+  });
+
+  it('builds to-dos, links and findings from stored data', async () => {
+    await project('web');
+    await e.DB.prepare("UPDATE projects SET repo = 'acme/web-app' WHERE id = 'web'").run();
+    await serve(
+      ['web', 'npm', 'undici', '7.29.0', '2026-11-18'],
+      ['web', 'npm', '@img/sharp-wasm32', '0.34.1', '2026-11-18'],
+      ['web', 'go', 'github.com/Klaus/compress', 'v1.20.2', '2026-11-18'],
+      ['web', 'npm', 'color-strng', '1.0.4', '2026-11-18'],
+    );
+    await exec(
+      "INSERT INTO vulns (eco, name, version, id, severity, summary, checked_at, fixed_versions) VALUES (?, ?, ?, ?, ?, ?, '2026-11-01T00:00:00Z', ?)",
+      ['npm', 'undici', '7.29.0', 'GHSA-fix', 'high', 'leak', '["6.21.3","7.29.1","8.0.0"]'],
+      ['npm', 'undici', '7.29.0', 'GHSA-nofix', 'high', 'dos', '[]'],
+      ['npm', 'undici', '7.29.0', 'GHSA-old', 'critical', 'legacy row', null],
+      ['npm', 'color-strng', '1.0.4', 'MAL-2026-2211', 'critical', 'malware', null],
+    );
+    await exec(
+      "INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, details, scanned_at) VALUES (?, ?, ?, 'guarddog', '3.2.0', 'flagged', ?, '2026-11-01T00:00:00Z')",
+      ['npm', '@img/sharp-wasm32', '0.34.1', JSON.stringify([{ rule: 'npm-install-script', message: 'postinstall', locations: ['package/package.json:12'] }])],
+      ['go', 'github.com/Klaus/compress', 'v1.20.2', JSON.stringify([{ rule: 'archive-anomaly', message: 'archive parser anomaly: multiple EOCD records' }])],
+    );
+    const by = Object.fromEntries((await attention(e, 'web', 30, NOW)).open.map((i) => [i.key, i]));
+
+    const fix = by['vuln:GHSA-fix:npm:undici@7.29.0:web']!;
+    expect(fix.todo).toContain('Fixed in `7.29.1`.');
+    expect(fix.links).toEqual([
+      { label: 'Open security PRs', url: 'https://github.com/acme/web-app/pulls?q=is%3Apr+is%3Aopen+label%3Adecant%3Asecurity' },
+      { label: 'Advisory', url: 'https://osv.dev/vulnerability/GHSA-fix' },
+    ]);
+    expect(by['vuln:GHSA-nofix:npm:undici@7.29.0:web']!.todo).toMatch(/^No fixed version yet/);
+    expect(by['vuln:GHSA-old:npm:undici@7.29.0:web']!.todo).toMatch(/^decant has not looked up a fixed version yet/);
+
+    const flagged = by['flagged:npm:@img/sharp-wasm32@0.34.1:web']!;
+    expect(flagged.findings).toEqual([{ rule: 'npm-install-script', note: 'postinstall at package/package.json:12' }]);
+    expect(flagged.todo).toMatch(/^Read the findings/);
+    expect(flagged.links.map((l) => l.url)).toEqual([
+      'https://github.com/acme/web-app/pulls?q=is%3Apr+is%3Aopen+status%3Afailure',
+      'https://www.npmjs.com/package/@img/sharp-wasm32/v/0.34.1',
+    ]);
+
+    const anomaly = by['flagged:go:github.com/Klaus/compress@v1.20.2:web']!;
+    expect(anomaly.findings).toEqual([{ rule: 'archive-anomaly', note: 'archive parser anomaly: multiple EOCD records' }]);
+    expect(anomaly.todo).toMatch(/^Nothing inside was scanned\. Download the module zip/);
+    expect(anomaly.links[1]).toEqual({ label: 'View on pkg.go.dev', url: 'https://pkg.go.dev/github.com/Klaus/compress@v1.20.2' });
+
+    const mal = by['malicious:npm:color-strng@1.0.4:web']!;
+    expect(mal.links).toEqual([
+      { label: 'Advisory', url: 'https://osv.dev/vulnerability/MAL-2026-2211' },
+      { label: 'View on npm', url: 'https://www.npmjs.com/package/color-strng/v/1.0.4' },
+    ]);
   });
 
   it('a malicious verdict is malicious, and its verdict block does not also emit blocked', async () => {
@@ -125,7 +185,7 @@ describe('attention items', () => {
     const r1 = await attention(e, 'p', 30, t1);
     expect(r1.open).toEqual([]);
     expect(r1.resolved).toEqual([
-      { key, project: 'p', kind: 'blocked', title: 'x@1.0.0 is blocked', detail: '', firstSeen: t0.toISOString(), resolvedAt: t1.toISOString() },
+      { key, project: 'p', kind: 'blocked', title: 'x@1.0.0 is blocked', detail: '', firstSeen: t0.toISOString(), resolvedAt: t1.toISOString(), todo: '', links: [] },
     ]);
 
     await gblock(['npm', 'x', '1.0.0', 'operator', 'bad']);

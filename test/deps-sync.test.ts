@@ -100,6 +100,22 @@ describe('PUT /api/projects/:id/deps', () => {
     expect(r.status).toBe(200);
   });
 
+  it('stores an optional repo on the project; omitting it keeps the stored one', async () => {
+    const repo = async () => (await e.DB.prepare('SELECT repo FROM projects WHERE id = ?').bind('da').first<{ repo: string | null }>())!.repo;
+    expect(await repo()).toBeNull();
+    expect((await put('da', A.sync, { sha: 'r0', deps: [dep()], repo: 'acme/...' })).status).toBe(200);
+    expect((await put('da', A.sync, { sha: 'r1', deps: [dep()], repo: 'acme/web-app.js' })).status).toBe(200);
+    expect(await repo()).toBe('acme/web-app.js');
+    expect((await put('da', A.sync, { sha: 'r2', deps: [dep()] })).status).toBe(200);
+    expect(await repo()).toBe('acme/web-app.js');
+    for (const bad of ['acme/.', 'acme/..', 'acme', 'acme/web app', '../x', 'a/b/c', 'a@b/c', '', 7, `a/${'x'.repeat(200)}`]) {
+      const r = await put('da', A.sync, { sha: 'bad', deps: [dep()], repo: bad });
+      expect(r.status, String(bad)).toBe(400);
+    }
+    expect(await repo()).toBe('acme/web-app.js');
+    expect((await row('da'))?.sha).toBe('r2');
+  });
+
   it('rejects a body over 1 MB with 413', async () => {
     const deps = Array.from({ length: 6000 }, (_, i) => dep({ name: `${'x'.repeat(200)}${i}` }));
     const r = await put('db', B.sync, { sha: 'big', deps });

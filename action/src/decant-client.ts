@@ -140,9 +140,10 @@ export function decant(
       return { status: res.status, body };
     },
 
-    /** PUT the default branch's dependency summary (sync token). Never throws on an HTTP status. */
-    async syncDeps(project: string, sha: string, deps: unknown[]): Promise<{ status: number; body: unknown }> {
-      const res = await call('PUT', `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps }, retryStatuses: false });
+    /** PUT the default branch's dependency summary (sync token), with the GitHub repo when known. Never throws on an HTTP status. */
+    async syncDeps(project: string, sha: string, deps: unknown[], repo?: string): Promise<{ status: number; body: unknown }> {
+      const payload = repo === undefined ? { sha, deps } : { sha, deps, repo };
+      const res = await call('PUT', `/api/projects/${encodeURIComponent(project)}/deps`, { body: payload, retryStatuses: false });
       const text = await res.text();
       let body: unknown = text;
       try {
