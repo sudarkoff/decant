@@ -221,7 +221,7 @@ export async function freshness(db: D1Database, project: string, from: string, n
   }
 
   const ages: number[] = [];
-  const majorBehind: { project: string; package: string; version: string; latest: string }[] = [];
+  const majorBehind: MajorBehind[] = [];
   let minorAvailable = 0;
   for (const x of rows) {
     if (x.publish_time !== null) {
@@ -246,7 +246,55 @@ export async function freshness(db: D1Database, project: string, from: string, n
     else if (latestMajor === instMajor && compareVersions(latest, x.version, x.eco) > 0) minorAvailable++;
   }
   majorBehind.sort((a, b) => (a.package < b.package ? -1 : a.package > b.package ? 1 : a.project < b.project ? -1 : a.project > b.project ? 1 : 0));
-  return { medianAgeDays: median(ages), majorBehind, minorAvailable };
+
+  // Split by each project's synced dependency summary (version-insensitive). A project without one keeps
+  // every entry in `direct`, marked classified: false.
+  const summaries = await depSummaries(db, [...new Set(majorBehind.map((x) => x.project))]);
+  const direct: (MajorBehind & { classified: boolean })[] = [];
+  const transitive: (MajorBehind & { via: string[] })[] = [];
+  for (const x of majorBehind) {
+    const s = summaries.get(x.project);
+    if (!s) {
+      direct.push({ ...x, classified: false });
+      continue;
+    }
+    const info = s.get(x.package);
+    if (info?.direct) direct.push({ ...x, classified: true });
+    else transitive.push({ ...x, via: [...(info?.via ?? [])].sort().slice(0, MAX_VIA) });
+  }
+  return { medianAgeDays: median(ages), majorBehind: { direct, transitive }, transitiveMajorBehindCount: transitive.length, minorAvailable };
+}
+
+type MajorBehind = { project: string; package: string; version: string; latest: string };
+const MAX_VIA = 5;
+
+/** project → (eco:name → direct anywhere in the summary, union of via). Missing or corrupt rows are absent. */
+async function depSummaries(db: D1Database, projects: string[]): Promise<Map<string, Map<string, { direct: boolean; via: Set<string> }>>> {
+  const out = new Map<string, Map<string, { direct: boolean; via: Set<string> }>>();
+  if (projects.length === 0) return out;
+  const r = await db
+    .prepare('SELECT project_id, json FROM project_deps WHERE project_id IN (SELECT value FROM json_each(?1))')
+    .bind(JSON.stringify(projects))
+    .all<{ project_id: string; json: string }>();
+  for (const row of r.results) {
+    let list: unknown;
+    try {
+      list = JSON.parse(row.json);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(list)) continue;
+    const m = new Map<string, { direct: boolean; via: Set<string> }>();
+    for (const d of list as { eco: string; name: string; direct: boolean; via: string[] }[]) {
+      const k = pkg(d.eco, d.name);
+      let cur = m.get(k);
+      if (!cur) m.set(k, (cur = { direct: false, via: new Set() }));
+      cur.direct ||= d.direct === true;
+      if (Array.isArray(d.via)) for (const v of d.via) cur.via.add(v);
+    }
+    out.set(row.project_id, m);
+  }
+  return out;
 }
 
 function median(xs: number[]): number | null {

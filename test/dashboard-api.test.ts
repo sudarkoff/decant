@@ -66,7 +66,7 @@ describe('dashboard api: fresh database', () => {
       vulnsBySeverity: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 },
       fastLane: [],
     });
-    expect((await get('freshness')).body).toEqual({ medianAgeDays: null, majorBehind: [], minorAvailable: 0 });
+    expect((await get('freshness')).body).toEqual({ medianAgeDays: null, majorBehind: { direct: [], transitive: [] }, transitiveMajorBehindCount: 0, minorAvailable: 0 });
     expect((await get('uptime')).body).toEqual({ outageDays: [], staleServed: 0, failed: 0 });
     expect((await get('policy')).body).toEqual({ policies: [] });
     expect((await get('packages')).body).toEqual({ items: [], page: 1, hasMore: false });
@@ -266,10 +266,15 @@ describe('dashboard api: seeded', () => {
     const { body } = await get('freshness?project=twocal&range=7');
     // a@10.0.0 (10 days), m v1.2.0 (20), 100%pct (5) → median 10
     expect(body.medianAgeDays).toBe(10);
-    expect(body.majorBehind).toEqual([
-      { project: 'twocal', package: 'go:example.com/m', version: 'v1.2.0', latest: 'v2.1.0' },
-      { project: 'twocal', package: 'npm:a', version: '10.0.0', latest: '11.0.0' },
-    ]);
+    // No dependency summary synced: everything is listed as direct, unclassified.
+    expect(body.majorBehind).toEqual({
+      direct: [
+        { project: 'twocal', package: 'go:example.com/m', version: 'v1.2.0', latest: 'v2.1.0', classified: false },
+        { project: 'twocal', package: 'npm:a', version: '10.0.0', latest: '11.0.0', classified: false },
+      ],
+      transitive: [],
+    });
+    expect(body.transitiveMajorBehindCount).toBe(0);
     expect(body.minorAvailable).toBe(1);
   });
 
@@ -277,13 +282,13 @@ describe('dashboard api: seeded', () => {
     const { body } = await get('freshness?project=all&range=7');
     // ages 1, 5, 10, 20 → median 7.5 → 8
     expect(body.medianAgeDays).toBe(8);
-    expect(body.majorBehind).toHaveLength(2);
+    expect(body.majorBehind.direct).toHaveLength(2);
     expect(body.minorAvailable).toBe(1);
   });
 
   it('freshness: project scoping', async () => {
     const { body } = await get('freshness?project=other&range=7');
-    expect(body).toEqual({ medianAgeDays: 1, majorBehind: [], minorAvailable: 0 });
+    expect(body).toEqual({ medianAgeDays: 1, majorBehind: { direct: [], transitive: [] }, transitiveMajorBehindCount: 0, minorAvailable: 0 });
   });
 
   it('uptime: twocal and all', async () => {

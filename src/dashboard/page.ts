@@ -386,11 +386,25 @@ const SCRIPT = String.raw`
   function renderFreshness(f) {
     var box = $('freshness');
     line(box, f.medianAgeDays === null ? 'Median dependency age: no data' : 'Median dependency age ' + plural(f.medianAgeDays, 'day', 'days'));
-    line(box, plural(f.majorBehind.length, 'dependency', 'dependencies') + ' a major version behind', f.majorBehind.length ? 'warn' : null);
-    if (f.majorBehind.length) {
+    var direct = f.majorBehind.direct, transitive = f.majorBehind.transitive;
+    line(box, plural(direct.length, 'direct dependency', 'direct dependencies') + ' a major version behind', direct.length ? 'warn' : null);
+    if (direct.length) {
       var ul = el('ul', 'plain muted');
-      f.majorBehind.forEach(function (x) { ul.appendChild(el('li', null, x.project + ' · ' + x.package + ' ' + x.version + ' → ' + x.latest)); });
+      direct.forEach(function (x) { ul.appendChild(el('li', null, x.project + ' · ' + x.package + ' ' + x.version + ' → ' + x.latest)); });
       box.appendChild(ul);
+    }
+    if (transitive.length) {
+      var det = el('details', null);
+      det.appendChild(el('summary', null, plural(f.transitiveMajorBehindCount, 'transitive', 'transitive') + ' (held back by their parents)'));
+      var tl = el('ul', 'plain muted');
+      transitive.forEach(function (x) {
+        tl.appendChild(el('li', null, x.project + ' · ' + x.package + ' ' + x.version + ' → ' + x.latest + (x.via.length ? ' · via ' + x.via.join(', ') : '')));
+      });
+      det.appendChild(tl);
+      box.appendChild(det);
+    }
+    if (direct.some(function (x) { return x.classified === false; })) {
+      line(box, 'Sync policy from the default branch to classify direct vs transitive.', 'muted');
     }
     line(box, plural(f.minorAvailable, 'minor update', 'minor updates') + ' available');
   }
