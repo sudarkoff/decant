@@ -190,10 +190,10 @@ describe('sync', () => {
     expect(f.calls).toHaveLength(0);
   });
   it('unsupported event exits 1', async () => {
-    const { deps } = syncDeps({ event: 'schedule' });
+    const { deps } = syncDeps({ event: 'release' });
     const { err } = cap();
     expect(await run(deps)).toBe(1);
-    expect(err.join('')).toContain('unsupported event schedule');
+    expect(err.join('')).toContain('unsupported event release');
   });
   it('missing policy file exits 1', async () => {
     const { deps } = syncDeps();
@@ -479,6 +479,22 @@ describe('sync sends a dependency summary on the default branch', () => {
     cap();
     expect(await run(deps)).toBe(0);
     expect(f.calls.map((c) => c.url)).toContain('https://decant.example/api/projects/proj/deps');
+  });
+
+  it('weekly schedule on main syncs main and sends it', async () => {
+    const { deps, f } = syncDeps({ event: 'schedule', payload: dispatch, files, env });
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(f.calls[0].headers.get('authorization')).toBe('Bearer sync-tok');
+    expect(JSON.parse(f.calls[0].body!).ref).toBe('main');
+    expect(f.calls.map((c) => c.url)).toContain('https://decant.example/api/projects/proj/deps');
+  });
+
+  it('schedule off the default branch does nothing', async () => {
+    const { deps, f } = syncDeps({ event: 'schedule', payload: dispatch, files, env: { ...env, GITHUB_REF: 'refs/heads/feat' } });
+    cap();
+    expect(await run(deps)).toBe(0);
+    expect(f.calls).toHaveLength(0);
   });
 
   it('pull_request overlays never send it', async () => {

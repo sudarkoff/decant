@@ -2579,18 +2579,30 @@ function summarizePackageLock(text) {
   const root = packages[""] ?? {};
   const rootDeps = /* @__PURE__ */ new Set();
   for (const f of ROOT_FIELDS) for (const d of Object.keys(root[f] ?? {})) rootDeps.add(d);
+  function declared(from, names, into) {
+    for (const d of names) {
+      const k = resolve3(packages, from, d);
+      const t = k === null ? null : target(packages, k);
+      if (k !== null && t !== null && !into.has(t)) into.set(t, packages[k].link ? nameOf(k, packages[k]) : nameOf(t, packages[t]));
+    }
+  }
   const directKeys = /* @__PURE__ */ new Map();
-  for (const d of rootDeps) {
-    const k = resolve3(packages, "", d);
-    const t = k === null ? null : target(packages, k);
-    if (k !== null && t !== null) directKeys.set(t, packages[k].link ? nameOf(k, packages[k]) : nameOf(t, packages[t]));
+  declared("", rootDeps, directKeys);
+  const roots = new Map(directKeys);
+  for (const e of Object.values(packages)) {
+    if (!e.link || e.resolved === void 0) continue;
+    const ws = packages[e.resolved];
+    if (!ws) continue;
+    const names = /* @__PURE__ */ new Set();
+    for (const f of ROOT_FIELDS) for (const d of Object.keys(ws[f] ?? {})) names.add(d);
+    declared(e.resolved, names, roots);
   }
   const via = /* @__PURE__ */ new Map();
-  for (const [start, directName] of directKeys) {
+  for (const [start, directName] of roots) {
     const seen = /* @__PURE__ */ new Set([start]);
     const queue = [start];
-    while (queue.length > 0) {
-      const at = queue.shift();
+    for (let qi = 0; qi < queue.length; qi++) {
+      const at = queue[qi];
       const e = packages[at];
       for (const f of DEP_FIELDS) {
         for (const d of Object.keys(e[f] ?? {})) {
@@ -2781,7 +2793,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       policy = base.policy;
       if (o.changed) notice("policy changes in decant.json take effect after merge");
     }
-  } else if (event === "push" || event === "workflow_dispatch") {
+  } else if (event === "push" || event === "workflow_dispatch" || event === "schedule") {
     const branch = payload.repository?.default_branch ?? "";
     if (!branch || env.GITHUB_REF !== `refs/heads/${branch}`) {
       if (event === "workflow_dispatch") return fail3("sync must run on the default branch");

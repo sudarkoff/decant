@@ -128,7 +128,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       policy = base.policy;
       if (o.changed) notice('policy changes in decant.json take effect after merge');
     }
-  } else if (event === 'push' || event === 'workflow_dispatch') {
+  } else if (event === 'push' || event === 'workflow_dispatch' || event === 'schedule') {
     // Match the full ref: GITHUB_REF_NAME is also set for tags, so a tag named like the branch must not pass.
     const branch = payload.repository?.default_branch ?? '';
     if (!branch || env.GITHUB_REF !== `refs/heads/${branch}`) {
