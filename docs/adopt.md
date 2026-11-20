@@ -46,6 +46,7 @@ Copy these to `.github/workflows/`:
 
 - `decant-pr.yml`: on every PR, syncs the PR overlay policy then scans. Needs `contents: read`, `pull-requests: write`, `issues: write` (labels and comments) and a full checkout (`fetch-depth: 0`, `persist-credentials: false`) so it can read the base branch's lockfile and policy. It runs on `edited` too, so changing a PR's base resets review state, and on `labeled`/`unlabeled`, so adding `decant:reviewed` re-runs the check.
   The overlay is built from the **base branch's** `decant.json` plus the PR's new `allow` entries and any `block` entries it adds. Other policy edits in a PR (`cooldownDays`, `autoShip`, removing a block) are not applied to the PR: the run posts the notice `policy changes in decant.json take effect after merge`. There is deliberately no `paths:` filter: a required check that never runs on a PR stays "Expected" and blocks the merge. When no lockfile changed, scan exits quickly and does not install GuardDog (it is installed lazily, only when a new package needs scanning).
+  Runner cost: every decant check run takes a runner, and a busy PR (pushes, label changes, edits) starts several. The example sets `concurrency` with `cancel-in-progress`, so a newer run cancels the superseded one. Each audit PR also runs your repo's full CI; audit opens at most one PR per run.
 - `decant-main.yml`: on pushes to the default branch that change `decant.json`, and on demand (`workflow_dispatch`), syncs the main policy using the environment's sync token. PR overlays are rejected until main has been synced once, so add this workflow first (see [step 5](#5-sync-main-then-run-adopt)).
 - `decant-audit.yml`: daily at 05:23 UTC and on demand. **It runs on the default branch only**, and the job is guarded to refuse any other ref. It needs Node and Go on the runner (the example installs both) because it runs `npm` and `go` to prepare fixes. For an npm-only repo, delete the setup-go step (or use `go-version: stable` instead of `go-version-file`).
   Each run opens **at most one security PR**, on branch `decant/security-fixes`, titled `decant: security fixes (N packages, M advisories)`. It groups advisories by package and raises each package to the highest fixed version its advisories need (per major line; direct dependencies are bumped, transitive ones get `overrides`), resolved through the overlay ref `audit`. The PR body lists every package, its advisories and severity, and anything left out. `decant.json` gains one advisory-cited `allow` entry per fixed version, so the fixes skip the cooldown.
@@ -73,6 +74,9 @@ on:
 jobs:
   decant:
     if: github.event_name == 'pull_request'
+    concurrency:
+      group: decant-build-sync-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
