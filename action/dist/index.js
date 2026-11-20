@@ -82,7 +82,8 @@ function defaultDeps() {
 import { appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 function getInput(name, env = process.env) {
-  return (env[`INPUT_${name.replace(/-/g, "_").toUpperCase()}`] ?? "").trim();
+  const key2 = name.replace(/ /g, "_").toUpperCase();
+  return (env[`INPUT_${key2}`] ?? env[`INPUT_${key2.replace(/-/g, "_")}`] ?? "").trim();
 }
 function escapeData(s) {
   return s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
