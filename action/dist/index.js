@@ -2262,6 +2262,8 @@ async function run4({ deps, inputs }) {
     if (!reason) return fail2("bypass requires bypass-reason");
     await deps.fs.writeFile(npmrc, "registry=https://registry.npmjs.org/\nignore-scripts=true\n");
     exportVar("GOPROXY", "https://proxy.golang.org", env);
+    exportVar("npm_config_registry", "https://registry.npmjs.org/", env);
+    exportVar("npm_config_ignore_scripts", "true", env);
     const actor = env.GITHUB_ACTOR ?? "";
     warning(`decant BYPASSED by ${actor}: ${reason}`);
     const runUrl = `${env.GITHUB_SERVER_URL ?? ""}/${env.GITHUB_REPOSITORY ?? ""}/actions/runs/${env.GITHUB_RUN_ID ?? ""}`;
@@ -2296,6 +2298,8 @@ ignore-scripts=true
   await deps.fs.chmod(npmrc, 384);
   await deps.fs.chmod(netrc, 384);
   exportVar("GOPROXY", `${base}/go`, env);
+  exportVar("npm_config_registry", `${base}/npm/`, env);
+  exportVar("npm_config_ignore_scripts", "true", env);
   return 0;
 }
 

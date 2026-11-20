@@ -104,6 +104,9 @@ describe('setup', () => {
     expect(t.read('summary')).toContain('Actor: alice · Reason: outage · Run: https://github.com/o/r/actions/runs/99');
     for (const v of fs.files.values()) expect(v).not.toContain(TOKEN);
     expect(t.read('env')).not.toContain(TOKEN);
+    expect(t.read('env')).toContain('npm_config_registry<<');
+    expect(t.read('env')).toContain('https://registry.npmjs.org/');
+    expect(t.read('env')).not.toContain('decant.example');
   });
   it('bypass other than true is false', async () => {
     const { deps, fs } = setupDeps({ INPUT_BYPASS: 'yes' });
@@ -266,6 +269,23 @@ describe('review fixes', () => {
   });
 });
 
+function exported(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(\w+)<<(.+)$/.exec(lines[i]!);
+    if (m) {
+      const body: string[] = [];
+      for (i++; i < lines.length && lines[i] !== m[2]; i++) body.push(lines[i]!);
+      out[m[1]!] = body.join('\n');
+    } else if (lines[i]!.includes('=')) {
+      const j = lines[i]!.indexOf('=');
+      out[lines[i]!.slice(0, j)] = lines[i]!.slice(j + 1);
+    }
+  }
+  return out;
+}
+
 describe('setup through the PR overlay', () => {
   function prSetup(event: string, payload: unknown) {
     const { deps, fs, t } = setupDeps({ GITHUB_EVENT_NAME: event, GITHUB_EVENT_PATH: '/event.json' });
@@ -284,6 +304,10 @@ describe('setup through the PR overlay', () => {
     expect(fs.files.get('/home/r/.netrc')).toBe(`machine decant.example login decant password ${TOKEN}\n`);
     expect(t.read('env')).toContain('https://decant.example/r/pr-12/go');
     expect(t.read('env')).not.toContain(TOKEN);
+    expect(exported(t.read('env'))).toMatchObject({
+      npm_config_registry: 'https://decant.example/r/pr-12/npm/',
+      npm_config_ignore_scripts: 'true',
+    });
   });
   it('fork pull_request keeps the main paths (no overlay is synced for forks)', async () => {
     const { deps, fs } = prSetup('pull_request', { pull_request: { number: 12, head: { repo: { full_name: 'x/r' } } }, repository: repo });
@@ -298,6 +322,11 @@ describe('setup through the PR overlay', () => {
     expect(fs.files.get('/home/r/.npmrc')).toContain('//decant.example/npm/:_authToken=');
     expect(t.read('env')).toContain('https://decant.example/go');
     expect(t.read('env')).not.toContain('/r/pr-');
+    expect(exported(t.read('env'))).toMatchObject({
+      npm_config_registry: 'https://decant.example/npm/',
+      npm_config_ignore_scripts: 'true',
+    });
+    expect(t.read('env')).not.toContain(TOKEN);
   });
   it('pull_request payload without a number fails', async () => {
     const { deps } = prSetup('pull_request', { repository: repo });

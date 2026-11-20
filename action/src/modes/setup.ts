@@ -23,6 +23,9 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     if (!reason) return fail('bypass requires bypass-reason');
     await deps.fs.writeFile(npmrc, 'registry=https://registry.npmjs.org/\nignore-scripts=true\n');
     exportVar('GOPROXY', 'https://proxy.golang.org', env);
+    // Env beats a committed project .npmrc, so it can't keep pointing at decant during a bypass.
+    exportVar('npm_config_registry', 'https://registry.npmjs.org/', env);
+    exportVar('npm_config_ignore_scripts', 'true', env);
     const actor = env.GITHUB_ACTOR ?? '';
     warning(`decant BYPASSED by ${actor}: ${reason}`);
     const runUrl = `${env.GITHUB_SERVER_URL ?? ''}/${env.GITHUB_REPOSITORY ?? ''}/actions/runs/${env.GITHUB_RUN_ID ?? ''}`;
@@ -56,5 +59,9 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   await deps.fs.chmod(npmrc, 0o600);
   await deps.fs.chmod(netrc, 0o600);
   exportVar('GOPROXY', `${base}/go`, env);
+  // npm precedence is CLI > env > project .npmrc > user ~/.npmrc: a committed project .npmrc registry
+  // would beat ~/.npmrc, so export the registry. Auth still comes from ~/.npmrc, matched by URL prefix.
+  exportVar('npm_config_registry', `${base}/npm/`, env);
+  exportVar('npm_config_ignore_scripts', 'true', env);
   return 0;
 }

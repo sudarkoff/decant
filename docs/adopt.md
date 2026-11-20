@@ -94,7 +94,7 @@ jobs:
       - run: npm ci --ignore-scripts
 ```
 
-`setup` writes `~/.npmrc` and `~/.netrc` (mode 600) and exports `GOPROXY`. For Go, run `go` after it with no `,direct` anywhere. On other events (push, workflow_dispatch) and on fork PRs it uses the main paths.
+`setup` writes `~/.npmrc` and `~/.netrc` (mode 600) and exports `GOPROXY`, `npm_config_registry` and `npm_config_ignore_scripts` (no token in any exported variable). For Go, run `go` after it with no `,direct` anywhere. On other events (push, workflow_dispatch) and on fork PRs it uses the main paths.
 
 After a PR that adds allow entries merges, a build on the merge commit can start before `decant-main.yml` has synced them to main, and fail to install the new version. Re-run the failed build once the **decant main** run is green (or trigger the build from it with `on: workflow_run: workflows: [decant main]`).
 
@@ -113,13 +113,15 @@ The project name defaults to the repo name lowercased; it must match `^[a-z0-9][
 
 ## 6. Local development
 
-npm, in `~/.npmrc`:
+npm: commit a per-app `.npmrc` (the token stays in your environment, never in the file):
 
 ```ini
 registry=https://<your-domain>/npm/
-//<your-domain>/npm/:_authToken=<read-token>
+//<your-domain>/npm/:_authToken=${DECANT_READ_TOKEN}
 ignore-scripts=true
 ```
+
+Export `DECANT_READ_TOKEN` locally. In CI, the `setup` step also exports `npm_config_registry` (and `npm_config_ignore_scripts=true`), which beats the project `.npmrc`. That is how PR builds install through the PR overlay (`/r/pr-<n>/npm/`) and how an emergency bypass reaches `registry.npmjs.org` even though the committed `.npmrc` points at decant.
 
 Go, in `~/.netrc` (mode 600):
 
