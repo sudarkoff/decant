@@ -1,5 +1,7 @@
 import { formatPackageId, type Deps, type Ecosystem, type PackageRef } from './types';
+import type { Severity } from './policy/schema';
 import { upstreamTimeout } from './upstream';
+import { severityOf } from './vuln-severity';
 
 const OSV = 'https://api.osv.dev';
 const OSV_ECO: Record<Ecosystem, string> = { npm: 'npm', go: 'Go' };
@@ -14,6 +16,9 @@ interface OsvVuln {
   id?: string;
   aliases?: string[];
   published?: string;
+  summary?: string;
+  database_specific?: { severity?: unknown };
+  severity?: { type?: string; score?: string }[];
   affected?: { package?: { ecosystem?: string; name?: string } }[];
 }
 
@@ -92,8 +97,10 @@ export async function verifyAdvisoryFix(
   }
 }
 
-/** packageId → MAL- advisory IDs, for refs with at least one. null if OSV is unavailable. */
-export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<string, string[]> | null> {
+export interface VulnDetails { severity: Severity | 'unknown'; summary: string; published: string | null }
+
+/** packageId → all advisory IDs, for refs with at least one. null if OSV is unavailable. */
+export async function vulnIds(deps: Deps, refs: PackageRef[]): Promise<Map<string, string[]> | null> {
   const out = new Map<string, string[]>();
   try {
     for (let i = 0; i < refs.length; i += BATCH_SIZE) {
@@ -110,10 +117,10 @@ export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<
         const next: typeof pending = [];
         results.forEach((res, j) => {
           const ref = pending[j]!.ref;
-          const mal = (res.vulns ?? []).map((v) => v.id).filter((id): id is string => !!id && id.startsWith('MAL-'));
-          if (mal.length > 0) {
+          const ids = (res.vulns ?? []).map((v) => v.id).filter((id): id is string => !!id);
+          if (ids.length > 0) {
             const key = formatPackageId(ref);
-            out.set(key, [...(out.get(key) ?? []), ...mal]);
+            out.set(key, [...new Set([...(out.get(key) ?? []), ...ids])]);
           }
           if (res.next_page_token) next.push({ ref, token: res.next_page_token });
         });
@@ -121,6 +128,42 @@ export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<
       }
     }
     return out;
+  } catch (err) {
+    if (err instanceof Unavailable) return null;
+    throw err;
+  }
+}
+
+/** packageId → MAL- advisory IDs, for refs with at least one. null if OSV is unavailable. */
+export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<string, string[]> | null> {
+  const all = await vulnIds(deps, refs);
+  if (all === null) return null;
+  const out = new Map<string, string[]>();
+  for (const [key, ids] of all) {
+    const mal = ids.filter((id) => id.startsWith('MAL-'));
+    if (mal.length > 0) out.set(key, mal);
+  }
+  return out;
+}
+
+/**
+ * Severity, summary (first 200 chars) and publish time of one OSV record; null if unavailable or unknown to OSV.
+ * Successful lookups are memoised in `cache`, which the caller scopes to one run.
+ */
+export async function vulnDetails(deps: Deps, id: string, cache?: Map<string, VulnDetails>): Promise<VulnDetails | null> {
+  const hit = cache?.get(id);
+  if (hit) return hit;
+  try {
+    const res = await osvFetch(deps, `/v1/vulns/${encodeURIComponent(id)}`);
+    if (!res.ok) return null;
+    const v = await okJson<OsvVuln>(res);
+    const d: VulnDetails = {
+      severity: severityOf(v),
+      summary: typeof v.summary === 'string' ? v.summary.slice(0, 200) : '',
+      published: typeof v.published === 'string' ? v.published : null,
+    };
+    cache?.set(id, d);
+    return d;
   } catch (err) {
     if (err instanceof Unavailable) return null;
     throw err;
