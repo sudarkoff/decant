@@ -4,8 +4,7 @@
  * Under a burst of cold-cache requests (a `go build` fetching dozens of modules at once) D1 can
  * answer a statement with a transient error: overloaded, queue timeout, network connection lost,
  * SQLITE_BUSY. One retry rides those out. Only for registry routes, whose writes are all
- * idempotent (INSERT OR IGNORE, COALESCE, conflict = 1) or stats (a lost-ack retry can count one
- * request twice, which is acceptable).
+ * idempotent (INSERT OR IGNORE, COALESCE, conflict = 1). Stats counters bypass it via noRetry().
  */
 
 const RETRY_DELAY_MS = 30;
@@ -40,12 +39,25 @@ function wrapStmt(s: D1PreparedStatement): D1PreparedStatement {
   return w as unknown as D1PreparedStatement;
 }
 
+// Retrying binding → the binding it wraps.
+const unwrapped = new WeakMap<object, D1Database>();
+
+/**
+ * The binding without retries. For non-idempotent writes (the request_counts `n = n + 1` upsert): a
+ * retry after a lost acknowledgement would count one request twice.
+ */
+export function noRetry(db: D1Database): D1Database {
+  return unwrapped.get(db) ?? db;
+}
+
 export function retryingD1(db: D1Database): D1Database {
-  return {
+  const r = {
     prepare: (q: string) => wrapStmt(db.prepare(q)),
     batch: <T>(stmts: D1PreparedStatement[]) => once(() => db.batch<T>(stmts.map(unwrap))),
     exec: (q: string) => db.exec(q),
     withSession: (c?: D1SessionBookmark | D1SessionConstraint) => db.withSession(c),
     dump: () => db.dump(),
   } as D1Database;
+  unwrapped.set(r, db);
+  return r;
 }

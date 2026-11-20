@@ -56,8 +56,13 @@ export function hang(): (req: Request) => Promise<Response> {
 /**
  * Wraps a D1 binding so statements whose SQL matches `fail` throw a D1-style transient error
  * whenever `fail` returns true for them. A batch fails if any statement in it would.
+ * With `lostAck`, a statement's run() executes first and then throws (the write landed, the answer was lost).
  */
-export function flakyDb(db: D1Database, fail: (sql: string) => boolean): D1Database & { failures: number } {
+export function flakyDb(
+  db: D1Database,
+  fail: (sql: string) => boolean,
+  opts: { lostAck?: boolean } = {},
+): D1Database & { failures: number } {
   const real = new WeakMap<object, { s: D1PreparedStatement; sql: string }>();
   let failures = 0;
   const boom = (sql: string) => {
@@ -69,7 +74,12 @@ export function flakyDb(db: D1Database, fail: (sql: string) => boolean): D1Datab
     const w = {
       bind: (...v: unknown[]) => wrap(s.bind(...v), sql),
       first: async (c?: string) => (boom(sql), c === undefined ? s.first() : s.first(c)),
-      run: async () => (boom(sql), s.run()),
+      run: async () => {
+        if (!opts.lostAck) return boom(sql), s.run();
+        const r = await s.run();
+        boom(sql);
+        return r;
+      },
       all: async () => (boom(sql), s.all()),
       raw: async () => (boom(sql), s.raw()),
     };

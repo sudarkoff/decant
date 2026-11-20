@@ -166,6 +166,38 @@ describe('registry requests never throw', () => {
     void owner;
   });
 
+  it('a stuck single-flight owner is dropped once a joiner times out: later requests do not wait again', async () => {
+    const key = 'go/example.com/sf/stuck/@v/v1.0.0.mod';
+    const url = `${PROXY}/example.com/sf/stuck/@v/v1.0.0.mod`;
+    const good = (): Deps => ({ fetch: fakeFetch({ [url]: new Response('module x\n') }), now, timeoutMs: 50 });
+    void cachedFetch(e, { fetch: () => new Promise<Response>(() => {}), now, timeoutMs: 50 }, { key, url, immutable: true });
+    expect((await cachedFetch(e, good(), { key, url, immutable: true })).status).toBe('ok'); // waits ~1.1 s
+    // R2 now holds it, but the point is the wait: a later request must not join the stuck owner.
+    const t0 = Date.now();
+    expect((await cachedFetch(e, good(), { key, url, immutable: true })).status).toBe('ok');
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it('stats upserts are never retried: a lost ack does not count a request twice', async () => {
+    const day = '2026-11-19';
+    const count = async () =>
+      (await e.DB.prepare(
+        "SELECT COALESCE(SUM(n), 0) AS n FROM request_counts WHERE project_id = 'rp' AND day = ? AND eco = 'go' AND kind = 'download'",
+      )
+        .bind(day)
+        .first<number>('n')) ?? 0;
+    const before = await count();
+    let failed = false;
+    const db = flakyDb(e.DB, (sql) => !failed && sql.includes('INSERT INTO request_counts') && (failed = true), { lostAck: true });
+    const { req, flush } = run(db, moduleRoutes('example.com/stats/once', 'v1.0.0'));
+    const r = await req('/go/example.com/stats/once/@v/v1.0.0.mod');
+    expect(r.status).toBe(200);
+    await r.text();
+    expect(await flush()).toBe(0);
+    expect(db.failures).toBe(1);
+    expect((await count()) - before).toBe(1);
+  });
+
   it('an R2 read failure on the cold path falls through to upstream', async () => {
     const b = e.BUCKET;
     const bucket = {

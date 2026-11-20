@@ -1,3 +1,4 @@
+import { noRetry } from '../d1-retry';
 import type { Ecosystem, Env } from '../types';
 
 export type Kind = 'metadata' | 'download';
@@ -23,7 +24,10 @@ function background(ctx: ExecutionContext, what: string, work: () => Promise<unk
   }
 }
 
-/** One upsert into request_counts for (project, UTC day, eco, kind, outcome). */
+/**
+ * One upsert into request_counts for (project, UTC day, eco, kind, outcome). Never retried (noRetry):
+ * `n = n + 1` is not idempotent, so a retry after a lost acknowledgement would count the request twice.
+ */
 export function recordRequest(
   env: Env,
   ctx: ExecutionContext,
@@ -34,7 +38,7 @@ export function recordRequest(
   now: Date,
 ): void {
   background(ctx, 'request count', () =>
-    env.DB.prepare(
+    noRetry(env.DB).prepare(
       `INSERT INTO request_counts (project_id, day, eco, kind, outcome, n) VALUES (?, ?, ?, ?, ?, 1)
        ON CONFLICT(project_id, day, eco, kind, outcome) DO UPDATE SET n = n + 1`,
     )

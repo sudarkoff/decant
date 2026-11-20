@@ -49,7 +49,7 @@ function joinWaitMs(deps: Deps): number {
 
 export function cachedFetch(env: Env, deps: Deps, opts: CachedFetchOpts): Promise<CachedFetchResult> {
   const existing = inflight.get(opts.key);
-  if (existing) return join(existing, () => safeRun(env, deps, opts), joinWaitMs(deps));
+  if (existing) return join(opts.key, existing, () => safeRun(env, deps, opts), joinWaitMs(deps));
   const p = safeRun(env, deps, opts).finally(() => {
     if (inflight.get(opts.key) === p) inflight.delete(opts.key);
   });
@@ -57,13 +57,22 @@ export function cachedFetch(env: Env, deps: Deps, opts: CachedFetchOpts): Promis
   return p;
 }
 
-async function join(shared: Promise<CachedFetchResult>, own: () => Promise<CachedFetchResult>, waitMs: number): Promise<CachedFetchResult> {
+async function join(
+  key: string,
+  shared: Promise<CachedFetchResult>,
+  own: () => Promise<CachedFetchResult>,
+  waitMs: number,
+): Promise<CachedFetchResult> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<null>((r) => {
     timer = setTimeout(() => r(null), waitMs);
   });
   try {
-    return (await Promise.race([shared, timedOut])) ?? (await own());
+    const r = await Promise.race([shared, timedOut]);
+    if (r) return r;
+    // The owner is stuck: drop it so later requests for the key don't wait on it again.
+    if (inflight.get(key) === shared) inflight.delete(key);
+    return await own();
   } finally {
     clearTimeout(timer);
   }

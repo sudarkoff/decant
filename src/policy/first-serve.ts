@@ -14,8 +14,8 @@ export async function storedObject(env: Env, key: string): Promise<R2ObjectBody 
 
 /**
  * The first-serve OSV check: true if OSV lists a MAL- advisory for `ref` (and records the block).
- * Any OSV failure counts as OSV down: serve, and the cron re-checks anything left with osv_checked_at
- * null. Recording is best-effort: a known-malicious version is refused whether or not its block row was
+ * Fail-open by design, for ANY error (OSV down, malformed answer, anything vulnIds throws): the version
+ * is served, osv_checked_at stays null, and the daily cron re-checks it. Recording is best-effort: a known-malicious version is refused whether or not its block row was
  * written, and it is marked checked only once the block is written, so the cron retries a lost block.
  */
 export async function osvMalicious(env: Env, deps: Deps, ref: PackageRef, now: Date): Promise<boolean> {
