@@ -194,8 +194,8 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
   const checks = await Promise.all(
     advisories.map((a) => verifyAdvisoryFix(deps, a.advisory!, parsePackageId(a.package)!)),
   );
-  if (checks.includes('unavailable')) return err(503, 'OSV unavailable; retry the sync');
-  const bad = advisories.map((a, i) => ({ a, r: checks[i] })).filter((x) => x.r !== 'verified');
+  if (checks.some((c) => c.result === 'unavailable')) return err(503, 'OSV unavailable; retry the sync');
+  const bad = advisories.map((a, i) => ({ a, r: checks[i]!.result })).filter((x) => x.r !== 'verified');
   if (bad.length > 0) {
     const entries = bad.map((x) => `${x.a.package} (${x.a.advisory}: ${x.r})`);
     return err(422, `advisory not verified: ${entries.join(', ')}`, { entries });
@@ -208,21 +208,34 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
       `INSERT INTO policies (project_id, ref, json, sha, synced_at) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT (project_id, ref) DO UPDATE SET json = excluded.json, sha = excluded.sha, synced_at = excluded.synced_at`,
     ).bind(projectId, ref, JSON.stringify(policy), sha, now),
-    db.prepare('DELETE FROM allows WHERE project_id = ? AND ref = ?').bind(projectId, ref),
   ];
   // One INSERT ... SELECT FROM json_each per table: a sync is a fixed handful of D1 statements
   // regardless of policy size (each batched statement counts against the per-invocation query limit).
+  const published = new Map(advisories.map((a, i) => [a.package, checks[i]!.published]));
   const allowRows = policy.allow.map((a) => {
     const p = parsePackageId(a.package)!;
-    return [p.eco, p.name, p.version, a.advisory ?? null, a.reason, a.advisory ? now : null];
+    return [p.eco, p.name, p.version, a.advisory ?? null, a.reason, a.advisory ? now : null, published.get(a.package) ?? null];
   });
+  // Rows no longer in the policy are deleted; the rest are upserted so first_synced_at survives (kept while the
+  // advisory is unchanged, else reset to now) without reading old rows outside the atomic batch.
+  stmts.push(
+    db.prepare(
+      `DELETE FROM allows WHERE project_id = ?1 AND ref = ?2 AND NOT EXISTS (
+         SELECT 1 FROM json_each(?3) j WHERE j.value ->> 0 = allows.eco AND j.value ->> 1 = allows.name AND j.value ->> 2 = allows.version)`,
+    ).bind(projectId, ref, JSON.stringify(allowRows)),
+  );
   if (allowRows.length > 0) {
     stmts.push(
       db.prepare(
-        `INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at)
-         SELECT ?1, ?2, j.value ->> 0, j.value ->> 1, j.value ->> 2, j.value ->> 3, j.value ->> 4, j.value ->> 5
-         FROM json_each(?3) j`,
-      ).bind(projectId, ref, JSON.stringify(allowRows)),
+        `INSERT INTO allows (project_id, ref, eco, name, version, advisory, reason, verified_at, advisory_published, first_synced_at)
+         SELECT ?1, ?2, j.value ->> 0, j.value ->> 1, j.value ->> 2, j.value ->> 3, j.value ->> 4, j.value ->> 5, j.value ->> 6, ?4
+         FROM json_each(?3) j WHERE true
+         ON CONFLICT (project_id, ref, eco, name, version) DO UPDATE SET
+           advisory = excluded.advisory, reason = excluded.reason, verified_at = excluded.verified_at,
+           advisory_published = excluded.advisory_published,
+           first_synced_at = CASE WHEN allows.advisory IS excluded.advisory AND allows.first_synced_at IS NOT NULL
+                                  THEN allows.first_synced_at ELSE excluded.first_synced_at END`,
+      ).bind(projectId, ref, JSON.stringify(allowRows), now),
     );
   }
   if (isMain) {

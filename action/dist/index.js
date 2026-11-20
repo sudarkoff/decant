@@ -1089,15 +1089,7 @@ function decant(f, url, token) {
   };
 }
 
-// action/src/osv.ts
-var OSV = "https://api.osv.dev";
-var OSV_ECO = { npm: "npm", go: "Go" };
-var BATCH = 1e3;
-var MAX_PAGES2 = 10;
-var DETAIL_CONCURRENCY = 8;
-function depKey(d) {
-  return `${d.eco}:${d.name}@${d.version}`;
-}
+// src/vuln-severity.ts
 var GHSA_SEVERITY = { CRITICAL: "critical", HIGH: "high", MODERATE: "moderate", MEDIUM: "moderate", LOW: "low" };
 var RANK = { unknown: 0, low: 1, moderate: 2, high: 3, critical: 4 };
 function maxSeverity(...s) {
@@ -1138,11 +1130,21 @@ function cvss31BaseScore(vector) {
 function scoreSeverity(score) {
   return score >= 9 ? "critical" : score >= 7 ? "high" : score >= 4 ? "moderate" : score > 0 ? "low" : "unknown";
 }
-function ownSeverity(r) {
+function severityOf(r) {
   const sev = r.database_specific?.severity;
   const db = typeof sev === "string" ? GHSA_SEVERITY[sev.toUpperCase()] ?? "unknown" : "unknown";
   const cvss = (r.severity ?? []).filter((x) => x.type === "CVSS_V3" && typeof x.score === "string").map((x) => cvss31BaseScore(x.score)).map((n) => n === null ? "unknown" : scoreSeverity(n));
   return maxSeverity(db, ...cvss);
+}
+
+// action/src/osv.ts
+var OSV = "https://api.osv.dev";
+var OSV_ECO = { npm: "npm", go: "Go" };
+var BATCH = 1e3;
+var MAX_PAGES2 = 10;
+var DETAIL_CONCURRENCY = 8;
+function depKey(d) {
+  return `${d.eco}:${d.name}@${d.version}`;
 }
 var withV = (eco, v) => eco === "go" && !v.startsWith("v") ? `v${v}` : v;
 function rangeCover(events, eco, version) {
@@ -1206,7 +1208,7 @@ function toVuln(r) {
   return {
     id: r.id,
     aliases: r.aliases ?? [],
-    severity: ownSeverity(r),
+    severity: severityOf(r),
     summary: r.summary ?? r.details?.split("\n")[0] ?? "",
     malicious: r.id.startsWith("MAL-"),
     fixedFor(eco, name, version) {

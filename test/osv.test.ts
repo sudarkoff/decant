@@ -21,8 +21,18 @@ describe('verifyAdvisoryFix', () => {
         return Response.json({});
       },
     });
-    expect(await verifyAdvisoryFix({ fetch: f, now }, ghsa, ref)).toBe('verified');
+    expect((await verifyAdvisoryFix({ fetch: f, now }, ghsa, ref)).result).toBe('verified');
     expect(body).toEqual({ package: { name: 'lodash', ecosystem: 'npm' }, version: '4.17.21' });
+  });
+
+  it('returns the record published timestamp (null when absent)', async () => {
+    const withPub = fakeFetch({
+      [`${OSV}/v1/vulns/${ghsa}`]: Response.json({ id: ghsa, published: '2021-02-15T00:00:00Z', affected: [{ package: { ecosystem: 'npm', name: 'lodash' } }] }),
+      [`${OSV}/v1/query`]: Response.json({}),
+    });
+    expect(await verifyAdvisoryFix({ fetch: withPub, now }, ghsa, ref)).toEqual({ result: 'verified', published: '2021-02-15T00:00:00Z' });
+    const without = fakeFetch({ [`${OSV}/v1/vulns/${ghsa}`]: new Response('nf', { status: 404 }) });
+    expect(await verifyAdvisoryFix({ fetch: without, now }, ghsa, ref)).toEqual({ result: 'unknown-advisory', published: null });
   });
 
   it('not-fixed when the version is still affected (match by alias)', async () => {
@@ -30,16 +40,16 @@ describe('verifyAdvisoryFix', () => {
       [`${OSV}/v1/vulns/CVE-2021-23337`]: vuln('npm', 'lodash', ghsa, ['CVE-2021-23337']),
       [`${OSV}/v1/query`]: Response.json({ vulns: [{ id: ghsa, aliases: ['CVE-2021-23337'] }] }),
     });
-    expect(await verifyAdvisoryFix({ fetch: f, now }, 'CVE-2021-23337', ref)).toBe('not-fixed');
+    expect((await verifyAdvisoryFix({ fetch: f, now }, 'CVE-2021-23337', ref)).result).toBe('not-fixed');
   });
 
   it('unknown-advisory on 404 or when the package is not listed', async () => {
     const f404 = fakeFetch({ [`${OSV}/v1/vulns/${ghsa}`]: new Response('nf', { status: 404 }) });
-    expect(await verifyAdvisoryFix({ fetch: f404, now }, ghsa, ref)).toBe('unknown-advisory');
+    expect((await verifyAdvisoryFix({ fetch: f404, now }, ghsa, ref)).result).toBe('unknown-advisory');
     const other = fakeFetch({ [`${OSV}/v1/vulns/${ghsa}`]: vuln('npm', 'underscore') });
-    expect(await verifyAdvisoryFix({ fetch: other, now }, ghsa, ref)).toBe('unknown-advisory');
+    expect((await verifyAdvisoryFix({ fetch: other, now }, ghsa, ref)).result).toBe('unknown-advisory');
     const wrongEco = fakeFetch({ [`${OSV}/v1/vulns/${ghsa}`]: vuln('Go', 'lodash') });
-    expect(await verifyAdvisoryFix({ fetch: wrongEco, now }, ghsa, ref)).toBe('unknown-advisory');
+    expect((await verifyAdvisoryFix({ fetch: wrongEco, now }, ghsa, ref)).result).toBe('unknown-advisory');
   });
 
   it('uses the Go ecosystem name and strips the v prefix for Go queries', async () => {
@@ -52,7 +62,7 @@ describe('verifyAdvisoryFix', () => {
       },
     });
     const goRef: PackageRef = { eco: 'go', name: 'github.com/x/y', version: 'v1.2.3' };
-    expect(await verifyAdvisoryFix({ fetch: f, now }, 'GO-2024-0001', goRef)).toBe('verified');
+    expect((await verifyAdvisoryFix({ fetch: f, now }, 'GO-2024-0001', goRef)).result).toBe('verified');
     expect(body).toEqual({ package: { name: 'github.com/x/y', ecosystem: 'Go' }, version: '1.2.3' });
   });
 
@@ -66,20 +76,20 @@ describe('verifyAdvisoryFix', () => {
       [`${OSV}/v1/query`]: Response.json({ vulns: [{ id: 'GO-2025-1' }] }),
     });
     const goRef: PackageRef = { eco: 'go', name: 'github.com/x/y', version: 'v1.0.0' };
-    expect(await verifyAdvisoryFix({ fetch: f, now }, ghsa, goRef)).toBe('not-fixed');
+    expect((await verifyAdvisoryFix({ fetch: f, now }, ghsa, goRef)).result).toBe('not-fixed');
   });
 
   it('unavailable on network error, 5xx and 429', async () => {
     const thrown = fakeFetch({});
-    expect(await verifyAdvisoryFix({ fetch: thrown, now }, ghsa, ref)).toBe('unavailable');
+    expect((await verifyAdvisoryFix({ fetch: thrown, now }, ghsa, ref)).result).toBe('unavailable');
     for (const status of [500, 503, 429]) {
       const f = fakeFetch({ [`${OSV}/v1/vulns/${ghsa}`]: new Response('x', { status }) });
-      expect(await verifyAdvisoryFix({ fetch: f, now }, ghsa, ref)).toBe('unavailable');
+      expect((await verifyAdvisoryFix({ fetch: f, now }, ghsa, ref)).result).toBe('unavailable');
       const q = fakeFetch({
         [`${OSV}/v1/vulns/${ghsa}`]: vuln('npm', 'lodash'),
         [`${OSV}/v1/query`]: new Response('x', { status }),
       });
-      expect(await verifyAdvisoryFix({ fetch: q, now }, ghsa, ref)).toBe('unavailable');
+      expect((await verifyAdvisoryFix({ fetch: q, now }, ghsa, ref)).result).toBe('unavailable');
     }
   });
 
@@ -95,7 +105,7 @@ describe('verifyAdvisoryFix', () => {
           : Response.json({ vulns: [{ id: 'GHSA-other' }], next_page_token: 'p2' });
       },
     });
-    expect(await verifyAdvisoryFix({ fetch: f, now }, ghsa, ref)).toBe('not-fixed');
+    expect((await verifyAdvisoryFix({ fetch: f, now }, ghsa, ref)).result).toBe('not-fixed');
     expect(n).toBe(2);
   });
 });
@@ -161,7 +171,7 @@ describe('OSV timeouts', () => {
   it('a hung OSV is unavailable for both calls', async () => {
     const f = fakeFetch({ [`${OSV}/v1/vulns/${ghsa}`]: hang(), [`${OSV}/v1/querybatch`]: hang() });
     const deps = { fetch: f, now, timeoutMs: 20 };
-    expect(await verifyAdvisoryFix(deps, ghsa, ref)).toBe('unavailable');
+    expect((await verifyAdvisoryFix(deps, ghsa, ref)).result).toBe('unavailable');
     expect(await maliciousIds(deps, [ref])).toBeNull();
   });
 });

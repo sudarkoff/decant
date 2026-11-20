@@ -13,6 +13,7 @@ class Unavailable extends Error {}
 interface OsvVuln {
   id?: string;
   aliases?: string[];
+  published?: string;
   affected?: { package?: { ecosystem?: string; name?: string } }[];
 }
 
@@ -56,14 +57,21 @@ async function okJson<T>(res: Response): Promise<T> {
  * Confirms that `advisory` covers ref.name in ref's ecosystem and that ref.version is NOT affected by it.
  * A CVE id that OSV does not index directly 404s → 'unknown-advisory' (cite the GHSA instead).
  */
-export async function verifyAdvisoryFix(deps: Deps, advisory: string, ref: PackageRef): Promise<AdvisoryCheck> {
+export async function verifyAdvisoryFix(
+  deps: Deps,
+  advisory: string,
+  ref: PackageRef,
+): Promise<{ result: AdvisoryCheck; published: string | null }> {
+  let published: string | null = null;
+  const done = (result: AdvisoryCheck) => ({ result, published });
   try {
     const res = await osvFetch(deps, `/v1/vulns/${encodeURIComponent(advisory)}`);
-    if (res.status >= 400 && res.status < 500) return 'unknown-advisory';
+    if (res.status >= 400 && res.status < 500) return done('unknown-advisory');
     const vuln = await okJson<OsvVuln>(res);
+    published = typeof vuln.published === 'string' ? vuln.published : null;
     const eco = OSV_ECO[ref.eco];
     const lists = (vuln.affected ?? []).some((a) => a.package?.ecosystem === eco && a.package?.name === ref.name);
-    if (!lists) return 'unknown-advisory';
+    if (!lists) return done('unknown-advisory');
 
     // Match the advisory under any of its names: the cited id, OSV's canonical id and its aliases
     // (e.g. a cited GHSA can come back from /v1/query as its GO- alias).
@@ -73,13 +81,13 @@ export async function verifyAdvisoryFix(deps: Deps, advisory: string, ref: Packa
       const q = { ...osvQuery(ref), ...(pageToken ? { page_token: pageToken } : {}) };
       const r = await okJson<{ vulns?: OsvVuln[]; next_page_token?: string }>(await osvFetch(deps, '/v1/query', q));
       const hit = (r.vulns ?? []).some((v) => (v.id !== undefined && ids.has(v.id)) || (v.aliases ?? []).some((a) => ids.has(a)));
-      if (hit) return 'not-fixed';
-      if (!r.next_page_token) return 'verified';
+      if (hit) return done('not-fixed');
+      if (!r.next_page_token) return done('verified');
       pageToken = r.next_page_token;
     }
-    return 'unavailable'; // too many pages to be sure: fail closed
+    return done('unavailable'); // too many pages to be sure: fail closed
   } catch (err) {
-    if (err instanceof Unavailable) return 'unavailable';
+    if (err instanceof Unavailable) return done('unavailable');
     throw err;
   }
 }
