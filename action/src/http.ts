@@ -48,38 +48,59 @@ export type RetryOpts = RequestOpts & {
   sleep: (ms: number) => Promise<void>;
   /** [0, 1); jitters each delay to 75–125% of its base. */
   random?: () => number;
+  /** Total time for all attempts of one call (default RETRY_DEADLINE_MS). */
+  deadlineMs?: number;
+  /** Clock in ms; injected by tests. */
+  now?: () => number;
+  /**
+   * Retry a 502/503/504 response (default true). False for writes where a gateway error may mean the
+   * write landed: those are retried only when fetch throws (no response at all).
+   */
+  retryStatuses?: boolean;
 };
 
 export const RETRY_DELAYS_MS = [500, 1000, 2000];
+export const RETRY_DEADLINE_MS = 60_000;
 const RETRY_STATUSES = new Set([502, 503, 504]);
 
 export const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /**
  * `request`, retried for connection-level failures: a fetch that throws (reset, socket closed, timeout)
- * or a 502/503/504 from a proxy in front of the server. Up to RETRY_DELAYS_MS.length + 1 attempts with
- * jittered backoff. Only for idempotent requests. A 4xx or other status is returned at once; a 502–504
- * that persists is returned as the last response; a throw that persists names the cause and the count.
+ * or (unless `retryStatuses` is false) a 502/503/504 from a proxy in front of the server. Up to
+ * RETRY_DELAYS_MS.length + 1 attempts with jittered backoff, all within `deadlineMs`: each attempt's
+ * timeout is cut to the time left, and no attempt starts once the deadline would be past. Only for
+ * idempotent requests. A 4xx or other status is returned at once; a 502–504 that persists is returned as
+ * the last response; a throw that persists names the cause and the attempt count.
  */
 export async function requestWithRetry(f: typeof fetch, url: string, init: RequestInit, o: RetryOpts): Promise<Response> {
   const attempts = RETRY_DELAYS_MS.length + 1;
   const random = o.random ?? Math.random;
+  const now = o.now ?? Date.now;
+  const deadlineMs = o.deadlineMs ?? RETRY_DEADLINE_MS;
+  const end = now() + deadlineMs;
+  const retryStatuses = o.retryStatuses ?? true;
   for (let i = 0; ; i++) {
+    const delay = i < RETRY_DELAYS_MS.length ? Math.round(RETRY_DELAYS_MS[i]! * (0.75 + 0.5 * random())) : 0;
     const last = i === attempts - 1;
+    const timeoutMs = Math.max(1, Math.min(o.timeoutMs, end - now()));
     let res: Response;
     try {
-      res = await f(url, { ...init, signal: AbortSignal.timeout(o.timeoutMs) });
+      res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     } catch (e) {
-      if (last) {
-        const why = isTimeout(e) ? `timed out (${o.timeoutMs / 1000}s)` : failure(e, o.timeoutMs);
-        throw new Error(redact(`${o.label}: ${why} after ${attempts} attempts`, o.secrets ?? []));
+      // Another attempt only if one is left and it would start before the deadline.
+      if (last || now() + delay >= end) {
+        const why = isTimeout(e) ? `timed out (${Math.round(timeoutMs / 1000)}s)` : failure(e, timeoutMs);
+        const n = `${i + 1} attempt${i === 0 ? '' : 's'}`;
+        const cut = i < attempts - 1 ? ` (${deadlineMs / 1000}s deadline)` : '';
+        throw new Error(redact(`${o.label}: ${why} after ${n}${cut}`, o.secrets ?? []));
       }
-      await o.sleep(Math.round(RETRY_DELAYS_MS[i]! * (0.75 + 0.5 * random())));
+      await o.sleep(delay);
       continue;
     }
-    if (last || !RETRY_STATUSES.has(res.status)) return res;
+    if (last || !retryStatuses || !RETRY_STATUSES.has(res.status) || now() + delay >= end) return res;
     await res.body?.cancel().catch(() => {});
-    await o.sleep(Math.round(RETRY_DELAYS_MS[i]! * (0.75 + 0.5 * random())));
+    await o.sleep(delay);
   }
 }
 

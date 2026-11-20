@@ -40,15 +40,17 @@ function npmMetaPath(name: string): string {
  * Client for the decant Worker. `token` is a ci token for /api (verdicts, blocks, status, overlay
  * syncs) or a sync token for main-ref policy syncs. The token goes only to `url`'s origin.
  *
- * Every request is retried on a connection-level failure or a 502/503/504 (see requestWithRetry). That
- * is safe because every call is idempotent: GETs; PUT /api/verdicts, which never lowers a stored
- * verdict's severity; and the policy and deps PUTs, which replace the ref's whole state.
+ * Every request is retried on a connection-level failure (see requestWithRetry), which is safe because
+ * every call is idempotent: GETs; PUT /api/verdicts, which never lowers a stored verdict's severity; and
+ * the policy and deps PUTs, which replace the ref's whole state. GETs and the verdict PUT are also
+ * retried on 502/503/504. The policy and deps PUTs are not: a gateway error may mean the write landed,
+ * and a late retry could overwrite a newer sync of the same ref.
  */
 export function decant(
   f: typeof fetch,
   url: string,
   token: string,
-  retry: { sleep?: (ms: number) => Promise<void>; random?: () => number } = {},
+  retry: { sleep?: (ms: number) => Promise<void>; random?: () => number; now?: () => number } = {},
 ) {
   const base = url.replace(/\/+$/, '');
   const origin = new URL(base).origin;
@@ -56,7 +58,11 @@ export function decant(
   const secrets = [token, basic];
   const bearer = { authorization: `Bearer ${token}` };
 
-  async function call(method: string, path: string, opts: { body?: unknown; headers?: Record<string, string> } = {}): Promise<Response> {
+  async function call(
+    method: string,
+    path: string,
+    opts: { body?: unknown; headers?: Record<string, string>; retryStatuses?: boolean } = {},
+  ): Promise<Response> {
     const target = path.startsWith('https://') || path.startsWith('http://') ? path : `${base}${path}`;
     if (new URL(target).origin !== origin) throw new Error(`decant: refusing to send credentials to another host (${new URL(target).host})`);
     const headers: Record<string, string> = { ...bearer, ...opts.headers };
@@ -71,6 +77,8 @@ export function decant(
       secrets,
       sleep: retry.sleep ?? realSleep,
       random: retry.random,
+      now: retry.now,
+      retryStatuses: opts.retryStatuses,
     });
   }
 
@@ -121,7 +129,7 @@ export function decant(
     /** PUT the policy for `ref`. Never throws on an HTTP status: the caller reports {status, body}. */
     async syncPolicy(project: string, policy: unknown, sha: string, ref: string): Promise<{ status: number; body: unknown }> {
       const parsed = typeof policy === 'string' ? (JSON.parse(policy) as unknown) : policy;
-      const res = await call('PUT', `/api/projects/${encodeURIComponent(project)}/policy`, { body: { policy: parsed, sha, ref } });
+      const res = await call('PUT', `/api/projects/${encodeURIComponent(project)}/policy`, { body: { policy: parsed, sha, ref }, retryStatuses: false });
       const text = await res.text();
       let body: unknown = text;
       try {
@@ -134,7 +142,7 @@ export function decant(
 
     /** PUT the default branch's dependency summary (sync token). Never throws on an HTTP status. */
     async syncDeps(project: string, sha: string, deps: unknown[]): Promise<{ status: number; body: unknown }> {
-      const res = await call('PUT', `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps } });
+      const res = await call('PUT', `/api/projects/${encodeURIComponent(project)}/deps`, { body: { sha, deps }, retryStatuses: false });
       const text = await res.text();
       let body: unknown = text;
       try {

@@ -106,17 +106,24 @@ describe('retries connection-level failures', () => {
   const v = { package: 'npm:a@1.0.0', scanner: 's', scannerVersion: '1', result: 'clean' as const };
 
   /** A fetch that plays `script` in order (a thrown Error or a Response), recording calls. */
-  function scripted(script: (Error | Response)[]) {
-    const calls: { method: string; url: string; body: unknown }[] = [];
+  /** `cost` is how long each fetch takes on the fake clock (sleeps advance it too). */
+  function scripted(script: (Error | Response)[], cost = 0) {
+    const calls: { method: string; url: string; body: unknown; at: number }[] = [];
+    let t = 1_000_000;
     const f = (async (u: string, init: RequestInit) => {
-      calls.push({ method: init.method ?? 'GET', url: u, body: init.body });
+      calls.push({ method: init.method ?? 'GET', url: u, body: init.body, at: t });
+      t += cost;
       const next = script.shift();
       if (!next) throw new Error('script exhausted');
       if (next instanceof Error) throw next;
       return next;
     }) as unknown as typeof fetch;
     const sleeps: number[] = [];
-    const client = decant(f, URL_, TOKEN, { sleep: async (ms) => void sleeps.push(ms), random: () => 0.5 });
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+      t += ms;
+    };
+    const client = decant(f, URL_, TOKEN, { sleep, random: () => 0.5, now: () => t });
     return { client, calls, sleeps };
   }
 
@@ -170,9 +177,48 @@ describe('retries connection-level failures', () => {
     expect(s.calls).toHaveLength(4);
   });
 
-  it('the policy sync (idempotent PUT) retries a 503 and returns the final status', async () => {
-    const s = scripted([new Response('', { status: 503 }), jsonRes({ ref: 'pr-3' })]);
-    expect(await s.client.syncPolicy('proj', { project: 'proj' }, 'abc', 'pr-3')).toEqual({ status: 200, body: { ref: 'pr-3' } });
+  it('the policy and deps PUTs retry a dropped connection', async () => {
+    const p = scripted([netErr('ECONNRESET'), jsonRes({ ref: 'pr-3' })]);
+    expect(await p.client.syncPolicy('proj', { project: 'proj' }, 'abc', 'pr-3')).toEqual({ status: 200, body: { ref: 'pr-3' } });
+    expect(p.calls).toHaveLength(2);
+    const d = scripted([netErr('UND_ERR_SOCKET', 'other side closed'), jsonRes({ deps: 1 })]);
+    expect(await d.client.syncDeps('proj', 'abc', [])).toEqual({ status: 200, body: { deps: 1 } });
+    expect(d.calls).toHaveLength(2);
+  });
+
+  it('the policy and deps PUTs never retry a 502/503/504 (the write may have landed)', async () => {
+    for (const status of [502, 503, 504]) {
+      const p = scripted([new Response('gw', { status }), jsonRes({ ref: 'pr-3' })]);
+      expect(await p.client.syncPolicy('proj', { project: 'proj' }, 'abc', 'pr-3')).toEqual({ status, body: 'gw' });
+      expect(p.calls).toHaveLength(1);
+      const d = scripted([new Response('gw', { status }), jsonRes({ deps: 1 })]);
+      expect(await d.client.syncDeps('proj', 'abc', [])).toEqual({ status, body: 'gw' });
+      expect(d.calls).toHaveLength(1);
+    }
+  });
+
+  it('GETs and the verdict PUT still retry a 502/503/504', async () => {
+    const g = scripted([new Response('', { status: 503 }), jsonRes({ blocks: [] })]);
+    expect(await g.client.blocks()).toEqual([]);
+    expect(g.calls).toHaveLength(2);
+    const p = scripted([new Response('', { status: 504 }), new Response(null, { status: 204 })]);
+    await p.client.putVerdict(v);
+    expect(p.calls).toHaveLength(2);
+  });
+
+  it('stops at the 60s deadline: no attempt starts after it, and the error names cause and count', async () => {
+    // Each attempt takes 25s: attempts start at 0s, 25.5s and 51.5s; a fourth would start at 78.5s.
+    const s = scripted([netErr('ECONNRESET'), netErr('ECONNRESET'), netErr('ECONNRESET'), netErr('ECONNRESET')], 25_000);
+    const err = (await s.client.blocks().catch((e: Error) => e)) as Error;
+    expect(err.message).toBe('decant GET /api/blocks: fetch failed (ECONNRESET) after 3 attempts (60s deadline)');
+    expect(s.calls).toHaveLength(3);
+    const start = s.calls[0]!.at;
+    expect(s.calls.every((c) => c.at - start < 60_000)).toBe(true);
+  });
+
+  it('a 5xx past the deadline is returned without another attempt', async () => {
+    const s = scripted([new Response('', { status: 503 }), new Response('', { status: 503 }), new Response(null, { status: 204 })], 40_000);
+    await expect(s.client.putVerdict(v)).rejects.toThrow(/HTTP 503/);
     expect(s.calls).toHaveLength(2);
   });
 
