@@ -281,6 +281,99 @@ describe('verifyAccess', () => {
     expect(fetch.calls).toHaveLength(2);
   });
 
+  it('fetches the JWKS without following redirects and denies on a 3xx', async () => {
+    const domain = freshDomain();
+    const seen: string[] = [];
+    const fetch = fakeFetch({
+      [certsUrl(domain)]: (r) => {
+        seen.push(r.redirect);
+        return new Response(null, { status: 302, headers: { location: 'https://evil.example/certs' } });
+      },
+    });
+    const tok = await signRS256(kA, claims(domain));
+    expect(await verifyAccess(req('/dashboard', tok), accessEnv(domain), { fetch, now: fixedClock(T0) })).toBeNull();
+    expect(seen).toEqual(['manual']); // workerd has no redirect: 'error'
+    expect(fetch.calls).toEqual([certsUrl(domain)]);
+  });
+
+  it('cold cache: concurrent requests share one in-flight JWKS fetch', async () => {
+    const domain = freshDomain();
+    const fetch = fakeFetch({
+      [certsUrl(domain)]: async () => {
+        await new Promise((r) => setTimeout(r, 20));
+        return jwksResponse(kA.jwk);
+      },
+    });
+    const deps: Deps = { fetch, now: fixedClock(T0) };
+    const tok = await signRS256(kA, claims(domain));
+    const results = await Promise.all([
+      verifyAccess(req('/dashboard', tok), accessEnv(domain), deps),
+      verifyAccess(req('/dashboard', tok), accessEnv(domain), deps),
+    ]);
+    expect(results).toEqual([{ email: 'george@example.com' }, { email: 'george@example.com' }]);
+    expect(fetch.calls).toHaveLength(1);
+  });
+
+  it('cold cache: a failed fetch is not retried within 60 s', async () => {
+    const domain = freshDomain();
+    let ok = false;
+    const fetch = fakeFetch({ [certsUrl(domain)]: () => (ok ? jwksResponse(kA.jwk) : new Response('x', { status: 500 })) });
+    const tok = await signRS256(kA, claims(domain));
+    expect(await verifyAccess(req('/dashboard', tok), accessEnv(domain), { fetch, now: fixedClock(T0) })).toBeNull();
+    ok = true;
+    const soon = new Date(Date.parse(T0) + 30_000).toISOString();
+    expect(await verifyAccess(req('/dashboard', tok), accessEnv(domain), { fetch, now: fixedClock(soon) })).toBeNull();
+    expect(fetch.calls).toHaveLength(1);
+    const later = new Date(Date.parse(T0) + 61_000).toISOString();
+    expect(await verifyAccess(req('/dashboard', tok), accessEnv(domain), { fetch, now: fixedClock(later) })).not.toBeNull();
+    expect(fetch.calls).toHaveLength(2);
+  });
+
+  it('rejects tokens longer than 8192 characters', async () => {
+    const domain = freshDomain();
+    const tok = await signRS256(kA, claims(domain, { pad: 'x'.repeat(8192) }));
+    expect(tok.length).toBeGreaterThan(8192);
+    const fetch = fakeFetch({ [certsUrl(domain)]: jwksResponse(kA.jwk) });
+    expect(await verifyAccess(req('/dashboard', tok), accessEnv(domain), { fetch, now: fixedClock(T0) })).toBeNull();
+    expect(fetch.calls).toEqual([]);
+  });
+
+  it('JWKS older than 1 h is refreshed; a dropped key stops verifying', async () => {
+    const domain = freshDomain();
+    let keys: object[] = [kA.jwk];
+    const fetch = fakeFetch({ [certsUrl(domain)]: () => jwksResponse(...keys) });
+    const e = accessEnv(domain);
+    const long = { exp: T0S + 7200 };
+    const tok = await signRS256(kA, claims(domain, long));
+    expect(await verifyAccess(req('/dashboard', tok), e, { fetch, now: fixedClock(T0) })).not.toBeNull();
+    keys = [kB.jwk];
+    const at = (ms: number) => fixedClock(new Date(Date.parse(T0) + ms).toISOString());
+    // Within the hour: cached key A still used, no fetch.
+    expect(await verifyAccess(req('/dashboard', tok), e, { fetch, now: at(3_599_000) })).not.toBeNull();
+    expect(fetch.calls).toHaveLength(1);
+    // Past the hour: refreshed, key A gone → deny.
+    expect(await verifyAccess(req('/dashboard', tok), e, { fetch, now: at(3_601_000) })).toBeNull();
+    expect(fetch.calls).toHaveLength(2);
+  });
+
+  it('JWKS older than 1 h: a failed refresh keeps using the old keys', async () => {
+    const domain = freshDomain();
+    let up = true;
+    const fetch = fakeFetch({ [certsUrl(domain)]: () => (up ? jwksResponse(kA.jwk) : new Response('x', { status: 503 })) });
+    const e = accessEnv(domain);
+    const tok = await signRS256(kA, claims(domain, { exp: T0S + 7200 }));
+    expect(await verifyAccess(req('/dashboard', tok), e, { fetch, now: fixedClock(T0) })).not.toBeNull();
+    up = false;
+    const at = (ms: number) => fixedClock(new Date(Date.parse(T0) + ms).toISOString());
+    expect(await verifyAccess(req('/dashboard', tok), e, { fetch, now: at(3_601_000) })).not.toBeNull();
+    expect(fetch.calls).toHaveLength(2);
+    // Refresh attempts are spaced 60 s apart.
+    expect(await verifyAccess(req('/dashboard', tok), e, { fetch, now: at(3_630_000) })).not.toBeNull();
+    expect(fetch.calls).toHaveLength(2);
+    expect(await verifyAccess(req('/dashboard', tok), e, { fetch, now: at(3_662_000) })).not.toBeNull();
+    expect(fetch.calls).toHaveLength(3);
+  });
+
   it('reads the token only from the Cf-Access-Jwt-Assertion header, not cookies', async () => {
     const domain = freshDomain();
     const fetch = fakeFetch({ [certsUrl(domain)]: jwksResponse(kA.jwk) });
@@ -351,6 +444,11 @@ describe('/dashboard routing', () => {
     ['aud empty', 'x.cloudflareaccess.com', ''],
     ['domain not a hostname', 'evil.com/path?', AUD],
     ['domain with scheme', 'https://x.cloudflareaccess.com', AUD],
+    ['domain with empty label', 'a..b', AUD],
+    ['domain with leading hyphen', '-x.com', AUD],
+    ['domain with trailing hyphen label', 'x-.com', AUD],
+    ['domain single label', 'x', AUD],
+    ['domain trailing dot', 'x.com.', AUD],
   ];
   for (const [name, domain, aud] of unset) {
     it(`config ${name} → 404 on every /dashboard path, no JWKS fetch`, async () => {
