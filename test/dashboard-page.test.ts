@@ -134,3 +134,125 @@ describe('dashboard page: freshness', () => {
     expect(m).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
   });
 });
+
+// Runs the page's Needs-attention renderer against a minimal fake DOM.
+type ANode = { tag: string; className: string | null; textContent: string; children: ANode[]; href?: string; target?: string; rel?: string; appendChild(n: ANode): ANode; firstChild: ANode | null };
+function renderAttention(data: unknown): { box: ANode; resolved: ANode } {
+  const m = /\n  \/\/ ---- Needs attention \/ Recently resolved ----\n[\s\S]*?\n  \/\/ ---- Activity ----\n/.exec(DASHBOARD_HTML);
+  if (!m) throw new Error('attention block not found');
+  const node = (tag: string, cls?: string | null, text?: unknown): ANode => {
+    const n: ANode = {
+      tag,
+      className: cls ?? null,
+      textContent: text === undefined || text === null ? '' : String(text),
+      children: [],
+      appendChild(c: ANode) {
+        n.children.push(c);
+        return c;
+      },
+      get firstChild() {
+        return n.children[0] ?? null;
+      },
+    };
+    return new Proxy(n, {
+      set(t, k, v) {
+        if (k === 'innerHTML' || k === 'outerHTML') throw new Error(`${String(k)} used`);
+        (t as unknown as Record<string | symbol, unknown>)[k] = v;
+        return true;
+      },
+    });
+  };
+  const nodes: Record<string, ANode> = { attention: node('div'), resolved: node('div'), 'attention-count': node('span') };
+  const doc = { createTextNode: (t: string) => node('#text', null, t) };
+  const line = (p: ANode, text: string, cls?: string | null) => p.appendChild(node('p', cls ?? null, text));
+  const fn = new Function('$', 'el', 'line', 'shortDate', 'document', 'window', `${m[0]}; return renderAttention;`)(
+    (id: string) => nodes[id],
+    node,
+    line,
+    (iso: string) => iso.slice(0, 10),
+    doc,
+    { URL },
+  );
+  fn(data);
+  return { box: nodes.attention!, resolved: nodes.resolved! };
+}
+const all = (n: ANode): ANode[] => [n, ...n.children.flatMap(all)];
+
+describe('dashboard page: needs attention', () => {
+  const base = { key: 'k', project: 'web', title: 'undici@7.29.0 has GHSA-x', detail: 'high: leak', firstSeen: '2026-11-18T00:00:00Z' };
+
+  it('renders the to-do (backtick parts as code) and allowlisted links only', () => {
+    const { box } = renderAttention({
+      open: [
+        {
+          ...base,
+          kind: 'vuln',
+          todo: 'Fixed in `7.29.1`. Merge it.',
+          links: [
+            { label: 'Open security PRs', url: 'https://github.com/acme/web/pulls?q=is%3Apr' },
+            { label: 'Advisory', url: 'https://osv.dev/vulnerability/GHSA-x' },
+            { label: 'npm', url: 'https://www.npmjs.com/package/a/v/1.0.0' },
+            { label: 'go', url: 'https://pkg.go.dev/example.com/m@v1.0.0' },
+            { label: 'js', url: 'javascript:alert(1)' },
+            { label: 'http', url: 'http://osv.dev/x' },
+            { label: 'evil', url: 'https://github.com.evil.example/x' },
+            { label: 'creds', url: 'https://user:pw@github.com/x' },
+            { label: 'port', url: 'https://github.com:8443/x' },
+            { label: 'data', url: 'data:text/html,hi' },
+            { label: 'junk', url: 'not a url' },
+          ],
+        },
+      ],
+      resolved: [],
+    });
+    const nodes = all(box);
+    const todo = nodes.find((n) => n.className === 'todo')!;
+    expect(todo.children.map((c) => [c.tag, c.textContent])).toEqual([
+      ['span', 'What to do'],
+      ['#text', 'Fixed in '],
+      ['code', '7.29.1'],
+      ['#text', '. Merge it.'],
+    ]);
+    const links = nodes.filter((n) => n.tag === 'a');
+    expect(links.map((a) => a.textContent)).toEqual(['Open security PRs', 'Advisory', 'npm', 'go']);
+    for (const a of links) {
+      expect(a.target).toBe('_blank');
+      expect(a.rel).toBe('noopener noreferrer');
+    }
+    expect(links[0]!.href).toBe('https://github.com/acme/web/pulls?q=is%3Apr');
+  });
+
+  it('labels kinds, lists findings, and calls an archive anomaly "Not scanned"', () => {
+    const { box } = renderAttention({
+      open: [
+        { ...base, kind: 'flagged', todo: 't', links: [], findings: [{ rule: 'npm-install-script', note: 'postinstall at package.json:12' }] },
+        { ...base, kind: 'flagged', todo: 't', links: [], findings: [{ rule: 'archive-anomaly', note: 'bad zip' }] },
+        { ...base, kind: 'conflict', project: null, todo: 't', links: [] },
+        { ...base, kind: 'silent', todo: 't', links: [] },
+      ],
+      resolved: [],
+    });
+    const labels = all(box).filter((n) => (n.className ?? '').startsWith('label ')).map((n) => [n.textContent, n.className]);
+    expect(labels).toEqual([
+      ['Flagged', 'label warn'],
+      ['Not scanned', 'label warn'],
+      ['Changed', 'label danger'],
+      ['Quiet', 'label info'],
+    ]);
+    const rule = all(box).find((n) => n.className === 'rules')!.children[0]!;
+    expect(rule.children.map((c) => [c.tag, c.textContent])).toEqual([
+      ['code', 'npm-install-script'],
+      ['#text', ' postinstall at package.json:12'],
+    ]);
+  });
+
+  it('items without a to-do or links (older Worker) render as before', () => {
+    const { box } = renderAttention({ open: [{ ...base, kind: 'blocked' }], resolved: [] });
+    expect(all(box).some((n) => n.className === 'todo' || n.className === 'links')).toBe(false);
+  });
+
+  it('builds the section with text nodes only', () => {
+    const m = /\/\/ ---- Needs attention[\s\S]*?\/\/ ---- Activity/.exec(DASHBOARD_HTML)![0];
+    expect(m).not.toMatch(/innerHTML|outerHTML|insertAdjacentHTML|document\.write|setAttribute\('href'/);
+  });
+});

@@ -15,7 +15,8 @@ const STYLE = String.raw`
   --bg: #f6f7f9; --surface: #ffffff; --text: #15171b; --muted: #555c68;
   --accent: #0e6e5c; --on-accent: #ffffff; --warn: #8a4a06; --danger: #a1290f;
   --border: #e3e6ea; --control: #868e99;
-  --danger-edge: #f0c9c0; --warn-edge: #ecd9b5;
+  --danger-edge: #f0c9c0; --warn-edge: #ecd9b5; --info: #4b62a8; --info-edge: #cfd8f2;
+  --todo-bg: #f1f5f4; --code-bg: #eef0f3;
   --c-served: #0e6e5c; --c-cooldown: #b0650a; --c-blocked: #a1290f; --c-stale: #4b62a8; --c-failed: #6b2a7a;
 }
 @media (prefers-color-scheme: dark) {
@@ -23,7 +24,8 @@ const STYLE = String.raw`
     --bg: #111315; --surface: #1a1d21; --text: #e8eaed; --muted: #a8afba;
     --accent: #4fc3a8; --on-accent: #0b1a16; --warn: #f0a54a; --danger: #ff8f78;
     --border: #2d3238; --control: #6b737e;
-    --danger-edge: #6a2a1e; --warn-edge: #5e4320;
+    --danger-edge: #6a2a1e; --warn-edge: #5e4320; --info: #8ea6f0; --info-edge: #2f3a5c;
+    --todo-bg: #1f2a27; --code-bg: #24282d;
     --c-served: #4fc3a8; --c-cooldown: #f0a54a; --c-blocked: #ff8f78; --c-stale: #8ea6f0; --c-failed: #d39ae2;
   }
 }
@@ -65,14 +67,25 @@ ul.plain { list-style: none; margin: 0; padding: 0; display: flex; flex-directio
 .body p { margin: 0; }
 .items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
 .item { background: var(--surface); border: 1px solid var(--border); border-left-width: 4px; border-radius: 12px;
-  padding: 14px 18px; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; }
+  padding: 14px 18px; display: grid; grid-template-columns: 96px minmax(0, 1fr) auto; gap: 4px 18px; align-items: start; }
 .item.sev-danger { border-color: var(--danger-edge); border-left-color: var(--danger); }
 .item.sev-warn { border-color: var(--warn-edge); border-left-color: var(--warn); }
+.item.sev-info { border-color: var(--info-edge); border-left-color: var(--info); }
 .item.sev-muted { border-left-color: var(--muted); }
-.label { font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; min-width: 6.5em; }
-.item .main { flex: 1 1 280px; min-width: 0; overflow-wrap: anywhere; }
-.item .detail { display: block; color: var(--muted); font-size: 14px; }
-.item .since { color: var(--muted); font-size: 13px; }
+.info { color: var(--info); }
+.label { font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; padding-top: 2px; }
+.item .main { min-width: 0; display: flex; flex-direction: column; gap: 6px; overflow-wrap: anywhere; }
+.item .title { font-weight: 600; }
+.item .detail { color: var(--muted); font-size: 14px; }
+.item .since { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.rules { margin: 0; padding-left: 18px; font-size: 14px; color: var(--muted); }
+.todo { background: var(--todo-bg); border-radius: 8px; padding: 8px 12px; font-size: 14px; }
+.todo .lbl { font-size: 11px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); margin-right: 6px; }
+.rules code, .todo code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; background: var(--code-bg);
+  padding: 1px 5px; border-radius: 4px; color: var(--text); }
+.links { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 14px; }
+.links a { color: var(--accent); text-decoration: none; font-weight: 500; }
+.links a:hover { text-decoration: underline; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .chart { width: 100%; height: 140px; display: block; }
 .axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; }
@@ -89,6 +102,10 @@ td.name { white-space: normal; overflow-wrap: anywhere; }
 @media (max-width: 719px) {
   .wrap { padding: 20px 16px; gap: 20px; }
   .grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 640px) {
+  .item { grid-template-columns: minmax(0, 1fr); }
+  .item .since { order: -1; }
 }
 @media (max-width: 479px) {
   .col-project, .col-published { display: none; }
@@ -260,16 +277,52 @@ const SCRIPT = String.raw`
   }
 
   // ---- Needs attention / Recently resolved ----
+  var LINK_HOSTS = ['osv.dev', 'www.npmjs.com', 'pkg.go.dev', 'github.com'];
+  var TICK = String.fromCharCode(96);
+  var UrlParser = window.URL; // named so the page never contains the CSS url-function token
+  function notScanned(item) {
+    return (item.findings || []).some(function (f) { return f.rule === 'archive-anomaly'; });
+  }
   function severity(item) {
     if (item.kind === 'malicious') return { word: 'Malicious', cls: 'danger' };
     if (item.kind === 'blocked') return { word: 'Blocked', cls: 'danger' };
     if (item.kind === 'vuln') {
       return item.detail.indexOf('critical') === 0 ? { word: 'Critical', cls: 'danger' } : { word: 'High', cls: 'warn' };
     }
-    if (item.kind === 'flagged') return { word: 'Flagged', cls: 'warn' };
-    if (item.kind === 'conflict') return { word: 'Republished', cls: 'warn' };
-    if (item.kind === 'silent') return { word: 'Silent', cls: 'muted' };
+    if (item.kind === 'flagged') return notScanned(item) ? { word: 'Not scanned', cls: 'warn' } : { word: 'Flagged', cls: 'warn' };
+    if (item.kind === 'conflict') return { word: 'Changed', cls: 'danger' };
+    if (item.kind === 'silent') return { word: 'Quiet', cls: 'info' };
     return { word: item.kind, cls: 'muted' };
+  }
+  /** The URL only if it is https on one of LINK_HOSTS (no credentials); otherwise null. */
+  function safeUrl(u) {
+    var p;
+    try { p = new UrlParser(String(u)); } catch (e) { return null; }
+    if (p.protocol !== 'https:' || p.username || p.password || p.port || LINK_HOSTS.indexOf(p.hostname) < 0) return null;
+    return p.href;
+  }
+  /** The to-do text as text nodes, with backtick-quoted parts in code elements. */
+  function todoBox(text) {
+    var box = el('div', 'todo');
+    box.appendChild(el('span', 'lbl', 'What to do'));
+    String(text).split(TICK).forEach(function (part, i) {
+      if (part === '') return;
+      box.appendChild(i % 2 ? el('code', null, part) : document.createTextNode(part));
+    });
+    return box;
+  }
+  function linkRow(links) {
+    var row = el('div', 'links');
+    (links || []).forEach(function (l) {
+      var href = safeUrl(l && l.url);
+      if (!href) return;
+      var a = el('a', null, l.label);
+      a.href = href;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+      row.appendChild(a);
+    });
+    return row.firstChild ? row : null;
   }
   function titleWithProject(item) {
     return (item.project ? item.project + ' · ' : 'all · ') + item.title;
@@ -283,12 +336,25 @@ const SCRIPT = String.raw`
       data.open.forEach(function (item) {
         var s = severity(item);
         var li = el('li', 'item sev-' + s.cls);
-        li.appendChild(el('span', 'label ' + s.cls, s.word));
-        var main = el('span', 'main');
-        main.appendChild(el('strong', null, titleWithProject(item)));
-        if (item.detail) main.appendChild(el('span', 'detail', item.detail));
+        li.appendChild(el('div', 'label ' + s.cls, s.word));
+        var main = el('div', 'main');
+        main.appendChild(el('div', 'title', titleWithProject(item)));
+        if (item.detail) main.appendChild(el('div', 'detail', item.detail));
+        if (item.findings && item.findings.length) {
+          var rules = el('ul', 'rules');
+          item.findings.forEach(function (f) {
+            var r = el('li');
+            r.appendChild(el('code', null, f.rule));
+            if (f.note) r.appendChild(document.createTextNode(' ' + f.note));
+            rules.appendChild(r);
+          });
+          main.appendChild(rules);
+        }
+        if (item.todo) main.appendChild(todoBox(item.todo));
+        var links = linkRow(item.links);
+        if (links) main.appendChild(links);
         li.appendChild(main);
-        li.appendChild(el('span', 'since', 'since ' + shortDate(item.firstSeen)));
+        li.appendChild(el('div', 'since', 'since ' + shortDate(item.firstSeen)));
         ul.appendChild(li);
       });
       box.appendChild(ul);
