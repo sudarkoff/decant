@@ -51,7 +51,10 @@ type World = {
   osvDown?: boolean;
   openPrs?: string[];
   /** Details of the open PR returned for any branch in openPrs. */
-  openPr?: { body?: string; labels?: string[]; autoMerge?: boolean };
+  openPr?: { body?: string; labels?: string[]; autoMerge?: boolean; user?: { login: string; type: string }; baseRef?: string };
+  /** GET /compare/<base>...<head> reply. */
+  compare?: (base: string, head: string) => unknown;
+  disableAutoMergeFails?: boolean;
   /** branch → body of its latest closed-unmerged PR. */
   closedPrs?: Record<string, string>;
   /** "path@ref" → file contents served by GET /contents. */
@@ -149,12 +152,17 @@ function harness(w: World) {
                 state: 'open',
                 labels: (w.openPr?.labels ?? []).map((name) => ({ name })),
                 auto_merge: w.openPr?.autoMerge ? { merge_method: 'squash' } : null,
+                user: w.openPr?.user ?? { login: 'decant-app[bot]', type: 'Bot' },
                 head: { ref: head, sha: OPEN_HEAD },
-                base: { ref: 'main', sha: HEAD },
+                base: { ref: w.openPr?.baseRef ?? 'main', sha: HEAD },
               },
             ]
           : [],
       );
+    }
+    if (c.method === 'GET' && c.url.startsWith(`${R}/compare/`)) {
+      const [base, head] = c.url.slice(`${R}/compare/`.length).split('...');
+      return w.compare ? jsonRes(w.compare(base!, head!)) : new Response('nf', { status: 404 });
     }
     if (c.method === 'GET' && c.url.startsWith(`${R}/contents/`)) {
       const path = decodeURIComponent(u.pathname.slice(`/repos/o/r/contents/`.length));
@@ -188,6 +196,7 @@ function harness(w: World) {
       }
       if (b.query.includes('disablePullRequestAutoMerge')) {
         autoMergeOffs.push(b.variables);
+        if (w.disableAutoMergeFails) return jsonRes({ errors: [{ message: 'nope' }] });
         return jsonRes({ data: { disablePullRequestAutoMerge: { clientMutationId: null } } });
       }
     }
@@ -540,25 +549,91 @@ describe('audit: one security PR per run', () => {
     expect(h.labelDeletes).toEqual([{ n: 3, label: 'decant:high' }]);
     // the batch is no longer auto-mergeable (moderate advisory): auto-merge turned off
     expect(h.autoMergeOffs).toEqual([{ id: 'OPEN' }]);
+    const at = (pred: (c: FetchCall) => boolean) => h.f.calls.findIndex(pred);
+    expect(at((c) => c.body?.includes('disablePullRequestAutoMerge') ?? false)).toBeLessThan(at((c) => c.method === 'PATCH' && c.url.includes('/git/refs/')));
     expect(h.summary()).toMatch(/Security PR: updated #3/);
   });
 
-  it('open PR already holding the same set and files → no commit, body refreshed', async () => {
-    const files = {
-      'package-lock.json@decant/security-fixes': '', // filled below
-    } as Record<string, string>;
-    // First run to learn the files the batch writes.
-    const first = harness({ ...BATCH, exec: batchExec() });
+  /** World for an open PR that already holds exactly this run's batch (ours unless overridden). */
+  async function reuseWorld(over: Partial<World> = {}, commits = 1): Promise<World> {
+    const first = harness({ ...BATCH, exec: batchExec(), ...(over.policy ? { policy: over.policy } : {}) });
     expect(await first.run()).toBe(0);
-    for (const [p, c] of Object.entries(first.written())) files[`${p}@${OPEN_HEAD}`] = c;
+    const written = first.written();
     vi.restoreAllMocks();
-    const h = harness({ ...BATCH, exec: batchExec(), openPrs: [BRANCH], openPr: { body: marker(BATCH_IDS), labels: ['decant:security', 'decant:critical'] }, contents: files });
+    const contents: Record<string, string> = {};
+    for (const [p, c] of Object.entries(written)) contents[`${p}@${OPEN_HEAD}`] = c;
+    return {
+      ...BATCH,
+      exec: batchExec(),
+      openPrs: [BRANCH],
+      openPr: { body: marker(BATCH_IDS), labels: ['decant:security', 'decant:critical'] },
+      contents,
+      compare: (base, head) => ({
+        status: 'ahead',
+        ahead_by: commits,
+        behind_by: 0,
+        commits: Array.from({ length: commits }, (_, i) => ({ sha: `${head}${i}`, author: { login: 'decant-app[bot]', type: 'Bot' }, parents: [{ sha: base }] })),
+        files: Object.keys(written).map((filename) => ({ filename })),
+      }),
+      ...over,
+    };
+  }
+
+  it('open PR already holding our single commit with the same set and files → no commit, body refreshed', async () => {
+    const h = harness(await reuseWorld());
     expect(await h.run()).toBe(0);
     expect(h.commits).toEqual([]);
     expect(h.refPatches).toEqual([]);
     expect(h.prs).toEqual([]);
     expect(h.prPatches.map((p) => p.n)).toEqual([3]);
+    expect(h.f.calls.some((c) => c.url === `${R}/compare/${HEAD}...${OPEN_HEAD}`)).toBe(true);
     expect(h.summary()).toMatch(/Security PR: #3 up to date/);
+  });
+
+  it('same marker and files but the PR is not ours → force-reset and recommit', async () => {
+    const h = harness(await reuseWorld({ openPr: { body: marker(BATCH_IDS), user: { login: 'mallory', type: 'User' } } }));
+    expect(await h.run()).toBe(0);
+    expect(h.refPatches).toHaveLength(1);
+    expect(h.commits).toHaveLength(1);
+  });
+
+  it('same marker and files but the branch holds an extra commit → force-reset and recommit', async () => {
+    const h = harness(await reuseWorld({}, 2));
+    expect(await h.run()).toBe(0);
+    expect(h.refPatches).toHaveLength(1);
+    expect(h.commits).toHaveLength(1);
+  });
+
+  it('same marker but based on another branch → force-reset and recommit', async () => {
+    const h = harness(await reuseWorld({ openPr: { body: marker(BATCH_IDS), baseRef: 'release' } }));
+    expect(await h.run()).toBe(0);
+    expect(h.commits).toHaveLength(1);
+  });
+
+  it('auto-eligible batch on a reused (unrewritten) open PR → auto-merge NOT enabled', async () => {
+    const AUTO = { ...BASE_POLICY, autoShip: { critical: 'auto', high: 'auto', moderate: 'auto', low: 'approve' } };
+    const h = harness(await reuseWorld({ policy: AUTO }));
+    expect(await h.run()).toBe(0);
+    expect(h.commits).toEqual([]);
+    expect(h.autoMerges).toEqual([]);
+  });
+
+  it('auto-eligible batch on a rewritten open PR → auto-merge enabled', async () => {
+    const AUTO = { ...BASE_POLICY, autoShip: { critical: 'auto', high: 'auto', moderate: 'auto', low: 'approve' } };
+    const h = harness({ ...BATCH, policy: AUTO, exec: batchExec(), openPrs: [BRANCH], openPr: { body: 'old' } });
+    expect(await h.run()).toBe(0);
+    expect(h.commits).toHaveLength(1);
+    expect(h.autoMerges).toEqual([{ id: 'OPEN', method: 'SQUASH' }]);
+  });
+
+  it('disabling auto-merge on the open PR fails → branch untouched, run fails after the issues', async () => {
+    const h = harness({ ...BATCH, exec: batchExec(), openPrs: [BRANCH], openPr: { body: 'old', autoMerge: true }, disableAutoMergeFails: true });
+    expect(await h.run()).toBe(1);
+    expect(h.refPatches).toEqual([]);
+    expect(h.commits).toEqual([]);
+    expect(h.prPatches).toEqual([]);
+    expect(h.log()).toMatch(/could not disable auto-merge/);
+    expect(h.summary()).toMatch(/Prune:/);
   });
 
   it('latest closed-unmerged PR covered the same set → declined: no sync, no npm/go, no PR', async () => {
@@ -632,6 +707,12 @@ describe('audit: one security PR per run', () => {
     expect(h.exec.calls).toEqual([]);
     expect(h.prs).toEqual([]);
     expect(h.log()).toMatch(/overlay sync HTTP 422: advisory not verified/);
+    // the issue, blocks and prune steps still ran before the failure
+    const issue = h.issueCreates.find((i) => i.title === 'decant: unfixed advisories');
+    expect(issue.body).toContain(GO);
+    expect(h.f.calls.some((c) => c.url === `${D}/api/blocks`)).toBe(true);
+    expect(h.summary()).toMatch(/Security PR: failed: overlay sync HTTP 422/);
+    expect(h.summary()).toMatch(/Prune: nothing expired/);
   });
 
   it('overlay rejected without naming entries → run fails', async () => {
@@ -685,6 +766,64 @@ describe('audit: one security PR per run', () => {
     expect(await h.run()).toBe(0);
     expect(h.syncs[0]!.body.policy.allow).toEqual([existing]);
     expect(Object.keys(h.written()).sort()).toEqual(['package-lock.json', 'package.json']);
+  });
+});
+
+describe('audit: batch consistency', () => {
+  const MIN = 'GHSA-mini-0001-aaaa';
+  it("a package whose fix would undo an earlier package's fix → reverted as unresolvable; the earlier fix ships", async () => {
+    const h = harness({
+      files: {
+        '/w/package.json': JSON.stringify({ name: 'app', dependencies: { lodash: '^4.17.20', minimist: '^1.2.5' } }, null, 2),
+        '/w/package-lock.json': lock([{ name: 'lodash', version: '4.17.20' }, { name: 'minimist', version: '1.2.5' }]),
+      },
+      osv: { 'lodash@4.17.20': [GHSA], 'minimist@1.2.5': [MIN] },
+      records: { ...LODASH_RECORD, [MIN]: npmRecord(MIN, 'minimist', [{ introduced: '0' }, { fixed: '1.2.6' }]) },
+      exec: (c, fs) => {
+        if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+        if (c.args.at(-1) === 'lodash@4.17.21') bump(fs, '/w', 'lodash', '4.17.21');
+        if (c.args.at(-1) === 'minimist@1.2.6') {
+          bump(fs, '/w', 'minimist', '1.2.6');
+          bump(fs, '/w', 'lodash', '4.17.20'); // drags lodash back down
+        }
+      },
+    });
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (1 package, 1 advisory)');
+    const l = JSON.parse(h.written()['package-lock.json']!);
+    expect(l.packages['node_modules/lodash'].version).toBe('4.17.21');
+    expect(l.packages['node_modules/minimist'].version).toBe('1.2.5');
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:lodash@4.17.21']);
+    expect(h.summary()).toMatch(/minimist.*unresolvable: would regress lodash/);
+  });
+
+  it('an overlay-only version of a package that is not shipping lands in a lockfile → run fails, no PR', async () => {
+    const AC = 'GHSA-acrn-0001-aaaa';
+    const BP = 'GHSA-bpkg-0001-aaaa';
+    const h = harness({
+      files: {
+        '/w/package.json': JSON.stringify({ name: 'app', dependencies: { acorn: '^1.0.0' } }, null, 2),
+        '/w/package-lock.json': lock([{ name: 'acorn', version: '1.0.0' }]),
+        '/w/sub/package.json': JSON.stringify({ name: 'sub', dependencies: { bpkg: '^2.0.0' } }, null, 2),
+        '/w/sub/package-lock.json': lock([{ name: 'bpkg', version: '2.0.0' }]),
+      },
+      osv: { 'acorn@1.0.0': [AC], 'bpkg@2.0.0': [BP] },
+      records: { [AC]: npmRecord(AC, 'acorn', [{ introduced: '0' }, { fixed: '1.0.1' }]), [BP]: npmRecord(BP, 'bpkg', [{ introduced: '0' }, { fixed: '2.0.1' }]) },
+      exec: (c, fs) => {
+        if (c.cmd !== 'npm') return;
+        if (c.args.at(-1) === 'acorn@1.0.1') {
+          bump(fs, '/w', 'acorn', '1.0.1');
+          bump(fs, '/w', 'bpkg', '2.0.1', 'node_modules/acorn/node_modules/bpkg'); // pulled in via the overlay
+          return;
+        }
+        if (c.args.at(-1) === 'bpkg@2.0.1') return { code: 1, stderr: 'E500' };
+      },
+    });
+    expect(await h.run()).toBe(1);
+    expect(h.prs).toEqual([]);
+    expect(h.commits).toEqual([]);
+    expect(h.log()).toMatch(/overlay-only versions.*npm:bpkg@2\.0\.1 in package-lock\.json/);
   });
 });
 

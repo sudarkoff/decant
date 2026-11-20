@@ -84,6 +84,9 @@ type Pkg = {
 type Result = 'fixed' | 'declined' | 'unverified' | 'unresolvable' | 'failed';
 type Outcome = { pkg: Pkg; result: Result; detail: string };
 
+/** Fails the run (exit 1), but only after the issue and prune steps have run. */
+class FatalError extends Error {}
+
 class PkgError extends Error {
   constructor(
     readonly result: 'unresolvable' | 'failed',
@@ -189,6 +192,8 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const outcomes: Outcome[] = [];
   const lines: string[] = [];
   let tmp: Promise<string> | null = null;
+  /** Set when the run must exit 1 once the issue and prune steps are done. */
+  let fatal: string | null = null;
 
   try {
     const gh = github(deps.fetch, inputs.githubToken, repo, { selfLogin: env.DECANT_GITHUB_LOGIN || undefined });
@@ -246,26 +251,29 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     // 4. One security PR for the whole run.
     let prLine = 'no fixable advisories';
     if (pkgs.length) {
-      const open = await gh.findOpenPr(FIX_BRANCH);
-      const closed = open ? null : await gh.findClosedUnmergedPr(FIX_BRANCH);
-      const declined = (set: Pkg[]) => closed !== null && markerOf(closed.body) === auditSetHash(set.flatMap(idsOf));
-      if (declined(pkgs)) {
-        prLine = `declined (#${closed!.number} closed without merging the same fixes)`;
-        for (const p of pkgs) outcomes.push({ pkg: p, result: 'declined', detail: `PR #${closed!.number}` });
-      } else {
-        const batch = await syncOverlay(ctx, pkgs, outcomes);
-        const { fixed, files } = await applyAll(ctx, batch, outcomes);
-        if (!fixed.length) prLine = 'nothing to ship';
-        else if (!open && declined(fixed)) prLine = `declined (#${closed!.number} closed without merging the same fixes)`;
-        else {
-          try {
+      try {
+        const open = await gh.findOpenPr(FIX_BRANCH);
+        const closed = open ? null : await gh.findClosedUnmergedPr(FIX_BRANCH);
+        const declined = (set: Pkg[]) => closed !== null && markerOf(closed.body) === auditSetHash(set.flatMap(idsOf));
+        if (declined(pkgs)) {
+          prLine = `declined (#${closed!.number} closed without merging the same fixes)`;
+          for (const p of pkgs) outcomes.push({ pkg: p, result: 'declined', detail: `PR #${closed!.number}` });
+        } else {
+          const batch = await syncOverlay(ctx, pkgs, outcomes);
+          const { fixed, files } = await applyAll(ctx, batch, outcomes);
+          if (!fixed.length) prLine = 'nothing to ship';
+          else if (!open && declined(fixed)) prLine = `declined (#${closed!.number} closed without merging the same fixes)`;
+          else {
+            strayOverlayVersions(ctx, batch, fixed, files, new Set(all.filter((d) => d.version).map(formatPackageId)));
             prLine = await publish(ctx, fixed, files, open, outcomes, unfixed);
-          } catch (e) {
-            if (systemic(e)) throw e;
-            prLine = `failed: ${redact((e as Error).message, [inputs.token, inputs.githubToken])}`;
-            warning(`security PR ${prLine}`);
           }
         }
+      } catch (e) {
+        if (systemic(e)) throw e;
+        const msg = redact((e as Error).message, [inputs.token, inputs.githubToken]);
+        prLine = `failed: ${msg}`;
+        if (e instanceof FatalError) fatal = msg;
+        else warning(`security PR ${prLine}`);
       }
     }
 
@@ -322,6 +330,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     if (tmp) await deps.fs.rm(await tmp.catch(() => '')).catch(() => {});
   }
   appendSummary(lines.join('\n'), env);
+  if (fatal !== null) return stop(`decant audit: ${fatal}`);
   setOutput('result', 'pass', env);
   return 0;
 }
@@ -382,6 +391,8 @@ async function syncOverlay(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promi
   }
   for (let attempt = 0; batch.length; attempt++) {
     const next = { ...ctx.raw, allow: [...mainAllow(ctx), ...batch.flatMap((p) => allowEntries(ctx, p))] };
+    const check = parsePolicy(next);
+    if (!check.ok) throw new FatalError(`overlay policy invalid: ${check.errors.join('; ')}`);
     const res = await ctx.client.syncPolicy(ctx.project, next, ctx.sha, OVERLAY_REF);
     if (res.status === 401 || res.status === 403) throw new Error(`decant PUT /api/projects/${ctx.project}/policy: HTTP ${res.status}`);
     if (res.status >= 200 && res.status < 300) return batch;
@@ -390,7 +401,7 @@ async function syncOverlay(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promi
     const rejected = Array.isArray(named) ? named.filter((e): e is string => typeof e === 'string') : [];
     const why = (p: Pkg) => rejected.filter((e) => idsOf(p).includes(e.split(' ')[0]!));
     const drop = batch.filter((p) => why(p).length);
-    if (attempt > 0 || !drop.length) throw new Error(failure);
+    if (attempt > 0 || !drop.length) throw new FatalError(failure);
     for (const p of drop) outcomes.push({ pkg: p, result: 'unverified', detail: `not verified by decant: ${why(p).join('; ')}` });
     batch = batch.filter((p) => !drop.includes(p));
   }
@@ -426,6 +437,12 @@ async function applyAll(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promise<
         let changed = false;
         for (const [abs, b] of before) if ((await read(abs)) !== b) changed = true;
         if (!changed) throw new PkgError('unresolvable', 'no lockfile changes');
+        // This package's npm/go run must not undo a fix already applied in this run.
+        for (const d of done) {
+          const left: string[] = [];
+          for (const dir of d.dirs) left.push(...(await remaining(ctx, d.p, dir)));
+          if (left.length) throw new PkgError('unresolvable', `would regress ${safe(d.p.name)}: ${left.join('; ')}`);
+        }
         const o: Outcome = { pkg: p, result: 'fixed', detail: '' };
         outcomes.push(o);
         done.push({ p, o, dirs });
@@ -438,16 +455,6 @@ async function applyAll(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promise<
         outcomes.push({ pkg: p, result, detail: msg });
       }
     }
-    // A later package's npm/go run could have moved an earlier one: verify every copy once more.
-    for (const d of done) {
-      const left: string[] = [];
-      for (const dir of d.dirs) left.push(...(await remaining(ctx, d.p, dir)));
-      if (left.length) {
-        d.o.result = 'unresolvable';
-        d.o.detail = `regressed by a later fix in this run: ${left.join('; ')}`;
-        warning(`${safe(d.p.name)}: ${d.o.detail}`);
-      }
-    }
     for (const [abs, b] of orig) {
       const after = await read(abs);
       if (after !== null && after !== b) files.push({ path: ctx.repoPath(abs), contents: after });
@@ -455,7 +462,25 @@ async function applyAll(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promise<
   } finally {
     for (const [abs, b] of orig) await put(abs, b);
   }
-  return { fixed: done.filter((d) => d.o.result === 'fixed').map((d) => d.p), files };
+  return { fixed: done.map((d) => d.p), files };
+}
+
+/**
+ * Guard: a version the overlay allowed for a package that is NOT shipping (e.g. pulled in by
+ * another package's install) would land in the lockfiles without its allow entry, and fail installs
+ * after merge. Fails the run instead of committing that.
+ */
+function strayOverlayVersions(ctx: FixCtx, overlay: Pkg[], fixed: Pkg[], files: { path: string; contents: string }[], locked: Set<string>): void {
+  const shipped = new Set(fixed.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package));
+  // Versions already locked before this run were installable without the overlay: not stray.
+  const stray = new Set(overlay.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package).filter((id) => !shipped.has(id) && !locked.has(id)));
+  if (!stray.size) return;
+  const hits = new Set<string>();
+  for (const f of files) {
+    const deps = isPackageLock(f.path) ? parsePackageLock(f.contents, f.path, ctx.inputs.decantUrl) : /(^|\/)go\.sum$/.test(f.path) ? parseGoSum(f.contents, f.path) : [];
+    for (const d of deps) if (d.version && stray.has(formatPackageId(d))) hits.add(`${safe(formatPackageId(d))} in ${safe(f.path)}`);
+  }
+  if (hits.size) throw new FatalError(`lockfiles would contain overlay-only versions with no allow entry in this PR: ${[...hits].sort().join(', ')}`);
 }
 
 /** Descriptions of the package's copies in `dir` that its advisories still affect. */
@@ -467,6 +492,23 @@ async function remaining(ctx: FixCtx, p: Pkg, dir: string): Promise<string[]> {
   const sumAbs = `${dir}/go.sum`;
   const left = parseGoSum(await ctx.deps.fs.readFile(sumAbs), sumAbs).filter((d) => d.name === p.name && stillVulnerable(p, d.version));
   return left.length ? [`${ctx.repoPath(sumAbs)} still has ${left.map((d) => safe(d.version)).join(', ')}`] : [];
+}
+
+/**
+ * True only if the open PR already holds exactly what this run would commit, written by us: our
+ * author, based on the default branch, its head a single commit of ours on top of the checked-out
+ * default head, changing exactly our files with our contents, and carrying our set marker.
+ */
+async function reusable(ctx: FixCtx, open: Pr, files: { path: string; contents: string }[], hash: string): Promise<boolean> {
+  const { gh } = ctx;
+  if (markerOf(open.body) !== hash || open.baseRef !== ctx.base) return false;
+  if (!gh.isMine({ login: open.author, type: open.authorType })) return false;
+  const changed = await gh.ownSingleCommit(ctx.sha, open.headSha);
+  if (changed === null) return false;
+  const want = files.map((f) => f.path).sort();
+  if (changed.length !== want.length || [...changed].sort().some((p, i) => p !== want[i])) return false;
+  for (const f of files) if ((await gh.fileAt(f.path, open.headSha)) !== f.contents) return false;
+  return true;
 }
 
 /** Commits the batch to the one security branch and opens (or refreshes) its PR. Returns a summary line. */
@@ -483,7 +525,12 @@ async function publish(
   const hash = auditSetHash(ids);
   const added = fixed.flatMap((p) => allowEntries(ctx, p));
   const files = [...changed];
-  if (added.length) files.push({ path: ctx.policyRel, contents: `${JSON.stringify({ ...ctx.raw, allow: [...mainAllow(ctx), ...added] }, null, 2)}\n` });
+  if (added.length) {
+    const policy = { ...ctx.raw, allow: [...mainAllow(ctx), ...added] };
+    const check = parsePolicy(policy);
+    if (!check.ok) throw new FatalError(`decant.json for the PR is invalid: ${check.errors.join('; ')}`);
+    files.push({ path: ctx.policyRel, contents: `${JSON.stringify(policy, null, 2)}\n` });
+  }
 
   const vulns = [...new Map(fixed.flatMap((p) => p.vulns).map((v) => [v.id, v])).values()];
   const title = `decant: security fixes (${plural(fixed.length, 'package', 'packages')}, ${plural(vulns.length, 'advisory', 'advisories')})`;
@@ -498,29 +545,31 @@ async function publish(
 
   let pr: { number: number; nodeId: string; url: string };
   let what: string;
-  let autoOn = false;
+  /** True when this run wrote the branch content (only then may auto-merge be turned on). */
+  let wrote = true;
   if (open) {
-    let same = markerOf(open.body) === hash;
-    for (const f of files) if (same && (await gh.fileAt(f.path, open.headSha)) !== f.contents) same = false;
+    // Auto-merge must never be left on across a push of content that does not qualify for it.
+    if (!auto && open.autoMerge) {
+      try {
+        await gh.disableAutoMerge(open.nodeId);
+      } catch (e) {
+        throw new FatalError(`#${open.number}: could not disable auto-merge, so the branch was not updated: ${(e as Error).message}`);
+      }
+    }
+    const same = await reusable(ctx, open, files, hash);
     if (!same) {
       // Rebuild the branch on the current default head: the fixes were computed against it.
       await gh.updateRef(FIX_BRANCH, ctx.sha);
       await gh.commitFiles(FIX_BRANCH, ctx.sha, title, files);
     }
+    wrote = !same;
     await gh.updatePr(open.number, { title, body });
     await gh.addLabels(open.number, labels);
     for (const l of open.labels) if (/^decant:(critical|high|moderate|low)$/.test(l) && l !== labels[1]) await gh.removeLabel(open.number, l);
     pr = { number: open.number, nodeId: open.nodeId, url: `#${open.number}` };
     what = same ? `#${open.number} up to date` : `updated #${open.number}`;
-    autoOn = open.autoMerge;
-    if (!auto && open.autoMerge) {
-      try {
-        await gh.disableAutoMerge(open.nodeId);
-        what += ' (auto-merge turned off)';
-      } catch (e) {
-        warning(`#${open.number}: could not disable auto-merge: ${(e as Error).message}`);
-      }
-    }
+    if (!auto && open.autoMerge) what += ' (auto-merge turned off)';
+    if (auto && open.autoMerge) wrote = false; // already on
   } else {
     try {
       await gh.createBranch(FIX_BRANCH, ctx.sha);
@@ -533,7 +582,7 @@ async function publish(
     pr = await gh.openPr({ head: FIX_BRANCH, base: ctx.base, title, body, labels });
     what = `opened #${pr.number}`;
   }
-  if (auto && !autoOn) {
+  if (auto && wrote) {
     try {
       await gh.enableAutoMerge(pr.nodeId, 'SQUASH');
       what += ' (auto-merge)';

@@ -310,6 +310,7 @@ function toPr(p) {
     state: p.state,
     draft: p.draft ?? false,
     author: p.user?.login ?? "",
+    authorType: p.user?.type ?? "",
     labels: (p.labels ?? []).map((l) => l.name),
     headRef: p.head.ref,
     headSha: p.head.sha,
@@ -413,6 +414,22 @@ function github(f, token, repo, opts = {}) {
   }
   return {
     graphql,
+    /** True if `u` is the account this client acts as (see isMine above). */
+    isMine: (u) => isMine(u),
+    /**
+     * The files changed between `base` and `head` if `head` is exactly one commit on top of `base`,
+     * authored by us; otherwise null.
+     */
+    async ownSingleCommit(base, head) {
+      const r = await json(
+        "GET",
+        `${R}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
+      );
+      if (r.status !== "ahead" || r.ahead_by !== 1 || r.behind_by !== 0 || r.commits?.length !== 1) return null;
+      const c = r.commits[0];
+      if (!isMine(c.author) || c.parents?.length !== 1 || c.parents[0].sha !== base) return null;
+      return (r.files ?? []).map((f2) => f2.filename);
+    },
     async defaultBranch() {
       return (await json("GET", R)).default_branch;
     },
@@ -1378,6 +1395,8 @@ var sevOf = (v) => v.severity === "unknown" ? "moderate" : v.severity;
 var sevRank = (s) => SEVERITIES.indexOf(s);
 var maxSev = (ss) => ss.reduce((a, b) => sevRank(b) < sevRank(a) ? b : a, "low");
 var bySeverity = (a, b) => sevRank(sevOf(a)) - sevRank(sevOf(b)) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+var FatalError = class extends Error {
+};
 var PkgError = class extends Error {
   constructor(result, msg) {
     super(msg);
@@ -1467,6 +1486,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
   const outcomes = [];
   const lines = [];
   let tmp = null;
+  let fatal = null;
   try {
     const gh = github(deps.fetch, inputs.githubToken, repo, { selfLogin: env.DECANT_GITHUB_LOGIN || void 0 });
     const co = await defaultHeadCheckout(gh, env, "audit");
@@ -1515,26 +1535,29 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     };
     let prLine = "no fixable advisories";
     if (pkgs.length) {
-      const open = await gh.findOpenPr(FIX_BRANCH);
-      const closed = open ? null : await gh.findClosedUnmergedPr(FIX_BRANCH);
-      const declined = (set) => closed !== null && markerOf(closed.body) === auditSetHash(set.flatMap(idsOf));
-      if (declined(pkgs)) {
-        prLine = `declined (#${closed.number} closed without merging the same fixes)`;
-        for (const p of pkgs) outcomes.push({ pkg: p, result: "declined", detail: `PR #${closed.number}` });
-      } else {
-        const batch = await syncOverlay(ctx, pkgs, outcomes);
-        const { fixed, files } = await applyAll(ctx, batch, outcomes);
-        if (!fixed.length) prLine = "nothing to ship";
-        else if (!open && declined(fixed)) prLine = `declined (#${closed.number} closed without merging the same fixes)`;
-        else {
-          try {
+      try {
+        const open = await gh.findOpenPr(FIX_BRANCH);
+        const closed = open ? null : await gh.findClosedUnmergedPr(FIX_BRANCH);
+        const declined = (set) => closed !== null && markerOf(closed.body) === auditSetHash(set.flatMap(idsOf));
+        if (declined(pkgs)) {
+          prLine = `declined (#${closed.number} closed without merging the same fixes)`;
+          for (const p of pkgs) outcomes.push({ pkg: p, result: "declined", detail: `PR #${closed.number}` });
+        } else {
+          const batch = await syncOverlay(ctx, pkgs, outcomes);
+          const { fixed, files } = await applyAll(ctx, batch, outcomes);
+          if (!fixed.length) prLine = "nothing to ship";
+          else if (!open && declined(fixed)) prLine = `declined (#${closed.number} closed without merging the same fixes)`;
+          else {
+            strayOverlayVersions(ctx, batch, fixed, files, new Set(all.filter((d) => d.version).map(formatPackageId)));
             prLine = await publish(ctx, fixed, files, open, outcomes, unfixed);
-          } catch (e) {
-            if (systemic(e)) throw e;
-            prLine = `failed: ${redact(e.message, [inputs.token, inputs.githubToken])}`;
-            warning(`security PR ${prLine}`);
           }
         }
+      } catch (e) {
+        if (systemic(e)) throw e;
+        const msg = redact(e.message, [inputs.token, inputs.githubToken]);
+        prLine = `failed: ${msg}`;
+        if (e instanceof FatalError) fatal = msg;
+        else warning(`security PR ${prLine}`);
       }
     }
     for (const o of outcomes) {
@@ -1585,6 +1608,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     });
   }
   appendSummary(lines.join("\n"), env);
+  if (fatal !== null) return stop(`decant audit: ${fatal}`);
   setOutput("result", "pass", env);
   return 0;
 }
@@ -1611,6 +1635,8 @@ async function syncOverlay(ctx, pkgs, outcomes) {
   }
   for (let attempt = 0; batch.length; attempt++) {
     const next = { ...ctx.raw, allow: [...mainAllow(ctx), ...batch.flatMap((p) => allowEntries(ctx, p))] };
+    const check = parsePolicy(next);
+    if (!check.ok) throw new FatalError(`overlay policy invalid: ${check.errors.join("; ")}`);
     const res = await ctx.client.syncPolicy(ctx.project, next, ctx.sha, OVERLAY_REF);
     if (res.status === 401 || res.status === 403) throw new Error(`decant PUT /api/projects/${ctx.project}/policy: HTTP ${res.status}`);
     if (res.status >= 200 && res.status < 300) return batch;
@@ -1619,7 +1645,7 @@ async function syncOverlay(ctx, pkgs, outcomes) {
     const rejected = Array.isArray(named) ? named.filter((e) => typeof e === "string") : [];
     const why = (p) => rejected.filter((e) => idsOf(p).includes(e.split(" ")[0]));
     const drop = batch.filter((p) => why(p).length);
-    if (attempt > 0 || !drop.length) throw new Error(failure);
+    if (attempt > 0 || !drop.length) throw new FatalError(failure);
     for (const p of drop) outcomes.push({ pkg: p, result: "unverified", detail: `not verified by decant: ${why(p).join("; ")}` });
     batch = batch.filter((p) => !drop.includes(p));
   }
@@ -1649,6 +1675,11 @@ async function applyAll(ctx, pkgs, outcomes) {
         let changed = false;
         for (const [abs, b] of before) if (await read(abs) !== b) changed = true;
         if (!changed) throw new PkgError("unresolvable", "no lockfile changes");
+        for (const d of done) {
+          const left = [];
+          for (const dir of d.dirs) left.push(...await remaining(ctx, d.p, dir));
+          if (left.length) throw new PkgError("unresolvable", `would regress ${safe2(d.p.name)}: ${left.join("; ")}`);
+        }
         const o = { pkg: p, result: "fixed", detail: "" };
         outcomes.push(o);
         done.push({ p, o, dirs });
@@ -1661,15 +1692,6 @@ async function applyAll(ctx, pkgs, outcomes) {
         outcomes.push({ pkg: p, result, detail: msg });
       }
     }
-    for (const d of done) {
-      const left = [];
-      for (const dir of d.dirs) left.push(...await remaining(ctx, d.p, dir));
-      if (left.length) {
-        d.o.result = "unresolvable";
-        d.o.detail = `regressed by a later fix in this run: ${left.join("; ")}`;
-        warning(`${safe2(d.p.name)}: ${d.o.detail}`);
-      }
-    }
     for (const [abs, b] of orig) {
       const after = await read(abs);
       if (after !== null && after !== b) files.push({ path: ctx.repoPath(abs), contents: after });
@@ -1677,7 +1699,18 @@ async function applyAll(ctx, pkgs, outcomes) {
   } finally {
     for (const [abs, b] of orig) await put(abs, b);
   }
-  return { fixed: done.filter((d) => d.o.result === "fixed").map((d) => d.p), files };
+  return { fixed: done.map((d) => d.p), files };
+}
+function strayOverlayVersions(ctx, overlay, fixed, files, locked) {
+  const shipped = new Set(fixed.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package));
+  const stray = new Set(overlay.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package).filter((id) => !shipped.has(id) && !locked.has(id)));
+  if (!stray.size) return;
+  const hits = /* @__PURE__ */ new Set();
+  for (const f of files) {
+    const deps = isPackageLock(f.path) ? parsePackageLock(f.contents, f.path, ctx.inputs.decantUrl) : /(^|\/)go\.sum$/.test(f.path) ? parseGoSum(f.contents, f.path) : [];
+    for (const d of deps) if (d.version && stray.has(formatPackageId(d))) hits.add(`${safe2(formatPackageId(d))} in ${safe2(f.path)}`);
+  }
+  if (hits.size) throw new FatalError(`lockfiles would contain overlay-only versions with no allow entry in this PR: ${[...hits].sort().join(", ")}`);
 }
 async function remaining(ctx, p, dir) {
   if (p.eco === "npm") {
@@ -1688,14 +1721,30 @@ async function remaining(ctx, p, dir) {
   const left = parseGoSum(await ctx.deps.fs.readFile(sumAbs), sumAbs).filter((d) => d.name === p.name && stillVulnerable(p, d.version));
   return left.length ? [`${ctx.repoPath(sumAbs)} still has ${left.map((d) => safe2(d.version)).join(", ")}`] : [];
 }
+async function reusable(ctx, open, files, hash) {
+  const { gh } = ctx;
+  if (markerOf(open.body) !== hash || open.baseRef !== ctx.base) return false;
+  if (!gh.isMine({ login: open.author, type: open.authorType })) return false;
+  const changed = await gh.ownSingleCommit(ctx.sha, open.headSha);
+  if (changed === null) return false;
+  const want = files.map((f) => f.path).sort();
+  if (changed.length !== want.length || [...changed].sort().some((p, i) => p !== want[i])) return false;
+  for (const f of files) if (await gh.fileAt(f.path, open.headSha) !== f.contents) return false;
+  return true;
+}
 async function publish(ctx, fixed, changed, open, outcomes, unfixed) {
   const { gh } = ctx;
   const ids = fixed.flatMap(idsOf);
   const hash = auditSetHash(ids);
   const added = fixed.flatMap((p) => allowEntries(ctx, p));
   const files = [...changed];
-  if (added.length) files.push({ path: ctx.policyRel, contents: `${JSON.stringify({ ...ctx.raw, allow: [...mainAllow(ctx), ...added] }, null, 2)}
+  if (added.length) {
+    const policy = { ...ctx.raw, allow: [...mainAllow(ctx), ...added] };
+    const check = parsePolicy(policy);
+    if (!check.ok) throw new FatalError(`decant.json for the PR is invalid: ${check.errors.join("; ")}`);
+    files.push({ path: ctx.policyRel, contents: `${JSON.stringify(policy, null, 2)}
 ` });
+  }
   const vulns = [...new Map(fixed.flatMap((p) => p.vulns).map((v) => [v.id, v])).values()];
   const title = `decant: security fixes (${plural(fixed.length, "package", "packages")}, ${plural(vulns.length, "advisory", "advisories")})`;
   const sev = maxSev(vulns.map(sevOf));
@@ -1707,28 +1756,28 @@ async function publish(ctx, fixed, changed, open, outcomes, unfixed) {
   const labels = ["decant:security", `decant:${sev}`];
   let pr;
   let what;
-  let autoOn = false;
+  let wrote = true;
   if (open) {
-    let same = markerOf(open.body) === hash;
-    for (const f of files) if (same && await gh.fileAt(f.path, open.headSha) !== f.contents) same = false;
+    if (!auto && open.autoMerge) {
+      try {
+        await gh.disableAutoMerge(open.nodeId);
+      } catch (e) {
+        throw new FatalError(`#${open.number}: could not disable auto-merge, so the branch was not updated: ${e.message}`);
+      }
+    }
+    const same = await reusable(ctx, open, files, hash);
     if (!same) {
       await gh.updateRef(FIX_BRANCH, ctx.sha);
       await gh.commitFiles(FIX_BRANCH, ctx.sha, title, files);
     }
+    wrote = !same;
     await gh.updatePr(open.number, { title, body });
     await gh.addLabels(open.number, labels);
     for (const l of open.labels) if (/^decant:(critical|high|moderate|low)$/.test(l) && l !== labels[1]) await gh.removeLabel(open.number, l);
     pr = { number: open.number, nodeId: open.nodeId, url: `#${open.number}` };
     what = same ? `#${open.number} up to date` : `updated #${open.number}`;
-    autoOn = open.autoMerge;
-    if (!auto && open.autoMerge) {
-      try {
-        await gh.disableAutoMerge(open.nodeId);
-        what += " (auto-merge turned off)";
-      } catch (e) {
-        warning(`#${open.number}: could not disable auto-merge: ${e.message}`);
-      }
-    }
+    if (!auto && open.autoMerge) what += " (auto-merge turned off)";
+    if (auto && open.autoMerge) wrote = false;
   } else {
     try {
       await gh.createBranch(FIX_BRANCH, ctx.sha);
@@ -1740,7 +1789,7 @@ async function publish(ctx, fixed, changed, open, outcomes, unfixed) {
     pr = await gh.openPr({ head: FIX_BRANCH, base: ctx.base, title, body, labels });
     what = `opened #${pr.number}`;
   }
-  if (auto && !autoOn) {
+  if (auto && wrote) {
     try {
       await gh.enableAutoMerge(pr.nodeId, "SQUASH");
       what += " (auto-merge)";

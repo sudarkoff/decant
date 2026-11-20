@@ -13,6 +13,8 @@ export type Pr = {
   state: string;
   draft: boolean;
   author: string;
+  /** GitHub account type of the author ("User", "Bot"). */
+  authorType: string;
   labels: string[];
   headRef: string;
   headSha: string;
@@ -29,7 +31,7 @@ type RawPr = {
   body: string | null;
   state: string;
   draft?: boolean;
-  user?: { login?: string } | null;
+  user?: { login?: string; type?: string } | null;
   labels?: { name: string }[];
   head: { ref: string; sha: string };
   base: { ref: string; sha: string };
@@ -45,6 +47,7 @@ function toPr(p: RawPr): Pr {
     state: p.state,
     draft: p.draft ?? false,
     author: p.user?.login ?? '',
+    authorType: p.user?.type ?? '',
     labels: (p.labels ?? []).map((l) => l.name),
     headRef: p.head.ref,
     headSha: p.head.sha,
@@ -190,6 +193,25 @@ export function github(f: typeof fetch, token: string, repo: string, opts: GitHu
 
   return {
     graphql,
+
+    /** True if `u` is the account this client acts as (see isMine above). */
+    isMine: (u: Author) => isMine(u),
+
+    /**
+     * The files changed between `base` and `head` if `head` is exactly one commit on top of `base`,
+     * authored by us; otherwise null.
+     */
+    async ownSingleCommit(base: string, head: string): Promise<string[] | null> {
+      type Commit = { sha: string; author?: Author; parents?: { sha: string }[] };
+      const r = await json<{ status?: string; ahead_by?: number; behind_by?: number; commits?: Commit[]; files?: { filename: string }[] }>(
+        'GET',
+        `${R}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`,
+      );
+      if (r.status !== 'ahead' || r.ahead_by !== 1 || r.behind_by !== 0 || r.commits?.length !== 1) return null;
+      const c = r.commits[0]!;
+      if (!isMine(c.author) || c.parents?.length !== 1 || c.parents[0]!.sha !== base) return null;
+      return (r.files ?? []).map((f) => f.filename);
+    },
 
     async defaultBranch(): Promise<string> {
       return (await json<{ default_branch: string }>('GET', R)).default_branch;
