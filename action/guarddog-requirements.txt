@@ -2,7 +2,10 @@
 #   pip install --require-hashes --no-deps --only-binary :all: -r guarddog-requirements.txt
 # guarddog 3.2.0 (released 2026-08-12) is the latest release at least 7 days old on 2026-11-19.
 # Regenerate (uv 0.12.6) from a file containing the single line `guarddog==3.2.0`:
-#   uv pip compile guarddog.in --generate-hashes --exclude-newer 2026-11-12 --python-version 3.12 --universal --no-header -o guarddog-requirements.txt
+#   uv pip compile guarddog.in --generate-hashes --exclude-newer 2026-11-12 --python-version 3.12 --universal --only-binary :all: --no-header -o guarddog-requirements.txt
+# Compiling with --python-version 3.13 gives the identical set. 3.14 is unsatisfiable: guarddog 3.2.0
+# requires pygit2<1.19, which has no cp314 wheels. The scan checks the runner's Python against this line:
+# decant-python: 3.12 3.13
 annotated-types==0.8.0 \
     --hash=sha256:13b2beaad985e05e2d6407ee4c4f35590b11f8d693a258a561055cac8f64cab7 \
     --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0

@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { describe, expect, it } from 'vitest';
@@ -8,19 +8,76 @@ import {
   GUARDDOG_VERSION,
   installGuardDog,
   parseGuardDogJson,
+  pythonInterpreter,
   requirementsPath,
   scanGo,
   scanNpm,
+  supportedPythons,
 } from '../src/guarddog';
 import { fakeExec } from './fakes';
 
 const clean = { package: '/t/0.tgz', results: { 'threat-npm-preinstall-script': {}, 'capability-network-outbound': [] }, errors: {}, issues: 0, risks: [] };
 
+const REQ = '# decant-python: 3.12 3.13\nguarddog==3.2.0 \\\n    --hash=sha256:00\n';
+const readReq = (text = REQ) => async (p: string) => {
+  if (p !== '/act/guarddog-requirements.txt') throw new Error(`ENOENT: ${p}`);
+  return text;
+};
+const VERSION_ARGS = ['-c', 'import sys; print("%d.%d" % sys.version_info[:2])'];
+const pyIs = (v: string) => fakeExec((c) => (c.args[0] === '-c' ? { stdout: `${v}\n` } : {}));
+
+describe('pythonInterpreter', () => {
+  it('prefers DECANT_PYTHON, then setup-python\'s pythonLocation, then python3', () => {
+    expect(pythonInterpreter({ DECANT_PYTHON: '/opt/py', pythonLocation: '/hosted/Python/3.12.9/x64' })).toBe('/opt/py');
+    expect(pythonInterpreter({ pythonLocation: '/hosted/Python/3.12.9/x64/' })).toBe('/hosted/Python/3.12.9/x64/bin/python');
+    expect(pythonInterpreter({})).toBe('python3');
+  });
+});
+
+describe('supportedPythons', () => {
+  it('reads the decant-python header; a file without one throws', () => {
+    expect(supportedPythons(REQ)).toEqual(['3.12', '3.13']);
+    expect(() => supportedPythons('guarddog==3.2.0\n')).toThrow(/decant-python/);
+  });
+
+  it('the shipped requirements declare their Python versions', () => {
+    const req = readFileSync(requirementsPath(actionDir(undefined)), 'utf8');
+    expect(supportedPythons(req)).toEqual(['3.12', '3.13']);
+  });
+});
+
 describe('installGuardDog', () => {
+  it('checks the interpreter version, then installs with that interpreter', async () => {
+    const exec = pyIs('3.13');
+    await installGuardDog(exec, readReq(), '/rt/g', '/act', { pythonLocation: '/hosted/py' });
+    expect(exec.calls.map((c) => [c.cmd, ...c.args]).slice(0, 2)).toEqual([
+      ['/hosted/py/bin/python', ...VERSION_ARGS],
+      ['/hosted/py/bin/python', '-m', 'venv', '/rt/g'],
+    ]);
+    expect(exec.calls[2]!.cmd).toBe('/rt/g/bin/pip');
+  });
+
+  it('a Python the requirements were not compiled for fails clearly before pip runs', async () => {
+    const exec = pyIs('3.14');
+    await expect(installGuardDog(exec, readReq(), '/rt/g', '/act', {})).rejects.toThrow(
+      "GuardDog's pinned dependencies are built for Python 3.12 or 3.13, but python3 is 3.14; add actions/setup-python with python-version: '3.12' before the decant scan step (see docs/adopt.md)",
+    );
+    expect(exec.calls.map((c) => [c.cmd, ...c.args])).toEqual([['python3', ...VERSION_ARGS]]);
+  });
+
+  it('a missing interpreter or header fails before pip runs', async () => {
+    const missing = fakeExec(() => ({ code: 127, stderr: 'spawn python3 ENOENT' }));
+    await expect(installGuardDog(missing, readReq(), '/rt/g', '/act', {})).rejects.toThrow(/python3 failed to run: spawn python3 ENOENT/);
+    const exec = pyIs('3.12');
+    await expect(installGuardDog(exec, readReq('guarddog==3.2.0\n'), '/rt/g', '/act', {})).rejects.toThrow(/decant-python/);
+    expect(exec.calls).toEqual([]);
+  });
+
   it('creates a venv and installs the hashed requirements from the action path', async () => {
-    const exec = fakeExec();
-    const gd = await installGuardDog(exec, '/rt/decant-guarddog', '/act');
+    const exec = pyIs('3.12');
+    const gd = await installGuardDog(exec, readReq(), '/rt/decant-guarddog', '/act', {});
     expect(exec.calls.map((c) => [c.cmd, ...c.args])).toEqual([
+      ['python3', ...VERSION_ARGS],
       ['python3', '-m', 'venv', '/rt/decant-guarddog'],
       [
         '/rt/decant-guarddog/bin/pip',
@@ -63,8 +120,8 @@ describe('installGuardDog', () => {
   });
 
   it('throws when pip fails', async () => {
-    const exec = fakeExec((c) => (c.cmd.endsWith('/pip') ? { code: 1, stderr: 'hash mismatch' } : {}));
-    await expect(installGuardDog(exec, '/rt/g', '/act')).rejects.toThrow(/pip install.*hash mismatch/);
+    const exec = fakeExec((c) => (c.cmd.endsWith('/pip') ? { code: 1, stderr: 'hash mismatch' } : c.args[0] === '-c' ? { stdout: '3.12' } : {}));
+    await expect(installGuardDog(exec, readReq(), '/rt/g', '/act', {})).rejects.toThrow(/pip install.*hash mismatch/);
   });
 });
 

@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { actionDir, requirementsPath } from '../src/guarddog';
 import { run } from '../src/main';
 import { fakeDeps, fakeExec, fakeFetch, jsonRes, memFs, type ExecCall, type FetchCall } from './fakes';
 
@@ -52,6 +53,7 @@ type World = {
   osvStatus?: number;
   priorComment?: boolean;
   autoMerge?: boolean;
+  python?: string;
 };
 
 function harness(w: World) {
@@ -66,7 +68,15 @@ function harness(w: World) {
     pull_request: { number: 7, base: { sha: BASE }, head: { sha: 'b'.repeat(40), repo: { full_name: w.fork ? 'evil/r' : 'o/r' } } },
     repository: { full_name: 'o/r', default_branch: 'main' },
   };
-  const files: Record<string, string> = { '/ev.json': JSON.stringify(payload), '/w/package-lock.json': w.head, ...w.extraFiles };
+  const realReq = requirementsPath(actionDir(undefined));
+  const req = readFileSync(realReq, 'utf8');
+  const files: Record<string, string> = {
+    '/ev.json': JSON.stringify(payload),
+    '/w/package-lock.json': w.head,
+    '/act/guarddog-requirements.txt': req,
+    [realReq]: req,
+    ...w.extraFiles,
+  };
   const fs = memFs(files, w.symlinks ?? []);
   const labels = [...(w.labels ?? [])];
   const puts: unknown[] = [];
@@ -152,6 +162,7 @@ function harness(w: World) {
       return w.base === null ? { code: 128, stderr: `fatal: path 'package-lock.json' exists on disk, but not in '${BASE}'` } : { stdout: w.base };
     }
     if (c.cmd.endsWith('/bin/guarddog')) return { stdout: JSON.stringify(gdOut) };
+    if (c.args[0] === '-c') return { stdout: `${w.python ?? '3.12'}\n` };
     return {};
   });
   const env: Record<string, string> = {
@@ -309,6 +320,22 @@ describe('scan', () => {
     const pip = h.exec.calls.find((c) => c.cmd.endsWith('/bin/pip'))!;
     expect(pip.args.at(-1)).toMatch(/\/action\/guarddog-requirements\.txt$/);
     expect(h.puts).toContainEqual(expect.objectContaining({ scanner: 'guarddog', result: 'clean' }));
+  });
+
+  it('an unsupported runner Python fails closed with the setup-python hint and never runs pip', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]), python: '3.14' });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain("add actions/setup-python with python-version: '3.12' before the decant scan step");
+    expect(h.exec.calls.some((c) => c.cmd.endsWith('/bin/pip'))).toBe(false);
+    expect(h.puts).not.toContainEqual(expect.objectContaining({ scanner: 'guarddog' }));
+  });
+
+  it('uses the Python actions/setup-python installed', async () => {
+    const h = harness({ head: lock([LP]), base: lock([]) });
+    h.env.pythonLocation = '/opt/hostedtoolcache/Python/3.12.9/x64';
+    expect(await h.run()).toBe(0);
+    const venv = h.exec.calls.find((c) => c.args[0] === '-m' && c.args[1] === 'venv')!;
+    expect(venv.cmd).toBe('/opt/hostedtoolcache/Python/3.12.9/x64/bin/python');
   });
 
   it('a lockfile new since base (git show fails with path-not-in-base) treats every dep as new', async () => {
