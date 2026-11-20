@@ -252,19 +252,29 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     let prLine = 'no fixable advisories';
     if (pkgs.length) {
       try {
-        const open = await gh.findOpenPr(FIX_BRANCH);
-        const closed = open ? null : await gh.findClosedUnmergedPr(FIX_BRANCH);
+        // A failed lookup must fail the run: guessing "no PR" could open a duplicate or reopen a declined set.
+        const lookup = async <T>(what: string, f: () => Promise<T>): Promise<T> => {
+          try {
+            return await f();
+          } catch (e) {
+            if (systemic(e)) throw e;
+            throw new FatalError(`looking up the ${what} security PR: ${(e as Error).message}`);
+          }
+        };
+        const open = await lookup('open', () => gh.findOpenPr(FIX_BRANCH));
+        const closed = open ? null : await lookup('closed', () => gh.findClosedUnmergedPr(FIX_BRANCH));
         const declined = (set: Pkg[]) => closed !== null && markerOf(closed.body) === auditSetHash(set.flatMap(idsOf));
         if (declined(pkgs)) {
           prLine = `declined (#${closed!.number} closed without merging the same fixes)`;
           for (const p of pkgs) outcomes.push({ pkg: p, result: 'declined', detail: `PR #${closed!.number}` });
         } else {
           const batch = await syncOverlay(ctx, pkgs, outcomes);
-          const { fixed, files } = await applyAll(ctx, batch, outcomes);
+          const locked = new Set(all.filter((d) => d.version).map(formatPackageId));
+          const { fixed, files } = await applyAll(ctx, batch, outcomes, locked);
           if (!fixed.length) prLine = 'nothing to ship';
           else if (!open && declined(fixed)) prLine = `declined (#${closed!.number} closed without merging the same fixes)`;
           else {
-            strayOverlayVersions(ctx, batch, fixed, files, new Set(all.filter((d) => d.version).map(formatPackageId)));
+            strayOverlayVersions(ctx, batch, fixed, files, locked);
             prLine = await publish(ctx, fixed, files, open, outcomes, unfixed);
           }
         }
@@ -413,7 +423,14 @@ async function syncOverlay(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promi
  * does not reach its targets has its own changes reverted. Returns the fixed packages and the
  * changed files; the working tree is restored afterwards whatever happens.
  */
-async function applyAll(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promise<{ fixed: Pkg[]; files: { path: string; contents: string }[] }> {
+async function applyAll(
+  ctx: FixCtx,
+  pkgs: Pkg[],
+  outcomes: Outcome[],
+  locked: Set<string>,
+): Promise<{ fixed: Pkg[]; files: { path: string; contents: string }[] }> {
+  /** Versions only the overlay allows (not main), each needing its allow entry in the PR. */
+  const overlayOnly = new Set(pkgs.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package).filter((id) => !locked.has(id)));
   const { deps, inputs } = ctx;
   const read = async (abs: string) => ((await deps.fs.exists(abs)) ? await deps.fs.readFile(abs) : null);
   const put = async (abs: string, v: string | null) => (v === null ? deps.fs.rm(abs) : deps.fs.writeFile(abs, v));
@@ -442,6 +459,16 @@ async function applyAll(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promise<
           const left: string[] = [];
           for (const dir of d.dirs) left.push(...(await remaining(ctx, d.p, dir)));
           if (left.length) throw new PkgError('unresolvable', `would regress ${safe(d.p.name)}: ${left.join('; ')}`);
+        }
+        // Nor pull in an overlay-only version of another package that has not shipped (yet).
+        const ok = new Set([...idsOf(p), ...done.flatMap((d) => idsOf(d.p))]);
+        for (const abs of before.keys()) {
+          const text = await read(abs);
+          if (text === null) continue;
+          const rel = ctx.repoPath(abs);
+          const deps = isPackageLock(rel) ? parsePackageLock(text, rel, ctx.inputs.decantUrl) : rel === 'go.sum' || rel.endsWith('/go.sum') ? parseGoSum(text, rel) : [];
+          const stray = deps.map((d) => formatPackageId(d)).find((id) => overlayOnly.has(id) && !ok.has(id));
+          if (stray) throw new PkgError('unresolvable', `pulls in overlay-only ${safe(stray)}`);
         }
         const o: Outcome = { pkg: p, result: 'fixed', detail: '' };
         outcomes.push(o);

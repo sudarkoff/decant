@@ -55,6 +55,8 @@ type World = {
   /** GET /compare/<base>...<head> reply. */
   compare?: (base: string, head: string) => unknown;
   disableAutoMergeFails?: boolean;
+  /** HTTP status for GET /pulls (state=open / state=closed) lookups; default 200. */
+  pullsStatus?: { open?: number; closed?: number };
   /** branch → body of its latest closed-unmerged PR. */
   closedPrs?: Record<string, string>;
   /** "path@ref" → file contents served by GET /contents. */
@@ -129,6 +131,8 @@ function harness(w: World) {
     if (key === `GET ${R}/git/ref/heads/main`) return jsonRes({ object: { sha: w.mainHead ?? HEAD } });
     if (c.method === 'GET' && c.url.startsWith(`${R}/pulls?`)) {
       const head = decodeURIComponent(u.searchParams.get('head') ?? '').replace(/^o:/, '');
+      const st = w.pullsStatus?.[u.searchParams.get('state') === 'closed' ? 'closed' : 'open'];
+      if (st) return new Response('boom', { status: st });
       if (u.searchParams.get('state') === 'closed') {
         const body = w.closedPrs?.[head];
         return jsonRes(
@@ -798,7 +802,50 @@ describe('audit: batch consistency', () => {
     expect(h.summary()).toMatch(/minimist.*unresolvable: would regress lodash/);
   });
 
-  it('an overlay-only version of a package that is not shipping lands in a lockfile → run fails, no PR', async () => {
+  it("a package whose install pulls in another package's overlay-only version → that package unresolvable and reverted; the others ship", async () => {
+    const AC = 'GHSA-acrn-0001-aaaa';
+    const BP = 'GHSA-bpkg-0001-aaaa';
+    const CP = 'GHSA-cpkg-0001-aaaa';
+    const h = harness({
+      files: {
+        '/w/package.json': JSON.stringify({ name: 'app', dependencies: { acorn: '^1.0.0', bpkg: '^2.0.0', cpkg: '^3.0.0' } }, null, 2),
+        '/w/package-lock.json': lock([
+          { name: 'acorn', version: '1.0.0' },
+          { name: 'bpkg', version: '2.0.0' },
+          { name: 'cpkg', version: '3.0.0' },
+        ]),
+      },
+      osv: { 'acorn@1.0.0': [AC], 'bpkg@2.0.0': [BP], 'cpkg@3.0.0': [CP] },
+      records: {
+        [AC]: npmRecord(AC, 'acorn', [{ introduced: '0' }, { fixed: '1.0.1' }]),
+        [BP]: npmRecord(BP, 'bpkg', [{ introduced: '0' }, { fixed: '2.0.1' }]),
+        [CP]: npmRecord(CP, 'cpkg', [{ introduced: '0' }, { fixed: '3.0.1' }]),
+      },
+      exec: (c, fs) => {
+        if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+        const spec = c.args.at(-1)!;
+        if (spec === 'acorn@1.0.1') bump(fs, '/w', 'acorn', '1.0.1');
+        if (spec === 'bpkg@2.0.1') {
+          bump(fs, '/w', 'bpkg', '2.0.1');
+          bump(fs, '/w', 'cpkg', '3.0.1', 'node_modules/bpkg/node_modules/cpkg'); // cpkg's overlay-only fix, before cpkg ships
+        }
+        if (spec === 'cpkg@3.0.1') bump(fs, '/w', 'cpkg', '3.0.1');
+      },
+    });
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (2 packages, 2 advisories)');
+    const l = JSON.parse(h.written()['package-lock.json']!);
+    expect(l.packages['node_modules/acorn'].version).toBe('1.0.1');
+    expect(l.packages['node_modules/bpkg'].version).toBe('2.0.0');
+    expect(l.packages['node_modules/bpkg/node_modules/cpkg']).toBeUndefined();
+    expect(l.packages['node_modules/cpkg'].version).toBe('3.0.1');
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:acorn@1.0.1', 'npm:cpkg@3.0.1']);
+    expect(h.prs[0]!.body).toMatch(/Not included[\s\S]*`bpkg`.*unresolvable: pulls in overlay-only npm:cpkg@3\.0\.1/);
+    expect(h.summary()).toMatch(/bpkg.*unresolvable: pulls in overlay-only npm:cpkg@3\.0\.1/);
+  });
+
+  it('pulling in the overlay-only version of a package that then fails → that package reverted, nothing ships', async () => {
     const AC = 'GHSA-acrn-0001-aaaa';
     const BP = 'GHSA-bpkg-0001-aaaa';
     const h = harness({
@@ -820,10 +867,30 @@ describe('audit: batch consistency', () => {
         if (c.args.at(-1) === 'bpkg@2.0.1') return { code: 1, stderr: 'E500' };
       },
     });
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toEqual([]);
+    expect(h.commits).toEqual([]);
+    expect(h.summary()).toMatch(/acorn.*unresolvable: pulls in overlay-only npm:bpkg@2\.0\.1/);
+    expect(h.fs.files.get('/w/package-lock.json')).toBe(h.original.get('/w/package-lock.json'));
+  });
+});
+
+describe('audit: PR lookups', () => {
+  it('open-PR lookup fails (non-auth) → run fails visibly after the issues, no PR', async () => {
+    const h = harness({ ...BATCH, exec: batchExec(), pullsStatus: { open: 500 } });
+    expect(await h.run()).toBe(1);
+    expect(h.syncs).toEqual([]);
+    expect(h.prs).toEqual([]);
+    expect(h.log()).toMatch(/::error::decant audit: looking up the open security PR: .*HTTP 500/);
+    expect(h.summary()).toMatch(/Security PR: failed: looking up the open security PR/);
+  });
+
+  it('closed-PR lookup fails (non-auth) → run fails visibly, no PR', async () => {
+    const h = harness({ ...BATCH, exec: batchExec(), pullsStatus: { closed: 502 } });
     expect(await h.run()).toBe(1);
     expect(h.prs).toEqual([]);
     expect(h.commits).toEqual([]);
-    expect(h.log()).toMatch(/overlay-only versions.*npm:bpkg@2\.0\.1 in package-lock\.json/);
+    expect(h.log()).toMatch(/looking up the closed security PR: .*HTTP 502/);
   });
 });
 

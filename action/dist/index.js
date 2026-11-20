@@ -1536,19 +1536,28 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     let prLine = "no fixable advisories";
     if (pkgs.length) {
       try {
-        const open = await gh.findOpenPr(FIX_BRANCH);
-        const closed = open ? null : await gh.findClosedUnmergedPr(FIX_BRANCH);
+        const lookup = async (what, f) => {
+          try {
+            return await f();
+          } catch (e) {
+            if (systemic(e)) throw e;
+            throw new FatalError(`looking up the ${what} security PR: ${e.message}`);
+          }
+        };
+        const open = await lookup("open", () => gh.findOpenPr(FIX_BRANCH));
+        const closed = open ? null : await lookup("closed", () => gh.findClosedUnmergedPr(FIX_BRANCH));
         const declined = (set) => closed !== null && markerOf(closed.body) === auditSetHash(set.flatMap(idsOf));
         if (declined(pkgs)) {
           prLine = `declined (#${closed.number} closed without merging the same fixes)`;
           for (const p of pkgs) outcomes.push({ pkg: p, result: "declined", detail: `PR #${closed.number}` });
         } else {
           const batch = await syncOverlay(ctx, pkgs, outcomes);
-          const { fixed, files } = await applyAll(ctx, batch, outcomes);
+          const locked = new Set(all.filter((d) => d.version).map(formatPackageId));
+          const { fixed, files } = await applyAll(ctx, batch, outcomes, locked);
           if (!fixed.length) prLine = "nothing to ship";
           else if (!open && declined(fixed)) prLine = `declined (#${closed.number} closed without merging the same fixes)`;
           else {
-            strayOverlayVersions(ctx, batch, fixed, files, new Set(all.filter((d) => d.version).map(formatPackageId)));
+            strayOverlayVersions(ctx, batch, fixed, files, locked);
             prLine = await publish(ctx, fixed, files, open, outcomes, unfixed);
           }
         }
@@ -1651,7 +1660,8 @@ async function syncOverlay(ctx, pkgs, outcomes) {
   }
   return batch;
 }
-async function applyAll(ctx, pkgs, outcomes) {
+async function applyAll(ctx, pkgs, outcomes, locked) {
+  const overlayOnly = new Set(pkgs.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package).filter((id) => !locked.has(id)));
   const { deps, inputs } = ctx;
   const read = async (abs) => await deps.fs.exists(abs) ? await deps.fs.readFile(abs) : null;
   const put = async (abs, v) => v === null ? deps.fs.rm(abs) : deps.fs.writeFile(abs, v);
@@ -1679,6 +1689,15 @@ async function applyAll(ctx, pkgs, outcomes) {
           const left = [];
           for (const dir of d.dirs) left.push(...await remaining(ctx, d.p, dir));
           if (left.length) throw new PkgError("unresolvable", `would regress ${safe2(d.p.name)}: ${left.join("; ")}`);
+        }
+        const ok = /* @__PURE__ */ new Set([...idsOf(p), ...done.flatMap((d) => idsOf(d.p))]);
+        for (const abs of before.keys()) {
+          const text = await read(abs);
+          if (text === null) continue;
+          const rel = ctx.repoPath(abs);
+          const deps2 = isPackageLock(rel) ? parsePackageLock(text, rel, ctx.inputs.decantUrl) : rel === "go.sum" || rel.endsWith("/go.sum") ? parseGoSum(text, rel) : [];
+          const stray = deps2.map((d) => formatPackageId(d)).find((id) => overlayOnly.has(id) && !ok.has(id));
+          if (stray) throw new PkgError("unresolvable", `pulls in overlay-only ${safe2(stray)}`);
         }
         const o = { pkg: p, result: "fixed", detail: "" };
         outcomes.push(o);
