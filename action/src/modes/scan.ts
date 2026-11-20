@@ -8,7 +8,7 @@ import { isForkPr, readPayload, type Payload } from '../event';
 import { fileAtCommit as baseFile, SHA_RE } from '../git';
 import { appendSummary, error, mask, notice, setOutput, warning } from '../gh-io';
 import { github } from '../github';
-import { actionDir, GUARDDOG_VERSION, installGuardDog, normalizeFindings, scanGo, scanNpm, type GuardDog, type GuardDogFinding } from '../guarddog';
+import { actionDir, ARCHIVE_ANOMALY, GUARDDOG_VERSION, installGuardDog, normalizeFindings, scanGo, scanNpm, type GuardDog, type GuardDogFinding } from '../guarddog';
 import type { ModeCtx } from '../inputs';
 import { containsDecantUrls, diffDeps, findLockfileTree, parseGoSum, parsePackageLock, type Dep } from '../lockfiles';
 import { createOsv, depKey, type Vuln } from '../osv';
@@ -54,18 +54,26 @@ const safeText = (s: string) => s.replace(/\s+/g, ' ').replace(/[^A-Za-z0-9._~/+
 
 const count = (f: GuardDogFinding) => (f.count !== undefined ? ` (${f.count})` : '');
 
+/**
+ * An archive-anomaly flag means GuardDog never looked inside the archive, and a package can trigger the
+ * anomaly on purpose. Clearing it is not a normal review, so the report says so next to the finding.
+ */
+const NOT_SCANNED =
+  'contents NOT scanned by GuardDog (archive anomaly; can be deliberate scan evasion). Inspect the archive manually before adding decant:reviewed';
+const notScanned = (f: GuardDogFinding) => f.rule === ARCHIVE_ANOMALY;
+
 /** One finding as plain text (annotations): `rule (n): message at a.js:1, b.js:2`. */
 function findingText(f: GuardDogFinding): string {
   const msg = f.message ? `: ${safeText(f.message)}` : '';
   const at = f.locations?.length ? ` at ${f.locations.map(safeText).join(', ')}` : '';
-  return `${safe(f.rule)}${count(f)}${msg}${at}`;
+  return `${safe(f.rule)}${count(f)}${msg}${at}${notScanned(f) ? ` - ${NOT_SCANNED}` : ''}`;
 }
 
 /** One finding as a markdown list item, every package-controlled part in a code span. */
 function findingLine(r: Row, f: GuardDogFinding): string {
   const msg = f.message ? `: \`${safeText(f.message)}\`` : '';
   const at = f.locations?.length ? ` at ${f.locations.map((l) => `\`${safeText(l)}\``).join(', ')}` : '';
-  return `- \`${safe(r.dep.name)}@${safe(r.dep.version)}\` \`${safe(f.rule)}\`${count(f)}${msg}${at}`;
+  return `- \`${safe(r.dep.name)}@${safe(r.dep.version)}\` \`${safe(f.rule)}\`${count(f)}${msg}${at}${notScanned(f) ? ` ⚠️ **${NOT_SCANNED}**` : ''}`;
 }
 
 const isPackageLock = (rel: string) => rel === 'package-lock.json' || rel.endsWith('/package-lock.json');

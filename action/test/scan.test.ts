@@ -576,6 +576,37 @@ describe('scan: GuardDog findings in the report', () => {
     expect(h.outputs()).toMatch(/flagged<<\S+\ntrue\n/);
   });
 
+  it('says plainly that an archive-anomaly package was NOT scanned and must be inspected by hand', async () => {
+    const warn =
+      'contents NOT scanned by GuardDog (archive anomaly; can be deliberate scan evasion). Inspect the archive manually before adding decant:reviewed';
+    const h = harness({ head: lock([LP]), base: lock([]), gdExit: anomaly });
+    await h.run();
+    const item = h.comments[0]!.split('\n').find((l) => l.includes('`archive-anomaly`'))!;
+    expect(item).toContain(`**${warn}**`);
+    expect(h.summary()).toContain(`**${warn}**`);
+    expect(h.log()).toMatch(new RegExp(`::warning::left-pad@1\\.3\\.0 flagged by GuardDog: archive-anomaly: .*${warn.replace(/[().;]/g, '\\$&')}`));
+    // Ordinary rules get no such warning.
+    vi.restoreAllMocks();
+    const n = harness({ head: lock([LP]), base: lock([]), guarddog: flaggedGd });
+    await n.run();
+    expect(n.comments[0]).not.toContain('NOT scanned');
+  });
+
+  it('a cached archive-anomaly verdict carries the same warning', async () => {
+    const h = harness({
+      head: lock([LP]),
+      base: lock([]),
+      verdicts: {
+        'npm:left-pad@1.3.0': [
+          { scanner: 'osv', result: 'clean' },
+          { scanner: 'guarddog', result: 'flagged', details: [{ rule: 'archive-anomaly', message: 'archive parser anomaly: x' }] },
+        ],
+      },
+    });
+    await h.run();
+    expect(h.summary()).toContain('contents NOT scanned by GuardDog');
+  });
+
   it('a writer\'s decant:reviewed clears an archive-anomaly flag', async () => {
     const h = harness({ head: lock([LP]), base: lock([]), gdExit: anomaly, labels: ['decant:reviewed'], labeler: { login: 'maint', permission: 'write' } });
     expect(await h.run()).toBe(0);
