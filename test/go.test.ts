@@ -84,6 +84,23 @@ describe('module path escaping', () => {
     // Policy/store use the unescaped module path.
     expect(await getVersionState(e, { eco: 'go', name: 'github.com/Azure/x', version: 'v1.0.0' })).not.toBeNull();
   });
+
+  it('accepts %21 for ! the way the go client sends it (path and version), and forwards the ! form', async () => {
+    // A fresh module (R2 is shared across this file's tests, so reuse would hit the cache).
+    const { f, req } = client(moduleRoutes('github.com/!burnt!sushi/toml', { 'v1.0.0': OLD }));
+    const list = await req('/go/github.com/%21burnt%21sushi/toml/@v/list');
+    expect(list.status).toBe(200);
+    expect(f.calls).toContain(`${PROXY}/github.com/!burnt!sushi/toml/@v/list`);
+    const info = await req('/go/github.com/%21burnt%21sushi/toml/@v/v1.0.0.info');
+    expect(info.status).toBe(200);
+  });
+
+  it('rejects any other percent-escape in a module path', async () => {
+    const { req } = client(moduleRoutes('github.com/!azure/x', { 'v1.0.0': OLD }));
+    // (%2e%2e is normalized away by the URL parser before routing, so it isn't a case here.)
+    expect((await req('/go/github.com/a%2Fb/@v/list')).status).toBe(404);
+    expect((await req('/go/github.com/a%20b/@v/list')).status).toBe(404);
+  });
 });
 
 describe('go list', () => {

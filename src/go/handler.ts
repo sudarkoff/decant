@@ -53,7 +53,9 @@ function parseMod(esc: string): Mod | null {
 
 function parsePath(path: string): Route | null {
   if (!path.startsWith('/')) return null;
-  const p = path.slice(1);
+  // The go client percent-encodes the '!' of case-escaped paths (%21). Accept that one escape; reject any other.
+  const p = path.slice(1).replace(/%21/gi, '!');
+  if (p.includes('%')) return null;
   if (p.endsWith('/@latest')) {
     const mod = parseMod(p.slice(0, -'/@latest'.length));
     return mod && { kind: 'latest', mod };
