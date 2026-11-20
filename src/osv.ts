@@ -147,7 +147,7 @@ export async function maliciousIds(deps: Deps, refs: PackageRef[]): Promise<Map<
 }
 
 /**
- * Severity, summary (first 200 chars) and publish time of one OSV record; null if unavailable or unknown to OSV.
+ * Severity, summary (first 200 chars) and publish time of one OSV record (empty details if OSV 404s); null if OSV is unavailable.
  * Successful lookups are memoised in `cache`, which the caller scopes to one run.
  */
 export async function vulnDetails(deps: Deps, id: string, cache?: Map<string, VulnDetails>): Promise<VulnDetails | null> {
@@ -155,8 +155,8 @@ export async function vulnDetails(deps: Deps, id: string, cache?: Map<string, Vu
   if (hit) return hit;
   try {
     const res = await osvFetch(deps, `/v1/vulns/${encodeURIComponent(id)}`);
-    if (!res.ok) return null;
-    const v = await okJson<OsvVuln>(res);
+    // A record OSV does not have (4xx) is a settled answer: empty details, so it is never re-fetched.
+    const v = res.status >= 400 && res.status < 500 ? {} : await okJson<OsvVuln>(res);
     const d: VulnDetails = {
       severity: severityOf(v),
       summary: typeof v.summary === 'string' ? v.summary.slice(0, 200) : '',

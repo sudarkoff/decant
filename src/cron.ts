@@ -9,12 +9,13 @@ const MAX_DETAIL_FETCHES = 200;
 
 interface VersionRow { eco: Ecosystem; name: string; version: string }
 
-type Details = Pick<VulnDetails, 'severity' | 'summary' | 'published'>;
-const PLACEHOLDER: Details = { severity: 'unknown', summary: '', published: null };
+type Details = Pick<VulnDetails, 'severity' | 'summary' | 'published'> & { pending?: true };
+/** Stored with checked_at = '' so a later run knows its details were never fetched (as opposed to fetched-but-empty). */
+const PLACEHOLDER: Details = { severity: 'unknown', summary: '', published: null, pending: true };
 
 /**
  * Details per advisory id for one batch: reuse what `vulns` already holds, then fetch the rest from OSV
- * (placeholders first, then new ids) until `budget.left` runs out. Ids left over get a placeholder row.
+ * (pending placeholders first, then new ids) until `budget.left` runs out. Ids left over get a pending placeholder.
  */
 async function detailsFor(
   env: Env,
@@ -26,16 +27,14 @@ async function detailsFor(
   const out = new Map<string, Details>();
   if (ids.length === 0) return out;
   const { results } = await env.DB.prepare(
-    `SELECT id, severity, summary, published FROM vulns WHERE id IN (SELECT value FROM json_each(?))
-       GROUP BY id HAVING MAX(NOT (severity = 'unknown' AND summary = ''))`,
-  ).bind(JSON.stringify(ids)).all<{ id: string; severity: string; summary: string | null; published: string | null }>();
-  for (const r of results) out.set(r.id, { severity: r.severity as Details['severity'], summary: r.summary ?? '', published: r.published });
-  // Ids only ever stored as placeholders are refreshed before ids never seen at all.
-  const { results: stale } = await env.DB.prepare(
-    "SELECT DISTINCT id FROM vulns WHERE severity = 'unknown' AND summary = '' AND id IN (SELECT value FROM json_each(?))",
-  ).bind(JSON.stringify(ids)).all<{ id: string }>();
-  const staleIds = new Set(stale.map((r) => r.id));
-  const todo = ids.filter((id) => !out.has(id)).sort((a, b) => Number(staleIds.has(b)) - Number(staleIds.has(a)));
+    'SELECT id, severity, summary, published, checked_at FROM vulns WHERE id IN (SELECT value FROM json_each(?))',
+  ).bind(JSON.stringify(ids)).all<{ id: string; severity: string; summary: string | null; published: string | null; checked_at: string }>();
+  const pending = new Set<string>();
+  for (const r of results) {
+    if (r.checked_at === '') pending.add(r.id);
+    else out.set(r.id, { severity: r.severity as Details['severity'], summary: r.summary ?? '', published: r.published });
+  }
+  const todo = ids.filter((id) => !out.has(id)).sort((a, b) => Number(pending.has(b)) - Number(pending.has(a)));
   for (const id of todo) {
     const cached = cache.get(id);
     if (cached) { out.set(id, cached); continue; }
@@ -46,7 +45,9 @@ async function detailsFor(
   return out;
 }
 
-/** Writes the vulns rows for a batch and drops rows of those versions whose id is gone, in one D1 batch. */
+const RECORD_CHUNK = 200;
+
+/** Writes the vulns rows for a batch and drops rows of those versions whose id is gone, one D1 batch per 200 versions. */
 async function recordVulns(
   env: Env,
   batch: PackageRef[],
@@ -54,31 +55,35 @@ async function recordVulns(
   details: Map<string, Details>,
   now: Date,
 ): Promise<void> {
-  const rows: (string | null)[][] = [];
-  for (const ref of batch) {
-    for (const id of hits.get(formatPackageId(ref)) ?? []) {
-      const d = details.get(id) ?? PLACEHOLDER;
-      rows.push([ref.eco, ref.name, ref.version, id, d.severity, d.summary, d.published]);
+  for (let i = 0; i < batch.length; i += RECORD_CHUNK) {
+    const chunk = batch.slice(i, i + RECORD_CHUNK);
+    const rows: (string | number | null)[][] = [];
+    for (const ref of chunk) {
+      for (const id of hits.get(formatPackageId(ref)) ?? []) {
+        const d = details.get(id) ?? PLACEHOLDER;
+        rows.push([ref.eco, ref.name, ref.version, id, d.severity, d.summary, d.published, d.pending ? 0 : 1]);
+      }
     }
+    const rowsJson = JSON.stringify(rows);
+    const refsJson = JSON.stringify(chunk.map((r) => [r.eco, r.name, r.version]));
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT OR REPLACE INTO vulns (eco, name, version, id, severity, summary, published, checked_at)
+         SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'),
+                json_extract(value, '$[4]'), json_extract(value, '$[5]'), json_extract(value, '$[6]'),
+                CASE WHEN json_extract(value, '$[7]') = 1 THEN ?2 ELSE '' END
+         FROM json_each(?1)`,
+      ).bind(rowsJson, now.toISOString()),
+      env.DB.prepare(
+        `DELETE FROM vulns
+         WHERE (eco, name, version) IN (
+           SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?1))
+         AND (eco, name, version, id) NOT IN (
+           SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]')
+           FROM json_each(?2))`,
+      ).bind(refsJson, rowsJson),
+    ]);
   }
-  const rowsJson = JSON.stringify(rows);
-  const refsJson = JSON.stringify(batch.map((r) => [r.eco, r.name, r.version]));
-  await env.DB.batch([
-    env.DB.prepare(
-      `INSERT OR REPLACE INTO vulns (eco, name, version, id, severity, summary, published, checked_at)
-       SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'),
-              json_extract(value, '$[4]'), json_extract(value, '$[5]'), json_extract(value, '$[6]'), ?2
-       FROM json_each(?1)`,
-    ).bind(rowsJson, now.toISOString()),
-    env.DB.prepare(
-      `DELETE FROM vulns
-       WHERE (eco, name, version) IN (
-         SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]') FROM json_each(?1))
-       AND (eco, name, version, id) NOT IN (
-         SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]')
-         FROM json_each(?2))`,
-    ).bind(refsJson, rowsJson),
-  ]);
 }
 
 async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; blocked: number }> {
@@ -97,8 +102,6 @@ async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; bloc
     const batch = refs.slice(i, i + BATCH);
     const hits = await vulnIds(deps, batch);
     if (hits === null) break;
-    const details = await detailsFor(env, deps, [...new Set([...hits.values()].flat())], cache, budget);
-    await recordVulns(env, batch, hits, details, now);
     for (const ref of batch) {
       const ids = hits.get(formatPackageId(ref))?.filter((id) => id.startsWith('MAL-'));
       if (!ids || ids.length === 0) continue;
@@ -109,6 +112,13 @@ async function osvRecheck(env: Env, deps: Deps): Promise<{ checked: number; bloc
       if (!existing) blocked++;
     }
     await markOsvChecked(env, batch, now);
+    // Best effort and after the security path: a failure here must not skip MAL blocking.
+    try {
+      const details = await detailsFor(env, deps, [...new Set([...hits.values()].flat())], cache, budget);
+      await recordVulns(env, batch, hits, details, now);
+    } catch (err) {
+      console.error('cron: recording vulns failed', err instanceof Error ? err.name : 'error');
+    }
     checked += batch.length;
   }
   return { checked, blocked };

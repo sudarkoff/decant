@@ -112,6 +112,40 @@ describe('vulnerability recording', () => {
     expect((await vulnRows('v-a')).map((r) => r.id)).toEqual(['MAL-1']);
   });
 
+  it('does not re-fetch an id whose details came back empty', async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    await e.DB.prepare('DELETE FROM vulns').run();
+    await addVersion('v-empty', '1.0.0');
+    const records = { 'MAL-9': { id: 'MAL-9' } };
+    const c1: string[] = [];
+    await runScheduled(e, { fetch: vulnFetch({ 'v-empty': ['MAL-9', 'GHSA-404'] }, records, c1), now: () => NOW });
+    expect(c1).toHaveLength(2);
+    const c2: string[] = [];
+    await runScheduled(e, { fetch: vulnFetch({ 'v-empty': ['MAL-9', 'GHSA-404'] }, records, c2), now: () => NOW });
+    expect(c2).toHaveLength(0);
+  });
+
+  it('still blocks MAL and marks checked when recording vulns fails', async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    await addVersion('v-fail', '1.0.0');
+    const db = new Proxy(e.DB, {
+      get(t, k) {
+        if (k === 'prepare') {
+          return (sql: string) => {
+            if (/vulns/.test(sql)) throw new Error('boom');
+            return t.prepare(sql);
+          };
+        }
+        const v = Reflect.get(t, k) as unknown;
+        return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(t) : v;
+      },
+    });
+    const bad = { ...e, DB: db } as unknown as Env;
+    await runScheduled(bad, { fetch: vulnFetch({ 'v-fail': ['MAL-1'] }, REC), now: () => NOW });
+    expect([...(await blockedVersions(e, 'npm', 'v-fail'))]).toEqual(['1.0.0']);
+    expect(await checkedAt('v-fail')).toBe(NOW.toISOString());
+  });
+
   it('caps detail fetches at 200 per run, stores placeholders, and fills them later', async () => {
     await e.DB.prepare('DELETE FROM versions').run();
     await e.DB.prepare('DELETE FROM vulns').run();
