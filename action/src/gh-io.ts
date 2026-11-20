@@ -4,7 +4,9 @@ import { randomUUID } from 'node:crypto';
 type Env = Record<string, string | undefined>;
 
 export function getInput(name: string, env: Env = process.env): string {
-  return (env[`INPUT_${name.replace(/-/g, '_').toUpperCase()}`] ?? '').trim();
+  // The Actions runner keeps hyphens (INPUT_DECANT-URL), like @actions/core; the underscore form is a fallback.
+  const key = name.replace(/ /g, '_').toUpperCase();
+  return (env[`INPUT_${key}`] ?? env[`INPUT_${key.replace(/-/g, '_')}`] ?? '').trim();
 }
 
 function escapeData(s: string): string {

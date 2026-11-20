@@ -18,6 +18,10 @@ describe('getInput', () => {
   it('reads INPUT_<NAME> trimmed with - to _', () => {
     expect(getInput('policy-path', { INPUT_POLICY_PATH: ' x ' })).toBe('x');
   });
+  it('reads hyphenated inputs the way the Actions runner sets them (hyphens kept)', () => {
+    expect(getInput('decant-url', { 'INPUT_DECANT-URL': 'https://d' })).toBe('https://d');
+    expect(getInput('github-token', { 'INPUT_GITHUB-TOKEN': 't', INPUT_GITHUB_TOKEN: 'other' })).toBe('t');
+  });
   it('returns empty string when unset', () => {
     expect(getInput('nope', {})).toBe('');
   });
