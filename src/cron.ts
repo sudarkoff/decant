@@ -9,13 +9,20 @@ const MAX_DETAIL_FETCHES = 200;
 
 interface VersionRow { eco: Ecosystem; name: string; version: string }
 
-type Details = Pick<VulnDetails, 'severity' | 'summary' | 'published'> & { pending?: true };
+/**
+ * `fixed`: fixed versions per package ("eco:name"). `fixedAll` is true when they came from the OSV record itself,
+ * so a package missing from `fixed` has none; reused rows only know the packages they were stored for.
+ */
+type Details = Pick<VulnDetails, 'severity' | 'summary' | 'published'> & { pending?: true; fixed: Record<string, string[]>; fixedAll: boolean };
 /** Stored with checked_at = '' so a later run knows its details were never fetched (as opposed to fetched-but-empty). */
-const PLACEHOLDER: Details = { severity: 'unknown', summary: '', published: null, pending: true };
+const PLACEHOLDER: Details = { severity: 'unknown', summary: '', published: null, pending: true, fixed: {}, fixedAll: false };
+
+const fromOsv = (d: VulnDetails): Details => ({ severity: d.severity, summary: d.summary, published: d.published, fixed: d.fixed, fixedAll: true });
 
 /**
  * Details per advisory id for one batch: reuse what `vulns` already holds, then fetch the rest from OSV
  * (pending placeholders first, then new ids) until `budget.left` runs out. Ids left over get a pending placeholder.
+ * With budget to spare, ids whose stored rows predate fixed versions (fixed_versions NULL) are re-fetched last.
  */
 async function detailsFor(
   env: Env,
@@ -27,22 +34,53 @@ async function detailsFor(
   const out = new Map<string, Details>();
   if (ids.length === 0) return out;
   const { results } = await env.DB.prepare(
-    'SELECT id, severity, summary, published, checked_at FROM vulns WHERE id IN (SELECT value FROM json_each(?))',
-  ).bind(JSON.stringify(ids)).all<{ id: string; severity: string; summary: string | null; published: string | null; checked_at: string }>();
+    `SELECT id, eco, name, severity, summary, published, checked_at, fixed_versions FROM vulns
+     WHERE id IN (SELECT value FROM json_each(?))`,
+  ).bind(JSON.stringify(ids)).all<{
+    id: string; eco: string; name: string; severity: string; summary: string | null; published: string | null; checked_at: string; fixed_versions: string | null;
+  }>();
   const pending = new Set<string>();
+  const stale = new Set<string>();
   for (const r of results) {
-    if (r.checked_at === '') pending.add(r.id);
-    else out.set(r.id, { severity: r.severity as Details['severity'], summary: r.summary ?? '', published: r.published });
+    if (r.checked_at === '') {
+      pending.add(r.id);
+      continue;
+    }
+    const d = out.get(r.id) ?? { severity: r.severity as Details['severity'], summary: r.summary ?? '', published: r.published, fixed: {}, fixedAll: false };
+    let list: unknown = null;
+    try {
+      list = r.fixed_versions === null ? null : JSON.parse(r.fixed_versions);
+    } catch {
+      // treated as unknown
+    }
+    if (Array.isArray(list) && list.every((x) => typeof x === 'string')) d.fixed[`${r.eco}:${r.name}`] = list as string[];
+    else stale.add(r.id);
+    out.set(r.id, d);
   }
   const todo = ids.filter((id) => !out.has(id)).sort((a, b) => Number(pending.has(b)) - Number(pending.has(a)));
   for (const id of todo) {
     const cached = cache.get(id);
-    if (cached) { out.set(id, cached); continue; }
+    if (cached) { out.set(id, fromOsv(cached)); continue; }
     if (budget.left <= 0) { out.set(id, PLACEHOLDER); continue; }
     budget.left--;
-    out.set(id, (await vulnDetails(deps, id, cache)) ?? PLACEHOLDER);
+    const d = await vulnDetails(deps, id, cache);
+    out.set(id, d ? fromOsv(d) : PLACEHOLDER);
+  }
+  for (const id of stale) {
+    const cached = cache.get(id);
+    if (cached) { out.set(id, fromOsv(cached)); continue; }
+    if (budget.left <= 0) break;
+    budget.left--;
+    const d = await vulnDetails(deps, id, cache);
+    if (d) out.set(id, fromOsv(d));
   }
   return out;
+}
+
+/** The JSON stored in vulns.fixed_versions for one row, or null when not known. */
+function fixedJson(d: Details, ref: PackageRef): string[] | null {
+  const list = d.fixed[`${ref.eco}:${ref.name}`];
+  return list ?? (d.fixedAll ? [] : null);
 }
 
 const RECORD_CHUNK = 200;
@@ -57,21 +95,21 @@ async function recordVulns(
 ): Promise<void> {
   for (let i = 0; i < batch.length; i += RECORD_CHUNK) {
     const chunk = batch.slice(i, i + RECORD_CHUNK);
-    const rows: (string | number | null)[][] = [];
+    const rows: (string | number | string[] | null)[][] = [];
     for (const ref of chunk) {
       for (const id of hits.get(formatPackageId(ref)) ?? []) {
         const d = details.get(id) ?? PLACEHOLDER;
-        rows.push([ref.eco, ref.name, ref.version, id, d.severity, d.summary, d.published, d.pending ? 0 : 1]);
+        rows.push([ref.eco, ref.name, ref.version, id, d.severity, d.summary, d.published, d.pending ? 0 : 1, fixedJson(d, ref)]);
       }
     }
     const rowsJson = JSON.stringify(rows);
     const refsJson = JSON.stringify(chunk.map((r) => [r.eco, r.name, r.version]));
     await env.DB.batch([
       env.DB.prepare(
-        `INSERT OR REPLACE INTO vulns (eco, name, version, id, severity, summary, published, checked_at)
+        `INSERT OR REPLACE INTO vulns (eco, name, version, id, severity, summary, published, checked_at, fixed_versions)
          SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'), json_extract(value, '$[3]'),
                 json_extract(value, '$[4]'), json_extract(value, '$[5]'), json_extract(value, '$[6]'),
-                CASE WHEN json_extract(value, '$[7]') = 1 THEN ?2 ELSE '' END
+                CASE WHEN json_extract(value, '$[7]') = 1 THEN ?2 ELSE '' END, json_extract(value, '$[8]')
          FROM json_each(?1)`,
       ).bind(rowsJson, now.toISOString()),
       env.DB.prepare(

@@ -183,6 +183,83 @@ describe('vulnerability recording', () => {
   });
 });
 
+describe('fixed versions', () => {
+  const fixedOf = async (name: string, version: string, id: string) =>
+    (
+      await e.DB.prepare('SELECT fixed_versions AS f FROM vulns WHERE name = ? AND version = ? AND id = ?').bind(name, version, id).first<{ f: string | null }>()
+    )?.f;
+  const rec = {
+    id: 'GHSA-f',
+    summary: 's',
+    database_specific: { severity: 'HIGH' },
+    affected: [
+      {
+        package: { ecosystem: 'npm', name: 'v-fix' },
+        ranges: [
+          { type: 'SEMVER', events: [{ introduced: '0' }, { fixed: '6.21.3' }, { introduced: '7.0.0' }, { fixed: '7.29.1' }] },
+          { type: 'GIT', events: [{ introduced: '0' }, { fixed: 'abc123' }] },
+        ],
+      },
+      { package: { ecosystem: 'npm', name: 'other' }, ranges: [{ type: 'SEMVER', events: [{ fixed: '9.9.9' }] }] },
+    ],
+  };
+
+  it("stores every non-GIT fixed version of the row's own package", async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    await e.DB.prepare('DELETE FROM vulns').run();
+    await addVersion('v-fix', '7.29.0');
+    await runScheduled(e, { fetch: vulnFetch({ 'v-fix': ['GHSA-f'] }, { 'GHSA-f': rec }), now: () => NOW });
+    expect(JSON.parse((await fixedOf('v-fix', '7.29.0', 'GHSA-f'))!)).toEqual(['6.21.3', '7.29.1']);
+  });
+
+  it('a new version of the same package reuses the stored list without a fetch', async () => {
+    await addVersion('v-fix', '6.5.0');
+    const calls: string[] = [];
+    await runScheduled(e, { fetch: vulnFetch({ 'v-fix': ['GHSA-f'] }, { 'GHSA-f': rec }, calls), now: () => NOW });
+    expect(calls).toEqual([]);
+    expect(JSON.parse((await fixedOf('v-fix', '6.5.0', 'GHSA-f'))!)).toEqual(['6.21.3', '7.29.1']);
+  });
+
+  it('an advisory without fixes stores [], and a 404 record stores [] (never re-fetched)', async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    await e.DB.prepare('DELETE FROM vulns').run();
+    await addVersion('v-nofix', '1.0.0');
+    const recs = { 'GHSA-n': { id: 'GHSA-n', affected: [{ package: { ecosystem: 'npm', name: 'v-nofix' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }] }] }] } };
+    await runScheduled(e, { fetch: vulnFetch({ 'v-nofix': ['GHSA-n', 'GHSA-404'] }, recs), now: () => NOW });
+    expect(await fixedOf('v-nofix', '1.0.0', 'GHSA-n')).toBe('[]');
+    expect(await fixedOf('v-nofix', '1.0.0', 'GHSA-404')).toBe('[]');
+  });
+
+  it('Go fixed versions get the v prefix the module proxy uses', async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    await e.DB.prepare('DELETE FROM vulns').run();
+    await e.DB.prepare(
+      "INSERT INTO versions (eco, name, version, publish_time, first_seen, stored_at) VALUES ('go', 'golang.org/x/net', 'v0.58.0', ?, ?, ?)",
+    ).bind(day(100), day(100), day(50)).run();
+    const recs = {
+      'GO-1': { id: 'GO-1', affected: [{ package: { ecosystem: 'Go', name: 'golang.org/x/net' }, ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }, { fixed: '0.59.0' }] }] }] },
+    };
+    await runScheduled(e, { fetch: vulnFetch({ 'golang.org/x/net': ['GO-1'] }, recs), now: () => NOW });
+    expect(await fixedOf('golang.org/x/net', 'v0.58.0', 'GO-1')).toBe('["v0.59.0"]');
+  });
+
+  it('back-fills rows written before fixed versions were stored, within the fetch budget', async () => {
+    await e.DB.prepare('DELETE FROM versions').run();
+    await e.DB.prepare('DELETE FROM vulns').run();
+    await addVersion('v-fix', '7.29.0');
+    await e.DB.prepare(
+      "INSERT INTO vulns (eco, name, version, id, severity, summary, published, checked_at) VALUES ('npm', 'v-fix', '7.29.0', 'GHSA-f', 'high', 's', NULL, ?)",
+    ).bind(day(3)).run();
+    const calls: string[] = [];
+    await runScheduled(e, { fetch: vulnFetch({ 'v-fix': ['GHSA-f'] }, { 'GHSA-f': rec }, calls), now: () => NOW });
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse((await fixedOf('v-fix', '7.29.0', 'GHSA-f'))!)).toEqual(['6.21.3', '7.29.1']);
+    const again: string[] = [];
+    await runScheduled(e, { fetch: vulnFetch({ 'v-fix': ['GHSA-f'] }, { 'GHSA-f': rec }, again), now: () => NOW });
+    expect(again).toEqual([]);
+  });
+});
+
 describe('overlay expiry', () => {
   it('removes stale overlays, keeps fresh ones, never touches main', async () => {
     await e.DB.prepare('DELETE FROM policies').run();

@@ -19,7 +19,32 @@ interface OsvVuln {
   summary?: string;
   database_specific?: { severity?: unknown };
   severity?: { type?: string; score?: string }[];
-  affected?: { package?: { ecosystem?: string; name?: string } }[];
+  affected?: { package?: { ecosystem?: string; name?: string }; ranges?: { type?: string; events?: { fixed?: unknown }[] }[] }[];
+}
+
+const MAX_FIXED = 50;
+
+/**
+ * Every "fixed" event per package ("eco:name") in an OSV record, from SEMVER and ECOSYSTEM ranges
+ * (GIT ranges hold commit hashes). Go versions get the 'v' the module proxy uses. At most MAX_FIXED per package.
+ */
+function fixedVersions(v: OsvVuln): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const a of Array.isArray(v.affected) ? v.affected : []) {
+    const eco = (Object.keys(OSV_ECO) as Ecosystem[]).find((k) => OSV_ECO[k] === a?.package?.ecosystem);
+    const name = a?.package?.name;
+    if (!eco || typeof name !== 'string') continue;
+    const list = (out[`${eco}:${name}`] ??= []);
+    for (const r of Array.isArray(a.ranges) ? a.ranges : []) {
+      if (r?.type === 'GIT' || !Array.isArray(r?.events)) continue;
+      for (const ev of r.events) {
+        if (typeof ev?.fixed !== 'string' || ev.fixed === '' || ev.fixed.length > 100) continue;
+        const f = eco === 'go' && !ev.fixed.startsWith('v') ? `v${ev.fixed}` : ev.fixed;
+        if (!list.includes(f) && list.length < MAX_FIXED) list.push(f);
+      }
+    }
+  }
+  return out;
 }
 
 function osvQuery(ref: PackageRef): { package: { name: string; ecosystem: string }; version: string } {
@@ -97,7 +122,8 @@ export async function verifyAdvisoryFix(
   }
 }
 
-export interface VulnDetails { severity: Severity | 'unknown'; summary: string; published: string | null }
+/** `fixed`: fixed versions per package ("eco:name") listed in the record; see fixedVersions. */
+export interface VulnDetails { severity: Severity | 'unknown'; summary: string; published: string | null; fixed: Record<string, string[]> }
 
 /** packageId → all advisory IDs, for refs with at least one. null if OSV is unavailable. */
 export async function vulnIds(deps: Deps, refs: PackageRef[]): Promise<Map<string, string[]> | null> {
@@ -161,6 +187,7 @@ export async function vulnDetails(deps: Deps, id: string, cache?: Map<string, Vu
       severity: severityOf(v),
       summary: typeof v.summary === 'string' ? v.summary.slice(0, 200) : '',
       published: typeof v.published === 'string' ? v.published : null,
+      fixed: fixedVersions(v),
     };
     cache?.set(id, d);
     return d;
