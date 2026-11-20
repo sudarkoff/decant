@@ -42,6 +42,10 @@ select, input, button { font: inherit; font-size: 14px; color: var(--text); back
   border: 1px solid var(--control); border-radius: 8px; padding: 9px 12px; }
 button { cursor: pointer; }
 button:disabled { cursor: default; opacity: 0.55; }
+select { -webkit-appearance: none; appearance: none; line-height: 1.45; padding-right: 34px; cursor: pointer; }
+.select { position: relative; display: inline-flex; }
+.select::after { content: ""; position: absolute; right: 14px; top: 50%; width: 6px; height: 6px; margin-top: -5px;
+  border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg); pointer-events: none; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .range { display: inline-flex; }
 .range button { border-radius: 0; margin-left: -1px; }
@@ -98,7 +102,7 @@ const BODY = String.raw`
     <h1>decant</h1>
     <div class="controls">
       <label for="project">Project</label>
-      <select id="project"><option value="all">All projects</option></select>
+      <span class="select"><select id="project"><option value="all">All projects</option></select></span>
       <div class="range" role="group" aria-label="Date range">
         <button type="button" data-range="7" aria-pressed="false">7 days</button>
         <button type="button" data-range="30" aria-pressed="true">30 days</button>
