@@ -32,6 +32,8 @@ New releases rest before they're poured: decant serves a version only after it h
 - A daily cron re-checks stored versions against OSV and blocks any newly flagged as malicious.
 - Tokens are per project: `read` for installs, `sync` for main-branch policy sync, `ci` for overlays and verdicts, and one operator token for admin.
 
-v1 supports npm and Go, plus Docker base images in CI (pinned by digest, cooldown, Grype scan). See [docs/deploy.md](docs/deploy.md) to set it up.
+v1 supports npm and Go, plus Docker base images in CI (pinned by digest, cooldown, Grype scan). See [docs/deploy.md](docs/deploy.md) to set it up. The image gate checks the Dockerfile as written: a `--build-arg` that changes a `FROM` at build time bypasses it (the scan warns on such lines; see [adopt](docs/adopt.md#pin-base-images-by-digest)).
+
+**Upgrading:** the daily audit now needs the `sync` token (`environment: decant-sync` and `sync-token` in `decant-audit.yml`), and the Worker needs migration 0008. See [release notes](docs/release.md) and [adopt](docs/adopt.md#upgrading-audit-needs-the-sync-token).
 
 Optional private dashboard (behind Cloudflare Access): [setup](docs/deploy.md#dashboard-optional).

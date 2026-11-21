@@ -195,6 +195,17 @@ What the scan checks for each digest that is new in the PR:
 
 Images referenced outside Dockerfiles (compose files, `fly.toml`) are noted in the report but not gated.
 
+Limits to know:
+
+- **Build args.** decant resolves `ARG` values from their defaults in the Dockerfile. `docker build --build-arg BASE=…` replaces them at build time and bypasses this check. The scan adds a warning on every `FROM` whose image comes from an `ARG`; prefer a literal, pinned `FROM`, or never pass that build arg.
+- **Platforms.** For a multi-arch (index) digest, Grype scans the one platform it selects: the `FROM --platform=` value when it is a literal `linux/…`, otherwise the runner's. Other platforms in the index are not scanned, and a multi-platform build is checked for that one platform only.
+- **ONBUILD in base images.** `ONBUILD` instructions inside a base image run in your build but are not inspected; only the Dockerfiles in your repo are.
+- **File names.** decant finds `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `*.dockerfile`, `Containerfile`, `Containerfile.*` and `*.containerfile`. Other names (for example `Dockerfile-prod`) are not checked, and neither is a file passed with `docker build -f` under another name.
+
+### Upgrading: audit needs the sync token
+
+decant reserves the overlay refs the audit uses (`audit`, `audit-images`) for the `sync` token, so no PR workflow's `ci` token can put allow entries there. If your `decant-audit.yml` predates this, add `environment: decant-sync` to the job and `sync-token: ${{ secrets.DECANT_SYNC_TOKEN }}` to the audit step, as in the example; the audit fails at the start without it. Add the Dockerfile globs to `decant-main.yml`'s push `paths:` too (see the example).
+
 ## 8. Renovate and Dependabot
 
 Set their minimum release age equal to your `cooldownDays` so they stop proposing versions decant would still hide.

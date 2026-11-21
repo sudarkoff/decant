@@ -1073,6 +1073,36 @@ function splitRepo(name) {
   return { registry: name.slice(0, i), path: name.slice(i + 1) };
 }
 var TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+var MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
+async function readCapped(res, max) {
+  if (Number(res.headers.get("content-length") ?? "0") > max) {
+    await res.body?.cancel().catch(() => {
+    });
+    return null;
+  }
+  if (!res.body) return new ArrayBuffer(0);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (; ; ) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => {
+      });
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out.buffer;
+}
 async function sha256(bytes) {
   const h = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
   return `sha256:${[...h].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
@@ -1081,22 +1111,23 @@ function ociClient(o) {
   const timeoutMs = o.timeoutMs ?? 1e4;
   const tokens = /* @__PURE__ */ new Map();
   async function get(url, init = {}) {
-    return o.fetch(url, { ...init, redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
+    return o.fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
   }
-  async function token(reg, path) {
-    let t = tokens.get(path);
+  async function token(registry, reg, path) {
+    const key2 = `${registry}/${path}`;
+    let t = tokens.get(key2);
     if (!t) {
       t = (async () => {
         const res = await get(reg.token(path));
         if (res.status === 401 || res.status === 403) return "denied";
-        if (!res.ok) throw new Error(`token endpoint HTTP ${res.status}`);
+        if (!res.ok || res.status >= 300) throw new Error(`token endpoint HTTP ${res.status}`);
         const body = await res.json();
         const v = typeof body.token === "string" ? body.token : typeof body.access_token === "string" ? body.access_token : "";
         if (!v) throw new Error("token endpoint returned no token");
         return v;
       })();
-      tokens.set(path, t);
-      t.catch(() => tokens.delete(path));
+      tokens.set(key2, t);
+      t.catch(() => tokens.delete(key2));
     }
     return t;
   }
@@ -1107,20 +1138,22 @@ function ociClient(o) {
     const byDigest = DIGEST_RE.test(reference);
     if (!byDigest && !TAG_RE.test(reference)) return { status: "error", message: "invalid tag" };
     try {
-      const t = await token(reg, path);
+      const t = await token(registry, reg, path);
       if (t === "denied") return { status: "denied" };
       const url = `${reg.api}/v2/${path}/manifests/${reference}`;
       const headers = { accept: MANIFEST_ACCEPT, authorization: `Bearer ${t}` };
       let res = await get(url, { method: "HEAD", headers });
       if (res.status === 404) return { status: "not-found" };
-      if (res.status === 401 || res.status === 403) return { status: "denied" };
-      if (!res.ok) return { status: "error", message: `HTTP ${res.status}` };
+      if (res.status === 401 || res.status === 403) return { status: "error", message: `HTTP ${res.status} with an anonymous token` };
+      if (!res.ok || res.status >= 300) return { status: "error", message: `HTTP ${res.status}` };
       let digest = res.headers.get("docker-content-digest");
       if (digest === null) {
         res = await get(url, { headers });
         if (res.status === 404) return { status: "not-found" };
-        if (!res.ok) return { status: "error", message: `HTTP ${res.status}` };
-        digest = await sha256(await res.arrayBuffer());
+        if (!res.ok || res.status >= 300) return { status: "error", message: `HTTP ${res.status}` };
+        const body = await readCapped(res, MAX_MANIFEST_BYTES);
+        if (body === null) return { status: "error", message: "manifest larger than 4 MB" };
+        digest = await sha256(body);
       }
       if (!DIGEST_RE.test(digest)) return { status: "error", message: "registry returned a malformed digest" };
       if (byDigest && digest !== reference) return { status: "error", message: "registry returned a different digest" };
@@ -1256,8 +1289,10 @@ function unquote(v) {
 }
 function substitute(s, args) {
   const missing = [];
+  const used = [];
   const text = s.replace(VAR_RE, (_m, braced, op, word, bare) => {
     const n = braced ?? bare;
+    if (!used.includes(n)) used.push(n);
     const v = args.get(n)?.value;
     if (op === void 0) {
       if (v === void 0) {
@@ -1278,7 +1313,7 @@ function substitute(s, args) {
         return v !== void 0 ? w : "";
     }
   });
-  return { text, missing };
+  return { text, missing, used };
 }
 function parseDockerfile(text) {
   const lines = text.replace(/^﻿/, "").split(/\r?\n/);
@@ -1379,7 +1414,7 @@ function parseDockerfile(text) {
     const inner = word === "ONBUILD" ? /^(\S+)\s*(.*)$/.exec(rest) ?? [] : [];
     const kind = word === "ONBUILD" ? (inner[1] ?? "").toUpperCase() : word;
     if (kind === "COPY" || kind === "RUN") {
-      for (const src of imageSources(kind, word === "ONBUILD" ? inner[2] ?? "" : rest)) {
+      for (const src of imageSources(kind, word === "ONBUILD" ? inner[2] ?? "" : rest, escape)) {
         if ("error" in src) {
           errors.push(`line ${ins.line}: decant couldn't parse this line (${src.error})`);
           froms.push({ line: ins.line, kind: "invalid", raw: rest, text: "" });
@@ -1437,7 +1472,7 @@ function parseDockerfile(text) {
       continue;
     }
     const image = sub.text;
-    const base = { line: ins.line, raw: rest, text: image, ...platform ? { platform } : {}, ...stage ? { stage } : {} };
+    const base = { line: ins.line, raw: rest, text: image, ...platform ? { platform } : {}, ...stage ? { stage } : {}, ...sub.used.length ? { args: sub.used } : {} };
     if (image.toLowerCase() === "scratch") froms.push({ ...base, kind: "scratch" });
     else if (!/[/:@]/.test(image) && stages.has(image.toLowerCase())) froms.push({ ...base, kind: "stage" });
     else {
@@ -1454,21 +1489,35 @@ function parseDockerfile(text) {
   const lineOf = (e) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);
   return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e) };
 }
-function imageSources(kind, args) {
+var KNOWN_FLAGS = {
+  COPY: /* @__PURE__ */ new Set(["--from", "--chown", "--chmod", "--link", "--parents", "--exclude"]),
+  RUN: /* @__PURE__ */ new Set(["--mount", "--network", "--security", "--device"])
+};
+function imageSources(kind, args, esc) {
   const out = [];
+  const odd = (t) => /["'\\]/.test(t) || t.includes(esc);
   for (const tok of args.split(/\s+/).filter(Boolean)) {
-    if (!tok.startsWith("--")) break;
+    const flagLike = tok.startsWith("--") || odd(tok[0]) && tok.replace(/^["'\\`]+/, "").startsWith("-");
+    if (!flagLike) break;
+    if (odd(tok)) {
+      out.push({ error: `${kind} flag with quotes or escapes` });
+      continue;
+    }
     const eq = tok.indexOf("=");
-    const name = (eq < 0 ? tok : tok.slice(0, eq)).toLowerCase();
-    const value = eq < 0 ? "" : tok.slice(eq + 1);
+    const name = eq < 0 ? tok : tok.slice(0, eq);
+    if (!KNOWN_FLAGS[kind].has(name)) {
+      out.push({ error: `unknown ${kind} flag ${name.slice(0, 40)}` });
+      continue;
+    }
     const wanted = kind === "COPY" ? "--from" : "--mount";
     if (name !== wanted) continue;
-    if (eq < 0 || tok.slice(0, eq) !== wanted) {
+    const value = eq < 0 ? "" : tok.slice(eq + 1);
+    if (eq < 0) {
       out.push({ error: `${tok.slice(0, 40)}: write ${wanted}=\u2026` });
       continue;
     }
-    if (/["'`$\\]/.test(value)) {
-      out.push({ error: `${wanted} with quotes, escapes or variables` });
+    if (value.includes("$")) {
+      out.push({ error: `${wanted} with variables` });
       continue;
     }
     if (kind === "COPY") {
@@ -1476,18 +1525,21 @@ function imageSources(kind, args) {
       continue;
     }
     for (const kv of value.split(",")) {
-      const i = kv.indexOf("=");
-      if (i < 0 || kv.slice(0, i).toLowerCase() !== "from") continue;
-      if (kv.slice(0, i) !== "from") out.push({ error: `--mount ${kv.slice(0, i)}=: write from=` });
-      else out.push({ via: "mount", flag: "--mount from", value: kv.slice(i + 1) });
+      const k = kv.indexOf("=");
+      if (k < 0 || kv.slice(0, k).toLowerCase() !== "from") continue;
+      if (kv.slice(0, k) !== "from") out.push({ error: `--mount ${kv.slice(0, k)}=: write from=` });
+      else out.push({ via: "mount", flag: "--mount from", value: kv.slice(k + 1) });
     }
   }
   return out;
 }
 var SKIP_DIRS2 = /* @__PURE__ */ new Set(["node_modules", ".git", "vendor", "testdata"]);
 function isDockerfileName(n) {
-  if (n.endsWith(".dockerignore")) return false;
-  return n === "Dockerfile" || n.endsWith(".Dockerfile") && n.length > ".Dockerfile".length || n.startsWith("Dockerfile.") && n.length > "Dockerfile.".length;
+  if (n.endsWith(".dockerignore") || n.endsWith(".containerignore")) return false;
+  for (const base of ["Dockerfile", "Containerfile"]) {
+    if (n === base || n.startsWith(`${base}.`) && n.length > base.length + 1) return true;
+  }
+  return [".Dockerfile", ".dockerfile", ".containerfile"].some((ext) => n.endsWith(ext) && n.length > ext.length);
 }
 async function findDockerfiles(root, fs) {
   const files = [];
@@ -1709,10 +1761,11 @@ async function auditImages(deps, client, wd, repoPath) {
       lines.push(`- ${label}: scan error; not bumped`);
       continue;
     }
-    const beforeIds = new Set(before.map((f) => f.id));
+    const fkey = (f) => `${f.id}\0${f.package}`;
+    const beforeIds = new Set(before.map(fkey));
     const afterIds = new Set(after.map((f) => f.id));
     const fixes = [...new Map(before.filter((f) => isSerious(f) && !afterIds.has(f.id)).map((f) => [f.id, f])).values()];
-    const introduced = [...new Map(after.filter((f) => !beforeIds.has(f.id)).map((f) => [f.id, f])).values()];
+    const introduced = [...new Map(after.filter((f) => !beforeIds.has(fkey(f))).map((f) => [fkey(f), f])).values()];
     if (!fixes.length) {
       lines.push(`- ${label}: fixes no High/Critical finding; not bumped`);
       continue;
@@ -2232,6 +2285,7 @@ async function run2({ deps, inputs }) {
   };
   if (!inputs.githubToken) return stop("github-token is required");
   if (!inputs.token) return stop("token is required (ci token)");
+  if (!inputs.syncToken) return stop("sync-token is required: decant reserves the audit overlay ref for the sync token (see docs/release.md)");
   if (!inputs.decantUrl) return stop("decant-url is required");
   if (!env.RUNNER_TEMP) return stop("RUNNER_TEMP is not set; decant audit runs on GitHub Actions runners");
   const repo = env.GITHUB_REPOSITORY ?? "";
@@ -2962,6 +3016,12 @@ async function dockerGate(o) {
       error(safeText(e.replace(/^line (\d+): /, `${rel}:$1: `)), join4(wd, rel));
     }
     for (const f of parsed.froms) {
+      if (f.args?.length) {
+        warning(
+          `${safe4(rel)}:${f.line}: value comes from ${f.args.map((a) => `ARG ${safe4(a)}`).join(", ")}; a --build-arg at build time bypasses this check`,
+          join4(wd, rel)
+        );
+      }
       if (f.kind !== "image" || !f.ref) continue;
       const r = f.ref;
       if (r.digest) {
