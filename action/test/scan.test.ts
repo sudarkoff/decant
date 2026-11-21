@@ -852,6 +852,12 @@ describe('scan: base images', () => {
     expect(h.exec.calls.filter((c) => c.cmd === '/rt/decant-grype/grype').map((c) => c.args[0])).toEqual([`registry:${NODE}@${DG}`, `registry:${NODE}@${DG2}`]);
   });
 
+  it('a FROM built from an ARG gets a warning: a --build-arg bypasses the check', async () => {
+    const h = docker(['ARG BASE=node', `FROM \${BASE}@${DG}`].join('\n'));
+    expect(await h.run()).toBe(0);
+    expect(h.log()).toContain('::warning file=/w/Dockerfile::Dockerfile:2: value comes from ARG BASE; a --build-arg at build time bypasses this check');
+  });
+
   it('a Grype failure (e.g. the DB check) is a scan error: fail closed', async () => {
     const h = docker(`FROM node@${DG}\n`, undefined, { grypeOut: { [`${NODE}@${DG}`]: { code: 1, stderr: 'db update check failed' } } });
     expect(await h.run()).toBe(1);

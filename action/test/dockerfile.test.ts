@@ -76,6 +76,8 @@ describe('parseDockerfile', () => {
     );
     expect(r.errors).toEqual([]);
     expect(r.froms.map((f) => f.text)).toEqual([`node:22@${D}`, `node:20@${D}`, `alpine@${E}`, `node:22@${E}`]);
+    expect(r.froms.map((f) => f.args)).toEqual([['BASE', 'TAG', 'DIGEST'], ['UNSET', 'EMPTY'], ['UNSET'], ['TAG']]);
+    expect(parseDockerfile(`FROM node@${D}`).froms[0]!.args).toBeUndefined();
   });
 
   it('an ARG without a default, an unknown ARG, or a stage-local ARG cannot be resolved statically: error', () => {
@@ -240,10 +242,24 @@ describe('parseDockerfile: reading files the way BuildKit does', () => {
 
   it('a --from or --mount decant cannot read unambiguously fails closed', () => {
     const errs = (line: string) => parseDockerfile([`FROM node@${D}`, line].join('\n')).errors;
-    expect(errs('COPY --from=$IMG /a /b')[0]).toMatch(/^line 2: decant couldn't parse this line \(--from with quotes/);
-    expect(errs('COPY --FROM=nginx /a /b')[0]).toMatch(/write --from=/);
-    expect(errs('RUN --mount="type=bind,from=nginx" true')[0]).toMatch(/--mount with quotes/);
-    expect(errs('RUN --mount=type=bind,FROM=nginx true')[0]).toMatch(/write from=/);
+    const P = (why: string) => `line 2: decant couldn't parse this line (${why})`;
+    expect(errs('COPY --from=$IMG /a /b')[0]).toBe(P('--from with variables'));
+    expect(errs('COPY --FROM=nginx /a /b')[0]).toBe(P('unknown COPY flag --FROM'));
+    expect(errs('RUN --mount="type=bind,from=nginx" true')[0]).toBe(P('RUN flag with quotes or escapes'));
+    expect(errs('RUN --mount=type=bind,FROM=nginx true')[0]).toBe(P('--mount FROM=: write from='));
+    expect(errs('COPY "--from"=nginx /a /b')[0]).toBe(P('COPY flag with quotes or escapes'));
+    expect(errs('COPY --fr\\om=nginx /a /b')[0]).toBe(P('COPY flag with quotes or escapes'));
+    expect(errs("COPY '--from=nginx' /a /b")[0]).toBe(P('COPY flag with quotes or escapes'));
+    expect(errs('COPY --form=nginx /a /b')[0]).toBe(P('unknown COPY flag --form'));
+    expect(errs('RUN --mnt=type=bind,from=nginx true')[0]).toBe(P('unknown RUN flag --mnt'));
+    expect(errs('COPY --from /a /b')[0]).toBe(P('--from: write --from=…'));
+    // With a backtick escape, a backtick in a flag token is an escape too.
+    expect(parseDockerfile(['# escape=`', `FROM node@${D}`, 'COPY --fr`om=nginx /a /b'].join('\n')).errors[0]).toBe(
+      "line 3: decant couldn't parse this line (COPY flag with quotes or escapes)",
+    );
+    // Known flags without images are fine.
+    expect(errs('COPY --chown=1:1 --chmod=644 --link --parents --exclude=*.md a /b')).toEqual([]);
+    expect(errs('RUN --network=none --security=sandbox --device=x true')).toEqual([]);
     expect(errs('COPY --from=Bad/Ref /a /b')[0]).toMatch(/not an earlier stage or a valid image reference/);
   });
 
@@ -264,6 +280,12 @@ describe('findDockerfiles', () => {
         '/w/api/Dockerfile.prod': 'FROM x',
         '/w/web/web.Dockerfile': 'FROM x',
         '/w/Dockerfile.dockerignore': 'x',
+        '/w/Containerfile': 'FROM x',
+        '/w/c/app.containerfile': 'FROM x',
+        '/w/c/app.dockerfile': 'FROM x',
+        '/w/c/Containerfile.dev': 'FROM x',
+        '/w/c/Dockerfile-prod': 'FROM x',
+        '/w/c/x.containerignore': 'x',
         '/w/dockerfile': 'FROM x',
         '/w/notes/MyDockerfile.txt': 'x',
         '/w/vendor/Dockerfile': 'FROM x',
@@ -274,7 +296,10 @@ describe('findDockerfiles', () => {
       },
       ['/w/link'],
     );
-    expect(await findDockerfiles('/w', fs)).toEqual({ files: ['Dockerfile', 'api/Dockerfile.prod', 'web/web.Dockerfile'], symlinks: ['link'] });
+    expect(await findDockerfiles('/w', fs)).toEqual({
+      files: ['Containerfile', 'Dockerfile', 'api/Dockerfile.prod', 'c/Containerfile.dev', 'c/app.containerfile', 'c/app.dockerfile', 'web/web.Dockerfile'],
+      symlinks: ['link'],
+    });
     expect(isDockerfileName('Dockerfile')).toBe(true);
     expect(isDockerfileName('Dockerfile.dockerignore')).toBe(false);
   });

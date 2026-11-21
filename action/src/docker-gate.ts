@@ -100,6 +100,12 @@ export async function dockerGate(o: GateOpts): Promise<{ rows: ImageRow[]; fatal
       error(safeText(e.replace(/^line (\d+): /, `${rel}:$1: `)), join(wd, rel));
     }
     for (const f of parsed.froms) {
+      if (f.args?.length) {
+        warning(
+          `${safe(rel)}:${f.line}: value comes from ${f.args.map((a) => `ARG ${safe(a)}`).join(', ')}; a --build-arg at build time bypasses this check`,
+          join(wd, rel),
+        );
+      }
       if (f.kind !== 'image' || !f.ref) continue;
       const r = f.ref;
       if (r.digest) {

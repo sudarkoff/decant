@@ -58,6 +58,8 @@ export type FromLine = {
   syntax?: true;
   /** An image pulled by `COPY --from=` or `RUN --mount=…,from=`, not a FROM. */
   via?: 'copy' | 'mount';
+  /** ARGs the value was built from: a `--build-arg` at build time can change it (decant sees only defaults). */
+  args?: string[];
 };
 
 export type ParsedDockerfile = { froms: FromLine[]; errors: string[] };
@@ -151,10 +153,12 @@ function unquote(v: string): string {
 }
 
 /** Substitutes ARG references; returns the names that a plain $X / ${X} needed but had no default. */
-function substitute(s: string, args: Map<string, Arg>): { text: string; missing: string[] } {
+function substitute(s: string, args: Map<string, Arg>): { text: string; missing: string[]; used: string[] } {
   const missing: string[] = [];
+  const used: string[] = [];
   const text = s.replace(VAR_RE, (_m, braced: string | undefined, op: string | undefined, word: string | undefined, bare: string | undefined) => {
     const n = (braced ?? bare)!;
+    if (!used.includes(n)) used.push(n);
     const v = args.get(n)?.value; // undefined: not declared, or declared without a default
     if (op === undefined) {
       if (v === undefined) {
@@ -175,7 +179,7 @@ function substitute(s: string, args: Map<string, Arg>): { text: string; missing:
         return v !== undefined ? w : '';
     }
   });
-  return { text, missing };
+  return { text, missing, used };
 }
 
 /**
@@ -296,7 +300,7 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     const inner = word === 'ONBUILD' ? (/^(\S+)\s*(.*)$/.exec(rest) ?? []) : [];
     const kind = word === 'ONBUILD' ? (inner[1] ?? '').toUpperCase() : word;
     if (kind === 'COPY' || kind === 'RUN') {
-      for (const src of imageSources(kind, word === 'ONBUILD' ? (inner[2] ?? '') : rest)) {
+      for (const src of imageSources(kind, word === 'ONBUILD' ? (inner[2] ?? '') : rest, escape)) {
         if ('error' in src) {
           errors.push(`line ${ins.line}: decant couldn't parse this line (${src.error})`);
           froms.push({ line: ins.line, kind: 'invalid', raw: rest, text: '' });
@@ -355,7 +359,7 @@ export function parseDockerfile(text: string): ParsedDockerfile {
       continue;
     }
     const image = sub.text;
-    const base = { line: ins.line, raw: rest, text: image, ...(platform ? { platform } : {}), ...(stage ? { stage } : {}) };
+    const base = { line: ins.line, raw: rest, text: image, ...(platform ? { platform } : {}), ...(stage ? { stage } : {}), ...(sub.used.length ? { args: sub.used } : {}) };
     if (image.toLowerCase() === 'scratch') froms.push({ ...base, kind: 'scratch' });
     else if (!/[/:@]/.test(image) && stages.has(image.toLowerCase())) froms.push({ ...base, kind: 'stage' });
     else {
@@ -374,26 +378,45 @@ export function parseDockerfile(text: string): ParsedDockerfile {
   return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e) };
 }
 
+/** The flags BuildKit accepts on COPY and RUN; any other leading `--` token fails closed. */
+const KNOWN_FLAGS: Record<'COPY' | 'RUN', Set<string>> = {
+  COPY: new Set(['--from', '--chown', '--chmod', '--link', '--parents', '--exclude']),
+  RUN: new Set(['--mount', '--network', '--security', '--device']),
+};
+
+type Source = { via: 'copy' | 'mount'; flag: string; value: string } | { error: string };
+
 /**
  * The `from=` sources of an instruction's leading flags: `COPY --from=<x>`, and `RUN --mount=<k=v,…>` with a
- * `from` key. Fail closed: a flag decant cannot read unambiguously (quotes, `$` substitution, a flag without
- * `=`, a differently cased spelling) is an error rather than a guess.
+ * `from` key. Fail closed: a leading flag token with quotes, a backslash or the escape character anywhere
+ * (name included, e.g. `"--from"=x`, `--fr\om=x`), an unknown flag, a `--from`/`--mount` without `=`, or a
+ * value with `$` substitution is an error rather than a guess.
  */
-function imageSources(kind: 'COPY' | 'RUN', args: string): ({ via: 'copy' | 'mount'; flag: string; value: string } | { error: string })[] {
-  const out: ({ via: 'copy' | 'mount'; flag: string; value: string } | { error: string })[] = [];
+function imageSources(kind: 'COPY' | 'RUN', args: string, esc: string): Source[] {
+  const out: Source[] = [];
+  const odd = (t: string) => /["'\\]/.test(t) || t.includes(esc);
   for (const tok of args.split(/\s+/).filter(Boolean)) {
-    if (!tok.startsWith('--')) break; // flags come first
+    const flagLike = tok.startsWith('--') || (odd(tok[0]!) && tok.replace(/^["'\\`]+/, '').startsWith('-'));
+    if (!flagLike) break; // flags come first
+    if (odd(tok)) {
+      out.push({ error: `${kind} flag with quotes or escapes` });
+      continue;
+    }
     const eq = tok.indexOf('=');
-    const name = (eq < 0 ? tok : tok.slice(0, eq)).toLowerCase();
-    const value = eq < 0 ? '' : tok.slice(eq + 1);
+    const name = eq < 0 ? tok : tok.slice(0, eq);
+    if (!KNOWN_FLAGS[kind].has(name)) {
+      out.push({ error: `unknown ${kind} flag ${name.slice(0, 40)}` });
+      continue;
+    }
     const wanted = kind === 'COPY' ? '--from' : '--mount';
     if (name !== wanted) continue;
-    if (eq < 0 || tok.slice(0, eq) !== wanted) {
+    const value = eq < 0 ? '' : tok.slice(eq + 1);
+    if (eq < 0) {
       out.push({ error: `${tok.slice(0, 40)}: write ${wanted}=…` });
       continue;
     }
-    if (/["'`$\\]/.test(value)) {
-      out.push({ error: `${wanted} with quotes, escapes or variables` });
+    if (value.includes('$')) {
+      out.push({ error: `${wanted} with variables` });
       continue;
     }
     if (kind === 'COPY') {
@@ -401,10 +424,10 @@ function imageSources(kind: 'COPY' | 'RUN', args: string): ({ via: 'copy' | 'mou
       continue;
     }
     for (const kv of value.split(',')) {
-      const i = kv.indexOf('=');
-      if (i < 0 || kv.slice(0, i).toLowerCase() !== 'from') continue;
-      if (kv.slice(0, i) !== 'from') out.push({ error: `--mount ${kv.slice(0, i)}=: write from=` });
-      else out.push({ via: 'mount', flag: '--mount from', value: kv.slice(i + 1) });
+      const k = kv.indexOf('=');
+      if (k < 0 || kv.slice(0, k).toLowerCase() !== 'from') continue;
+      if (kv.slice(0, k) !== 'from') out.push({ error: `--mount ${kv.slice(0, k)}=: write from=` });
+      else out.push({ via: 'mount', flag: '--mount from', value: kv.slice(k + 1) });
     }
   }
   return out;
@@ -412,10 +435,16 @@ function imageSources(kind: 'COPY' | 'RUN', args: string): ({ via: 'copy' | 'mou
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'vendor', 'testdata']);
 
-/** `Dockerfile`, `*.Dockerfile` and `Dockerfile.*` (never a `.dockerignore`). Case-sensitive, like Docker's default. */
+/**
+ * `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `*.dockerfile`, and the Podman/Buildah spellings `Containerfile`,
+ * `Containerfile.*`, `*.containerfile` (never an ignore file). Other names (e.g. `Dockerfile-prod`) are not found.
+ */
 export function isDockerfileName(n: string): boolean {
-  if (n.endsWith('.dockerignore')) return false;
-  return n === 'Dockerfile' || (n.endsWith('.Dockerfile') && n.length > '.Dockerfile'.length) || (n.startsWith('Dockerfile.') && n.length > 'Dockerfile.'.length);
+  if (n.endsWith('.dockerignore') || n.endsWith('.containerignore')) return false;
+  for (const base of ['Dockerfile', 'Containerfile']) {
+    if (n === base || (n.startsWith(`${base}.`) && n.length > base.length + 1)) return true;
+  }
+  return ['.Dockerfile', '.dockerfile', '.containerfile'].some((ext) => n.endsWith(ext) && n.length > ext.length);
 }
 
 /**
