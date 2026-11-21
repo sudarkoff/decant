@@ -174,7 +174,7 @@ In CI, run the `setup` step first, then the same command; it reads the files `se
 
 ### Pin base images by digest
 
-The PR scan gates base images too. Every `FROM` (and a `# syntax=` frontend, which is code BuildKit runs) in a changed `Dockerfile`, `*.Dockerfile` or `Dockerfile.*` must be `scratch`, an earlier stage, or pinned by digest. The tag stays as documentation:
+The PR scan gates base images too. Every `FROM`, every image pulled by `COPY --from=` or `RUN --mount=…,from=` (an earlier stage name or index is exempt), and a `# syntax=` frontend (code BuildKit runs) in a changed `Dockerfile`, `*.Dockerfile` or `Dockerfile.*` must be `scratch`, an earlier stage, or pinned by digest, and goes through the same checks. The tag stays as documentation:
 
 ```dockerfile
 # syntax=docker/dockerfile:1@sha256:<digest>

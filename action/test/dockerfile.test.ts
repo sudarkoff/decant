@@ -214,6 +214,39 @@ describe('parseDockerfile: reading files the way BuildKit does', () => {
     expect(parseDockerfile(['# escape=`', `FROM node@${D}`, 'RUN echo `"x <<EOF', 'EOF'].join('\n')).errors[0]).toBe(HD(3));
   });
 
+  it('COPY --from and RUN --mount from= are images unless they name an earlier stage or a stage index', () => {
+    const r = parseDockerfile(
+      [
+        `FROM node@${D} AS build`,
+        'COPY --from=build /a /b',
+        'COPY --from=0 /a /b',
+        'COPY --chown=1 --from=nginx:1.27 /etc/nginx /etc/nginx',
+        `RUN --mount=type=bind,from=ghcr.io/acme/tools@${E},target=/t --mount=type=cache,target=/c make`,
+        'RUN --mount=type=cache,from=build,target=/c true',
+        'RUN --mount=type=secret,id=x,from=alpine true',
+        'ONBUILD COPY --from=busybox /bin/sh /sh',
+        'ADD https://example.com/x.tgz /x',
+        'ADD git@github.com:acme/repo.git /src',
+      ].join('\n'),
+    );
+    expect(r.errors).toEqual([]);
+    expect(r.froms.filter((f) => f.via).map((f) => [f.line, f.via, f.ref!.name, f.ref!.digest ?? null])).toEqual([
+      [4, 'copy', 'docker.io/library/nginx', null],
+      [5, 'mount', 'ghcr.io/acme/tools', E],
+      [7, 'mount', 'docker.io/library/alpine', null],
+      [8, 'copy', 'docker.io/library/busybox', null],
+    ]);
+  });
+
+  it('a --from or --mount decant cannot read unambiguously fails closed', () => {
+    const errs = (line: string) => parseDockerfile([`FROM node@${D}`, line].join('\n')).errors;
+    expect(errs('COPY --from=$IMG /a /b')[0]).toMatch(/^line 2: decant couldn't parse this line \(--from with quotes/);
+    expect(errs('COPY --FROM=nginx /a /b')[0]).toMatch(/write --from=/);
+    expect(errs('RUN --mount="type=bind,from=nginx" true')[0]).toMatch(/--mount with quotes/);
+    expect(errs('RUN --mount=type=bind,FROM=nginx true')[0]).toMatch(/write from=/);
+    expect(errs('COPY --from=Bad/Ref /a /b')[0]).toMatch(/not an earlier stage or a valid image reference/);
+  });
+
   it('stage names follow Docker; a reference with / : or @ is never a stage', () => {
     expect(parseDockerfile('FROM node AS 1bad').errors[0]).toMatch(/invalid stage name/);
     expect(parseDockerfile('FROM node AS a/b').errors[0]).toMatch(/invalid stage name/);

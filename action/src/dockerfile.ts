@@ -56,6 +56,8 @@ export type FromLine = {
   ref?: ImageRef;
   /** The `# syntax=` frontend image (code BuildKit runs), not a FROM. */
   syntax?: true;
+  /** An image pulled by `COPY --from=` or `RUN --mount=…,from=`, not a FROM. */
+  via?: 'copy' | 'mount';
 };
 
 export type ParsedDockerfile = { froms: FromLine[]; errors: string[] };
@@ -290,6 +292,28 @@ export function parseDockerfile(text: string): ParsedDockerfile {
       }
       continue;
     }
+    // COPY --from=<x> and RUN --mount=…,from=<x> (also under ONBUILD) pull <x> unless it is an earlier stage.
+    const inner = word === 'ONBUILD' ? (/^(\S+)\s*(.*)$/.exec(rest) ?? []) : [];
+    const kind = word === 'ONBUILD' ? (inner[1] ?? '').toUpperCase() : word;
+    if (kind === 'COPY' || kind === 'RUN') {
+      for (const src of imageSources(kind, word === 'ONBUILD' ? (inner[2] ?? '') : rest)) {
+        if ('error' in src) {
+          errors.push(`line ${ins.line}: decant couldn't parse this line (${src.error})`);
+          froms.push({ line: ins.line, kind: 'invalid', raw: rest, text: '' });
+          continue;
+        }
+        const v = src.value;
+        if (/^\d+$/.test(v) || (!/[/:@]/.test(v) && stages.has(v.toLowerCase()))) continue; // a stage index or an earlier stage
+        const ref = parseImageRef(v);
+        if (!ref) {
+          errors.push(`line ${ins.line}: ${kind} ${src.flag}=${v}: not an earlier stage or a valid image reference`);
+          froms.push({ line: ins.line, kind: 'invalid', raw: rest, text: '' });
+          continue;
+        }
+        froms.push({ line: ins.line, kind: 'image', raw: rest, text: v, ref, via: src.via });
+      }
+      continue;
+    }
     if (word !== 'FROM') continue;
     seenFrom = true;
     const bad = (why: string) => {
@@ -348,6 +372,42 @@ export function parseDockerfile(text: string): ParsedDockerfile {
   // Report in file order (instruction errors are found before FROM errors).
   const lineOf = (e: string) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);
   return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e) };
+}
+
+/**
+ * The `from=` sources of an instruction's leading flags: `COPY --from=<x>`, and `RUN --mount=<k=v,…>` with a
+ * `from` key. Fail closed: a flag decant cannot read unambiguously (quotes, `$` substitution, a flag without
+ * `=`, a differently cased spelling) is an error rather than a guess.
+ */
+function imageSources(kind: 'COPY' | 'RUN', args: string): ({ via: 'copy' | 'mount'; flag: string; value: string } | { error: string })[] {
+  const out: ({ via: 'copy' | 'mount'; flag: string; value: string } | { error: string })[] = [];
+  for (const tok of args.split(/\s+/).filter(Boolean)) {
+    if (!tok.startsWith('--')) break; // flags come first
+    const eq = tok.indexOf('=');
+    const name = (eq < 0 ? tok : tok.slice(0, eq)).toLowerCase();
+    const value = eq < 0 ? '' : tok.slice(eq + 1);
+    const wanted = kind === 'COPY' ? '--from' : '--mount';
+    if (name !== wanted) continue;
+    if (eq < 0 || tok.slice(0, eq) !== wanted) {
+      out.push({ error: `${tok.slice(0, 40)}: write ${wanted}=…` });
+      continue;
+    }
+    if (/["'`$\\]/.test(value)) {
+      out.push({ error: `${wanted} with quotes, escapes or variables` });
+      continue;
+    }
+    if (kind === 'COPY') {
+      out.push({ via: 'copy', flag: '--from', value });
+      continue;
+    }
+    for (const kv of value.split(',')) {
+      const i = kv.indexOf('=');
+      if (i < 0 || kv.slice(0, i).toLowerCase() !== 'from') continue;
+      if (kv.slice(0, i) !== 'from') out.push({ error: `--mount ${kv.slice(0, i)}=: write from=` });
+      else out.push({ via: 'mount', flag: '--mount from', value: kv.slice(i + 1) });
+    }
+  }
+  return out;
 }
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'vendor', 'testdata']);

@@ -835,6 +835,23 @@ describe('scan: base images', () => {
     expect(h.puts.find((p) => (p as { package: string }).package === `docker:${NODE}@${DG}`)).toMatchObject({ result: 'flagged' });
   });
 
+  it('COPY --from and RUN --mount from= images are gated like FROM; stage references are not', async () => {
+    const h = docker(
+      [`FROM node@${DG} AS build`, 'COPY --from=build /a /b', 'COPY --from=nginx:1.27 /etc/nginx /etc/nginx', `RUN --mount=type=bind,from=node:20@${DG2},target=/t true`].join('\n'),
+      undefined,
+      {
+        tags: { 'docker.io/library/nginx:1.27': DG2 },
+        decisions: { [`${NODE}@${DG2}`]: { decision: 'cooldown', firstSeen: '2026-11-18T00:00:00.000Z', eligibleAt: '2026-11-25T00:00:00.000Z' } },
+      },
+    );
+    expect(await h.run()).toBe(1);
+    const s = h.summary();
+    expect(s).toContain(`COPY --from image is not pinned by digest; pin it: \`COPY --from=nginx:1.27@${DG2}\``);
+    expect(h.imagePosts[0]!.images).toEqual([{ name: NODE, digest: DG }, { name: NODE, digest: DG2 }]);
+    expect(s).toContain(`| \`${NODE}@${DG2}\` | Dockerfile:4 | until 2026-11-25 00:00 UTC |`);
+    expect(h.exec.calls.filter((c) => c.cmd === '/rt/decant-grype/grype').map((c) => c.args[0])).toEqual([`registry:${NODE}@${DG}`, `registry:${NODE}@${DG2}`]);
+  });
+
   it('a Grype failure (e.g. the DB check) is a scan error: fail closed', async () => {
     const h = docker(`FROM node@${DG}\n`, undefined, { grypeOut: { [`${NODE}@${DG}`]: { code: 1, stderr: 'db update check failed' } } });
     expect(await h.run()).toBe(1);

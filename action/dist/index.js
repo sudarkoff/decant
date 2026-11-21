@@ -1376,6 +1376,27 @@ function parseDockerfile(text) {
       }
       continue;
     }
+    const inner = word === "ONBUILD" ? /^(\S+)\s*(.*)$/.exec(rest) ?? [] : [];
+    const kind = word === "ONBUILD" ? (inner[1] ?? "").toUpperCase() : word;
+    if (kind === "COPY" || kind === "RUN") {
+      for (const src of imageSources(kind, word === "ONBUILD" ? inner[2] ?? "" : rest)) {
+        if ("error" in src) {
+          errors.push(`line ${ins.line}: decant couldn't parse this line (${src.error})`);
+          froms.push({ line: ins.line, kind: "invalid", raw: rest, text: "" });
+          continue;
+        }
+        const v = src.value;
+        if (/^\d+$/.test(v) || !/[/:@]/.test(v) && stages.has(v.toLowerCase())) continue;
+        const ref = parseImageRef(v);
+        if (!ref) {
+          errors.push(`line ${ins.line}: ${kind} ${src.flag}=${v}: not an earlier stage or a valid image reference`);
+          froms.push({ line: ins.line, kind: "invalid", raw: rest, text: "" });
+          continue;
+        }
+        froms.push({ line: ins.line, kind: "image", raw: rest, text: v, ref, via: src.via });
+      }
+      continue;
+    }
     if (word !== "FROM") continue;
     seenFrom = true;
     const bad = (why) => {
@@ -1432,6 +1453,36 @@ function parseDockerfile(text) {
   }
   const lineOf = (e) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);
   return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e) };
+}
+function imageSources(kind, args) {
+  const out = [];
+  for (const tok of args.split(/\s+/).filter(Boolean)) {
+    if (!tok.startsWith("--")) break;
+    const eq = tok.indexOf("=");
+    const name = (eq < 0 ? tok : tok.slice(0, eq)).toLowerCase();
+    const value = eq < 0 ? "" : tok.slice(eq + 1);
+    const wanted = kind === "COPY" ? "--from" : "--mount";
+    if (name !== wanted) continue;
+    if (eq < 0 || tok.slice(0, eq) !== wanted) {
+      out.push({ error: `${tok.slice(0, 40)}: write ${wanted}=\u2026` });
+      continue;
+    }
+    if (/["'`$\\]/.test(value)) {
+      out.push({ error: `${wanted} with quotes, escapes or variables` });
+      continue;
+    }
+    if (kind === "COPY") {
+      out.push({ via: "copy", flag: "--from", value });
+      continue;
+    }
+    for (const kv of value.split(",")) {
+      const i = kv.indexOf("=");
+      if (i < 0 || kv.slice(0, i).toLowerCase() !== "from") continue;
+      if (kv.slice(0, i) !== "from") out.push({ error: `--mount ${kv.slice(0, i)}=: write from=` });
+      else out.push({ via: "mount", flag: "--mount from", value: kv.slice(i + 1) });
+    }
+  }
+  return out;
 }
 var SKIP_DIRS2 = /* @__PURE__ */ new Set(["node_modules", ".git", "vendor", "testdata"]);
 function isDockerfileName(n) {
@@ -2873,7 +2924,10 @@ function findingList(fs) {
 }
 function pinned(f, digest) {
   const base = f.text.replace(/@sha256:[0-9a-f]*$/, "");
-  return f.syntax ? `# syntax=${base}@${digest}` : `FROM ${f.platform ? `--platform=${f.platform} ` : ""}${base}@${digest}`;
+  if (f.syntax) return `# syntax=${base}@${digest}`;
+  if (f.via === "copy") return `COPY --from=${base}@${digest}`;
+  if (f.via === "mount") return `RUN --mount=from=${base}@${digest}`;
+  return `FROM ${f.platform ? `--platform=${f.platform} ` : ""}${base}@${digest}`;
 }
 async function changedDockerfiles(deps, wd, baseSha) {
   const tree = await findDockerfiles(wd, deps.fs);
@@ -2920,7 +2974,7 @@ async function dockerGate(o) {
       }
       const res = await oci.resolveTag(r.name, r.tag ?? "latest");
       const fix = res.status === "ok" ? `pin it: \`${safeLine(pinned(f, res.digest))}\`` : res.status === "unsupported" ? `can't resolve: registry ${safe4(r.registry)} is not supported; pin the digest you build from` : res.status === "denied" ? "can't resolve: anonymous pull refused (private image?); pin the digest you build from" : `can't resolve the tag (${res.status === "not-found" ? "not found" : safeText(res.message)})`;
-      const what = f.syntax ? "syntax frontend image is not pinned by digest" : "not pinned by digest";
+      const what = f.syntax ? "syntax frontend image is not pinned by digest" : f.via ? `${f.via === "copy" ? "COPY --from" : "RUN --mount from"} image is not pinned by digest` : "not pinned by digest";
       rows.push({ file: rel, line: f.line, image: safe4(f.text), cooldown: "\u2014", grype: "\u2014", problems: [`${what}; ${fix}`], notes: [] });
       error(`${safe4(rel)}:${f.line}: ${safe4(f.text)} is ${what}; ${fix.replace(/`/g, "")}`, join4(wd, rel));
     }

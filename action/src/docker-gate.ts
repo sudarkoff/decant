@@ -42,7 +42,10 @@ function findingList(fs: GrypeFinding[]): string {
 /** The FROM a reviewer should write: the image as written, pinned to `digest`. */
 function pinned(f: FromLine, digest: string): string {
   const base = f.text.replace(/@sha256:[0-9a-f]*$/, '');
-  return f.syntax ? `# syntax=${base}@${digest}` : `FROM ${f.platform ? `--platform=${f.platform} ` : ''}${base}@${digest}`;
+  if (f.syntax) return `# syntax=${base}@${digest}`;
+  if (f.via === 'copy') return `COPY --from=${base}@${digest}`;
+  if (f.via === 'mount') return `RUN --mount=from=${base}@${digest}`;
+  return `FROM ${f.platform ? `--platform=${f.platform} ` : ''}${base}@${digest}`;
 }
 
 export type GateOpts = {
@@ -117,7 +120,7 @@ export async function dockerGate(o: GateOpts): Promise<{ rows: ImageRow[]; fatal
             : res.status === 'denied'
               ? "can't resolve: anonymous pull refused (private image?); pin the digest you build from"
               : `can't resolve the tag (${res.status === 'not-found' ? 'not found' : safeText(res.message)})`;
-      const what = f.syntax ? 'syntax frontend image is not pinned by digest' : 'not pinned by digest';
+      const what = f.syntax ? 'syntax frontend image is not pinned by digest' : f.via ? `${f.via === 'copy' ? 'COPY --from' : 'RUN --mount from'} image is not pinned by digest` : 'not pinned by digest';
       rows.push({ file: rel, line: f.line, image: safe(f.text), cooldown: '—', grype: '—', problems: [`${what}; ${fix}`], notes: [] });
       error(`${safe(rel)}:${f.line}: ${safe(f.text)} is ${what}; ${fix.replace(/`/g, '')}`, join(wd, rel));
     }
