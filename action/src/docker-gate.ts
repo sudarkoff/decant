@@ -99,6 +99,9 @@ export async function dockerGate(o: GateOpts): Promise<{ rows: ImageRow[]; fatal
       rows.push({ file: rel, line: Number(/^line (\d+)/.exec(e)?.[1] ?? 0), image: '—', cooldown: '—', grype: '—', problems: ['cannot read this line (see log)'], notes: [] });
       error(safeText(e.replace(/^line (\d+): /, `${rel}:$1: `)), join(wd, rel));
     }
+    for (const a of parsed.argLines ?? []) {
+      warning(`${safe(rel)}:${a.line}: --mount value comes from ${a.args.map((x) => `ARG ${safe(x)}`).join(', ')}; a --build-arg at build time bypasses this check`, join(wd, rel));
+    }
     for (const f of parsed.froms) {
       if (f.args?.length) {
         warning(

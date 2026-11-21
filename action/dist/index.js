@@ -1395,6 +1395,8 @@ function parseDockerfile(text) {
     }
   }
   const globals = /* @__PURE__ */ new Map();
+  let stageArgs = /* @__PURE__ */ new Map();
+  const argLines = [];
   const stages = /* @__PURE__ */ new Set();
   let seenFrom = false;
   for (const ins of instructions) {
@@ -1403,7 +1405,14 @@ function parseDockerfile(text) {
     const word = m[1].toUpperCase();
     const rest = m[2];
     if (word === "ARG") {
-      if (seenFrom) continue;
+      if (seenFrom) {
+        for (const tok of rest.split(/\s+/).filter(Boolean)) {
+          const eq = tok.indexOf("=");
+          const n = eq < 0 ? tok : tok.slice(0, eq);
+          stageArgs.set(n, { value: eq < 0 ? globals.get(n)?.value : unquote(tok.slice(eq + 1)) });
+        }
+        continue;
+      }
       for (const tok of rest.split(/\s+/).filter(Boolean)) {
         const eq = tok.indexOf("=");
         if (eq < 0) globals.set(tok, { value: void 0 });
@@ -1414,7 +1423,12 @@ function parseDockerfile(text) {
     const inner = word === "ONBUILD" ? /^(\S+)\s*(.*)$/.exec(rest) ?? [] : [];
     const kind = word === "ONBUILD" ? (inner[1] ?? "").toUpperCase() : word;
     if (kind === "COPY" || kind === "RUN") {
-      for (const src of imageSources(kind, word === "ONBUILD" ? inner[2] ?? "" : rest, escape)) {
+      let argsUsed = [];
+      for (const src of imageSources(kind, word === "ONBUILD" ? inner[2] ?? "" : rest, escape, stageArgs)) {
+        if ("argsUsed" in src) {
+          argsUsed = [.../* @__PURE__ */ new Set([...argsUsed, ...src.argsUsed])];
+          continue;
+        }
         if ("error" in src) {
           errors.push(`line ${ins.line}: decant couldn't parse this line (${src.error})`);
           froms.push({ line: ins.line, kind: "invalid", raw: rest, text: "" });
@@ -1430,10 +1444,12 @@ function parseDockerfile(text) {
         }
         froms.push({ line: ins.line, kind: "image", raw: rest, text: v, ref, via: src.via });
       }
+      if (argsUsed.length) argLines.push({ line: ins.line, args: argsUsed });
       continue;
     }
     if (word !== "FROM") continue;
     seenFrom = true;
+    stageArgs = /* @__PURE__ */ new Map();
     const bad = (why) => {
       errors.push(`line ${ins.line}: FROM ${rest}: ${why}`);
       froms.push({ line: ins.line, kind: "invalid", raw: rest, text: "" });
@@ -1487,13 +1503,28 @@ function parseDockerfile(text) {
     if (stage) stages.add(stage);
   }
   const lineOf = (e) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);
-  return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e) };
+  return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e), ...argLines.length ? { argLines } : {} };
 }
 var KNOWN_FLAGS = {
   COPY: /* @__PURE__ */ new Set(["--from", "--chown", "--chmod", "--link", "--parents", "--exclude"]),
   RUN: /* @__PURE__ */ new Set(["--mount", "--network", "--security", "--device"])
 };
-function imageSources(kind, args, esc) {
+var PLATFORM_ARGS = new Map(
+  ["TARGETPLATFORM", "TARGETOS", "TARGETARCH", "TARGETVARIANT", "BUILDPLATFORM", "BUILDOS", "BUILDARCH", "BUILDVARIANT"].map((n) => [n, "platform"])
+);
+function expandMount(value, scope) {
+  const all = new Map([...[...PLATFORM_ARGS].map(([k, v]) => [k, { value: v }]), ...scope]);
+  const sub = substitute(value, all);
+  if (sub.missing.length) return { error: `--mount uses ${sub.missing.map((n) => `$${n}`).join(", ")} with no value decant can see` };
+  for (const n of sub.used) {
+    const v = all.get(n)?.value ?? "";
+    if (/[,=]/.test(v)) return { error: `--mount: ARG ${n} has a value with ',' or '='` };
+  }
+  const raw = value.replace(VAR_RE, "");
+  if ((sub.text.match(/[,=]/g) ?? []).length !== (raw.match(/[,=]/g) ?? []).length) return { error: "--mount: a variable expands to ',' or '='" };
+  return { text: sub.text, used: sub.used.filter((n) => !PLATFORM_ARGS.has(n) || scope.has(n)) };
+}
+function imageSources(kind, args, esc, scope) {
   const out = [];
   const odd = (t) => /["'\\]/.test(t) || t.includes(esc);
   for (const tok of args.split(/\s+/).filter(Boolean)) {
@@ -1516,15 +1547,18 @@ function imageSources(kind, args, esc) {
       out.push({ error: `${tok.slice(0, 40)}: write ${wanted}=\u2026` });
       continue;
     }
-    if (value.includes("$")) {
-      out.push({ error: `${wanted} with variables` });
-      continue;
-    }
     if (kind === "COPY") {
-      out.push({ via: "copy", flag: "--from", value });
+      if (value.includes("$")) out.push({ error: "--from with variables" });
+      else out.push({ via: "copy", flag: "--from", value });
       continue;
     }
-    for (const kv of value.split(",")) {
+    const x = expandMount(value, scope);
+    if ("error" in x) {
+      out.push({ error: x.error });
+      continue;
+    }
+    if (x.used.length) out.push({ argsUsed: x.used });
+    for (const kv of x.text.split(",")) {
       const k = kv.indexOf("=");
       if (k < 0 || kv.slice(0, k).toLowerCase() !== "from") continue;
       if (kv.slice(0, k) !== "from") out.push({ error: `--mount ${kv.slice(0, k)}=: write from=` });
@@ -3014,6 +3048,9 @@ async function dockerGate(o) {
     for (const e of parsed.errors) {
       rows.push({ file: rel, line: Number(/^line (\d+)/.exec(e)?.[1] ?? 0), image: "\u2014", cooldown: "\u2014", grype: "\u2014", problems: ["cannot read this line (see log)"], notes: [] });
       error(safeText(e.replace(/^line (\d+): /, `${rel}:$1: `)), join4(wd, rel));
+    }
+    for (const a of parsed.argLines ?? []) {
+      warning(`${safe4(rel)}:${a.line}: --mount value comes from ${a.args.map((x) => `ARG ${safe4(x)}`).join(", ")}; a --build-arg at build time bypasses this check`, join4(wd, rel));
     }
     for (const f of parsed.froms) {
       if (f.args?.length) {

@@ -858,6 +858,12 @@ describe('scan: base images', () => {
     expect(h.log()).toContain('::warning file=/w/Dockerfile::Dockerfile:2: value comes from ARG BASE; a --build-arg at build time bypasses this check');
   });
 
+  it('a --mount built from an ARG warns; one with a platform ARG passes quietly', async () => {
+    const h = docker([`FROM node@${DG}`, 'ARG C=/c', 'RUN --mount=type=cache,id=npm-$TARGETPLATFORM,target=$C true'].join('\n'));
+    expect(await h.run()).toBe(0);
+    expect(h.log()).toContain('::warning file=/w/Dockerfile::Dockerfile:3: --mount value comes from ARG C; a --build-arg at build time bypasses this check');
+  });
+
   it('a Grype failure (e.g. the DB check) is a scan error: fail closed', async () => {
     const h = docker(`FROM node@${DG}\n`, undefined, { grypeOut: { [`${NODE}@${DG}`]: { code: 1, stderr: 'db update check failed' } } });
     expect(await h.run()).toBe(1);

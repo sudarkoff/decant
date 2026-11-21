@@ -240,6 +240,30 @@ describe('parseDockerfile: reading files the way BuildKit does', () => {
     ]);
   });
 
+  it('--mount values expand variables before the comma split, failing closed on anything that could inject from=', () => {
+    const run = (...lines: string[]) => parseDockerfile([`FROM node@${D}`, ...lines].join('\n'));
+    const ok = run('RUN --mount=type=cache,id=npm-$TARGETPLATFORM,target=/root/.npm npm ci');
+    expect(ok.errors).toEqual([]);
+    expect(ok.argLines).toBeUndefined(); // platform args are not --build-arg overrides
+    const go = run('ARG GOCACHE=/root/.cache/go', 'RUN --mount=type=cache,target=${GOCACHE} go build');
+    expect(go.errors).toEqual([]);
+    expect(go.argLines).toEqual([{ line: 3, args: ['GOCACHE'] }]);
+    // A global ARG redeclared in the stage keeps its default.
+    const g = parseDockerfile(['ARG CACHE=/c', `FROM node@${D}`, 'ARG CACHE', 'RUN --mount=type=cache,target=$CACHE true'].join('\n'));
+    expect(g.errors).toEqual([]);
+    expect(run('RUN --mount=type=cache,target=$X true').errors).toEqual([
+      "line 2: decant couldn't parse this line (--mount uses $X with no value decant can see)",
+    ]);
+    expect(run('ARG T="a,from=evil"', 'RUN --mount=type=bind,target=$T true').errors).toEqual([
+      "line 3: decant couldn't parse this line (--mount: ARG T has a value with ',' or '=')",
+    ]);
+    expect(run('RUN --mount=type=bind,target=${X:-a,from=evil} true').errors[0]).toMatch(/a variable expands to/);
+    // A from= that is literal next to an ARG is still gated, and the line warns.
+    const f = run('ARG C=/c', 'RUN --mount=type=bind,from=alpine,target=$C true');
+    expect(f.froms.filter((x) => x.via).map((x) => x.ref!.name)).toEqual(['docker.io/library/alpine']);
+    expect(f.argLines).toEqual([{ line: 3, args: ['C'] }]);
+  });
+
   it('a --from or --mount decant cannot read unambiguously fails closed', () => {
     const errs = (line: string) => parseDockerfile([`FROM node@${D}`, line].join('\n')).errors;
     const P = (why: string) => `line 2: decant couldn't parse this line (${why})`;

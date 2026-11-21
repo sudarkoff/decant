@@ -190,13 +190,14 @@ What the scan checks for each digest that is new in the PR:
 - **Cooldown.** A digest's age counts from when decant first verified it in the registry (never the image's own `created` time, which the publisher controls). Main-branch sync reports the digests in use, so adopting decant does not block images you already build from. An `allow` entry skips the cooldown, as for npm and Go: `{ "package": "docker:docker.io/library/node@sha256:<digest>", "reason": "…", "added": "2026-11-20" }`. Names are fully qualified (`docker.io/library/node`, `ghcr.io/org/app`).
 - **Blocks.** `block` entries with `docker:` ids work like any other.
 - **Vulnerabilities.** Grype (pinned) scans the image straight from the registry. High or Critical findings with a fixed version fail the PR; findings with no fix are reported and pass. The daily audit re-scans every image in use and, once the tag points at a newer digest that has cleared the cooldown and removes a High or Critical finding, bumps the digest in the same security PR as npm and Go fixes.
-- **Registries.** decant resolves and scans public images on Docker Hub and ghcr.io. Images on other or private registries have a per-project cooldown clock and cannot be scanned, so they fail unless an `allow` entry names the digest.
+- **Registries.** decant resolves and scans public images on Docker Hub and ghcr.io. A private image there cannot be verified anonymously (the registry refuses the manifest), so it never starts a cooldown clock; an image on any other registry gets a cooldown clock for this project only and cannot be scanned. Either way it fails unless an `allow` entry names the digest.
 - **What fails closed.** An `ARG` in `FROM` without a default, a line decant cannot parse (it accepts only Dockerfile instructions, `#` comments and `RUN`/`COPY`/`ADD` heredocs it can read unambiguously), a digest the registry does not have, or a Grype or Grype database error.
 
 Images referenced outside Dockerfiles (compose files, `fly.toml`) are noted in the report but not gated.
 
 Limits to know:
 
+- **Quoted flags.** A `COPY` or `RUN` flag with quotes or escapes, such as `--chown="app:app"`, fails closed: write flag values unquoted (`--chown=app:app`).
 - **Build args.** decant resolves `ARG` values from their defaults in the Dockerfile. `docker build --build-arg BASE=…` replaces them at build time and bypasses this check. The scan adds a warning on every `FROM` whose image comes from an `ARG`; prefer a literal, pinned `FROM`, or never pass that build arg.
 - **Platforms.** For a multi-arch (index) digest, Grype scans the one platform it selects: the `FROM --platform=` value when it is a literal `linux/…`, otherwise the runner's. Other platforms in the index are not scanned, and a multi-platform build is checked for that one platform only.
 - **ONBUILD in base images.** `ONBUILD` instructions inside a base image run in your build but are not inspected; only the Dockerfiles in your repo are.

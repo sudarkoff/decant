@@ -62,7 +62,12 @@ export type FromLine = {
   args?: string[];
 };
 
-export type ParsedDockerfile = { froms: FromLine[]; errors: string[] };
+export type ParsedDockerfile = {
+  froms: FromLine[];
+  errors: string[];
+  /** Lines whose image references or --mount values were built from ARGs a --build-arg can override. */
+  argLines?: { line: number; args: string[] }[];
+};
 
 type Arg = { value: string | undefined };
 
@@ -280,6 +285,8 @@ export function parseDockerfile(text: string): ParsedDockerfile {
   }
 
   const globals = new Map<string, Arg>();
+  let stageArgs = new Map<string, Arg>();
+  const argLines: { line: number; args: string[] }[] = [];
   const stages = new Set<string>();
   let seenFrom = false;
   for (const ins of instructions) {
@@ -288,7 +295,15 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     const word = m[1]!.toUpperCase();
     const rest = m[2]!;
     if (word === 'ARG') {
-      if (seenFrom) continue; // stage ARGs are invisible to FROM
+      if (seenFrom) {
+        // Stage ARGs: in scope for later instructions in this stage (a redeclared global keeps its default).
+        for (const tok of rest.split(/\s+/).filter(Boolean)) {
+          const eq = tok.indexOf('=');
+          const n = eq < 0 ? tok : tok.slice(0, eq);
+          stageArgs.set(n, { value: eq < 0 ? globals.get(n)?.value : unquote(tok.slice(eq + 1)) });
+        }
+        continue; // invisible to FROM
+      }
       for (const tok of rest.split(/\s+/).filter(Boolean)) {
         const eq = tok.indexOf('=');
         if (eq < 0) globals.set(tok, { value: undefined });
@@ -300,7 +315,12 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     const inner = word === 'ONBUILD' ? (/^(\S+)\s*(.*)$/.exec(rest) ?? []) : [];
     const kind = word === 'ONBUILD' ? (inner[1] ?? '').toUpperCase() : word;
     if (kind === 'COPY' || kind === 'RUN') {
-      for (const src of imageSources(kind, word === 'ONBUILD' ? (inner[2] ?? '') : rest, escape)) {
+      let argsUsed: string[] = [];
+      for (const src of imageSources(kind, word === 'ONBUILD' ? (inner[2] ?? '') : rest, escape, stageArgs)) {
+        if ('argsUsed' in src) {
+          argsUsed = [...new Set([...argsUsed, ...src.argsUsed])];
+          continue;
+        }
         if ('error' in src) {
           errors.push(`line ${ins.line}: decant couldn't parse this line (${src.error})`);
           froms.push({ line: ins.line, kind: 'invalid', raw: rest, text: '' });
@@ -316,10 +336,12 @@ export function parseDockerfile(text: string): ParsedDockerfile {
         }
         froms.push({ line: ins.line, kind: 'image', raw: rest, text: v, ref, via: src.via });
       }
+      if (argsUsed.length) argLines.push({ line: ins.line, args: argsUsed });
       continue;
     }
     if (word !== 'FROM') continue;
     seenFrom = true;
+    stageArgs = new Map();
     const bad = (why: string) => {
       errors.push(`line ${ins.line}: FROM ${rest}: ${why}`);
       froms.push({ line: ins.line, kind: 'invalid', raw: rest, text: '' });
@@ -375,7 +397,7 @@ export function parseDockerfile(text: string): ParsedDockerfile {
   }
   // Report in file order (instruction errors are found before FROM errors).
   const lineOf = (e: string) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);
-  return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e) };
+  return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e), ...(argLines.length ? { argLines } : {}) };
 }
 
 /** The flags BuildKit accepts on COPY and RUN; any other leading `--` token fails closed. */
@@ -384,7 +406,31 @@ const KNOWN_FLAGS: Record<'COPY' | 'RUN', Set<string>> = {
   RUN: new Set(['--mount', '--network', '--security', '--device']),
 };
 
-type Source = { via: 'copy' | 'mount'; flag: string; value: string } | { error: string };
+type Source = { via: 'copy' | 'mount'; flag: string; value: string } | { error: string } | { argsUsed: string[] };
+
+/** BuildKit's predefined platform ARGs, as placeholders with no ',' or '=' (they only matter for the split). */
+const PLATFORM_ARGS = new Map(
+  ['TARGETPLATFORM', 'TARGETOS', 'TARGETARCH', 'TARGETVARIANT', 'BUILDPLATFORM', 'BUILDOS', 'BUILDARCH', 'BUILDVARIANT'].map((n) => [n, 'platform']),
+);
+
+/**
+ * Expands variables in a --mount value the way BuildKit does before splitting on commas: platform ARGs as
+ * placeholders, others from the ARG defaults in scope. Fails when a variable has no value, or when a value
+ * contains ',' or '=' (it could inject a from= at build time).
+ */
+function expandMount(value: string, scope: Map<string, Arg>): { text: string; used: string[] } | { error: string } {
+  const all = new Map<string, Arg>([...[...PLATFORM_ARGS].map(([k, v]) => [k, { value: v }] as [string, Arg]), ...scope]);
+  const sub = substitute(value, all);
+  if (sub.missing.length) return { error: `--mount uses ${sub.missing.map((n) => `$${n}`).join(', ')} with no value decant can see` };
+  for (const n of sub.used) {
+    const v = all.get(n)?.value ?? '';
+    if (/[,=]/.test(v)) return { error: `--mount: ARG ${n} has a value with ',' or '='` };
+  }
+  // Also catch a ${X:-a,from=b} default word.
+  const raw = value.replace(VAR_RE, '');
+  if ((sub.text.match(/[,=]/g) ?? []).length !== (raw.match(/[,=]/g) ?? []).length) return { error: '--mount: a variable expands to \',\' or \'=\'' };
+  return { text: sub.text, used: sub.used.filter((n) => !PLATFORM_ARGS.has(n) || scope.has(n)) };
+}
 
 /**
  * The `from=` sources of an instruction's leading flags: `COPY --from=<x>`, and `RUN --mount=<k=v,…>` with a
@@ -392,7 +438,7 @@ type Source = { via: 'copy' | 'mount'; flag: string; value: string } | { error: 
  * (name included, e.g. `"--from"=x`, `--fr\om=x`), an unknown flag, a `--from`/`--mount` without `=`, or a
  * value with `$` substitution is an error rather than a guess.
  */
-function imageSources(kind: 'COPY' | 'RUN', args: string, esc: string): Source[] {
+function imageSources(kind: 'COPY' | 'RUN', args: string, esc: string, scope: Map<string, Arg>): Source[] {
   const out: Source[] = [];
   const odd = (t: string) => /["'\\]/.test(t) || t.includes(esc);
   for (const tok of args.split(/\s+/).filter(Boolean)) {
@@ -415,15 +461,18 @@ function imageSources(kind: 'COPY' | 'RUN', args: string, esc: string): Source[]
       out.push({ error: `${tok.slice(0, 40)}: write ${wanted}=…` });
       continue;
     }
-    if (value.includes('$')) {
-      out.push({ error: `${wanted} with variables` });
-      continue;
-    }
     if (kind === 'COPY') {
-      out.push({ via: 'copy', flag: '--from', value });
+      if (value.includes('$')) out.push({ error: '--from with variables' });
+      else out.push({ via: 'copy', flag: '--from', value });
       continue;
     }
-    for (const kv of value.split(',')) {
+    const x = expandMount(value, scope);
+    if ('error' in x) {
+      out.push({ error: x.error });
+      continue;
+    }
+    if (x.used.length) out.push({ argsUsed: x.used });
+    for (const kv of x.text.split(',')) {
       const k = kv.indexOf('=');
       if (k < 0 || kv.slice(0, k).toLowerCase() !== 'from') continue;
       if (kv.slice(0, k) !== 'from') out.push({ error: `--mount ${kv.slice(0, k)}=: write from=` });
