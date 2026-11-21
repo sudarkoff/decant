@@ -287,6 +287,10 @@ export function parseDockerfile(text: string): ParsedDockerfile {
 
   const globals = new Map<string, Arg>();
   let stageArgs = new Map<string, Arg>();
+  // ENV names set in each stage (values not modelled). A stage FROM an earlier stage inherits that stage's set,
+  // transitively. ENV from an external base image is trusted: that image is itself pinned, cooled down and scanned.
+  let stageEnv = new Set<string>();
+  const envOf = new Map<string, Set<string>>();
   const argLines: { line: number; args: string[] }[] = [];
   const stages = new Set<string>();
   let seenFrom = false;
@@ -325,7 +329,7 @@ export function parseDockerfile(text: string): ParsedDockerfile {
         const legacy = /^([A-Za-z_][A-Za-z0-9_]*)\b/.exec(rest);
         if (legacy) named.push(legacy[1]!);
       }
-      for (const n of named) stageArgs.set(n, { value: undefined, opaque: 'env' });
+      for (const n of named) stageEnv.add(n);
       continue;
     }
     // COPY --from=<x> and RUN --mount=…,from=<x> (also under ONBUILD) pull <x> unless it is an earlier stage.
@@ -333,7 +337,7 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     const kind = word === 'ONBUILD' ? (inner[1] ?? '').toUpperCase() : word;
     if (kind === 'COPY' || kind === 'RUN') {
       let argsUsed: string[] = [];
-      for (const src of imageSources(kind, word === 'ONBUILD' ? (inner[2] ?? '') : rest, escape, stageArgs)) {
+      for (const src of imageSources(kind, word === 'ONBUILD' ? (inner[2] ?? '') : rest, escape, new Map([...stageArgs, ...[...stageEnv].map((n): [string, Arg] => [n, { value: undefined, opaque: 'env' }])]))) {
         if ('argsUsed' in src) {
           argsUsed = [...new Set([...argsUsed, ...src.argsUsed])];
           continue;
@@ -359,6 +363,7 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     if (word !== 'FROM') continue;
     seenFrom = true;
     stageArgs = new Map();
+    stageEnv = new Set();
     const bad = (why: string) => {
       errors.push(`line ${ins.line}: FROM ${rest}: ${why}`);
       froms.push({ line: ins.line, kind: 'invalid', raw: rest, text: '' });
@@ -405,17 +410,22 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     const image = sub.text;
     const base = { line: ins.line, raw: rest, text: image, ...(platform ? { platform } : {}), ...(stage ? { stage } : {}), ...(sub.used.length ? { args: sub.used } : {}) };
     if (image.toLowerCase() === 'scratch') froms.push({ ...base, kind: 'scratch' });
-    else if (!/[/:@]/.test(image) && stages.has(image.toLowerCase())) froms.push({ ...base, kind: 'stage' });
+    else if (!/[/:@]/.test(image) && stages.has(image.toLowerCase())) {
+      froms.push({ ...base, kind: 'stage' });
+      stageEnv = new Set(envOf.get(image.toLowerCase()) ?? []);
+    }
     else {
       const ref = parseImageRef(image);
       if (!ref) {
         bad('not a valid image reference');
         if (stage) stages.add(stage);
+        if (stage) envOf.set(stage, stageEnv);
         continue;
       }
       froms.push({ ...base, kind: 'image', ref });
     }
     if (stage) stages.add(stage);
+    if (stage) envOf.set(stage, stageEnv); // the same set: later ENV in this stage reaches stages built FROM it
   }
   // Report in file order (instruction errors are found before FROM errors).
   const lineOf = (e: string) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);

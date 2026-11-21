@@ -266,6 +266,14 @@ describe('parseDockerfile: reading files the way BuildKit does', () => {
     expect(run('ARG T="a,from=evil"', 'RUN --mount=type=bind,target=$T true').errors[0]).toMatch(/\$T \(its ARG line has quotes or backslashes\) in a --mount/);
     expect(run("ARG T='/c'", 'RUN --mount=type=cache,target=$T true').errors[0]).toMatch(/its ARG line has quotes/);
     expect(parseDockerfile(['ARG BASE="node"', 'FROM $BASE'].join('\n')).errors[0]).toMatch(/^line 2: FROM \$BASE: decant can't evaluate \$BASE/);
+    // ENV is inherited by stages built FROM an earlier stage, transitively; set after FROM-ing it still counts.
+    const S = (...lines: string[]) => parseDockerfile(lines.join('\n')).errors;
+    const envErr = /decant can't evaluate \$X set by ENV in a --mount/;
+    expect(S(`FROM node@${D} AS a`, 'ENV X=a,from=evil', 'FROM a AS b', 'RUN --mount=type=cache,id=$X,target=/c true')[0]).toMatch(envErr);
+    expect(S(`FROM node@${D} AS a`, 'ENV X=1', 'FROM a AS b', 'FROM b AS c', 'RUN --mount=type=cache,id=$X,target=/c true')[0]).toMatch(envErr);
+    expect(S(`FROM node@${D} AS a`, 'FROM a AS b', 'FROM a AS c', 'ENV X=1', 'FROM c', 'RUN --mount=type=cache,id=$X,target=/c true')[0]).toMatch(envErr);
+    // A stage FROM an external image (or scratch) starts with no ENV decant tracks.
+    expect(S(`FROM node@${D} AS a`, 'ENV X=1', `FROM node@${D}`, 'ARG X=ok', 'RUN --mount=type=cache,id=$X,target=/c true')).toEqual([]);
     // An ENV not used in a mount is fine.
     expect(run('ENV PATH=/x:$PATH', 'RUN --mount=type=cache,id=npm-$TARGETPLATFORM,target=/c true').errors).toEqual([]);
     expect(run('RUN --mount=type=bind,target=${X:-a,from=evil} true').errors[0]).toMatch(/a variable expands to/);

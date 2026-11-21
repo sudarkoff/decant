@@ -200,6 +200,7 @@ Limits to know:
 - **Quoted flags.** A `COPY` or `RUN` flag with quotes or escapes, such as `--chown="app:app"`, fails closed: write flag values unquoted (`--chown=app:app`).
 - **Build args.** decant resolves `ARG` values from their defaults in the Dockerfile. `docker build --build-arg BASE=…` replaces them at build time and bypasses this check. The scan adds a warning on every `FROM` whose image comes from an `ARG`; prefer a literal, pinned `FROM`, or never pass that build arg.
 - **Platforms.** For a multi-arch (index) digest, Grype scans the one platform it selects: the `FROM --platform=` value when it is a literal `linux/…`, otherwise the runner's. Other platforms in the index are not scanned, and a multi-platform build is checked for that one platform only.
+- **ENV from base images.** An `ENV` set by an external base image is trusted when decant evaluates `--mount` values (that image is itself pinned, cooled down and scanned); an `ENV` set in one of your own stages makes any `--mount` that uses it fail, including in stages built `FROM` that stage.
 - **ONBUILD in base images.** `ONBUILD` instructions inside a base image run in your build but are not inspected; only the Dockerfiles in your repo are.
 - **File names.** decant finds `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `*.dockerfile`, `Containerfile`, `Containerfile.*` and `*.containerfile`. Other names (for example `Dockerfile-prod`) are not checked, and neither is a file passed with `docker build -f` under another name.
 

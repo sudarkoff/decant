@@ -1396,6 +1396,8 @@ function parseDockerfile(text) {
   }
   const globals = /* @__PURE__ */ new Map();
   let stageArgs = /* @__PURE__ */ new Map();
+  let stageEnv = /* @__PURE__ */ new Set();
+  const envOf = /* @__PURE__ */ new Map();
   const argLines = [];
   const stages = /* @__PURE__ */ new Set();
   let seenFrom = false;
@@ -1431,14 +1433,14 @@ function parseDockerfile(text) {
         const legacy = /^([A-Za-z_][A-Za-z0-9_]*)\b/.exec(rest);
         if (legacy) named.push(legacy[1]);
       }
-      for (const n of named) stageArgs.set(n, { value: void 0, opaque: "env" });
+      for (const n of named) stageEnv.add(n);
       continue;
     }
     const inner = word === "ONBUILD" ? /^(\S+)\s*(.*)$/.exec(rest) ?? [] : [];
     const kind = word === "ONBUILD" ? (inner[1] ?? "").toUpperCase() : word;
     if (kind === "COPY" || kind === "RUN") {
       let argsUsed = [];
-      for (const src of imageSources(kind, word === "ONBUILD" ? inner[2] ?? "" : rest, escape, stageArgs)) {
+      for (const src of imageSources(kind, word === "ONBUILD" ? inner[2] ?? "" : rest, escape, new Map([...stageArgs, ...[...stageEnv].map((n) => [n, { value: void 0, opaque: "env" }])]))) {
         if ("argsUsed" in src) {
           argsUsed = [.../* @__PURE__ */ new Set([...argsUsed, ...src.argsUsed])];
           continue;
@@ -1464,6 +1466,7 @@ function parseDockerfile(text) {
     if (word !== "FROM") continue;
     seenFrom = true;
     stageArgs = /* @__PURE__ */ new Map();
+    stageEnv = /* @__PURE__ */ new Set();
     const bad = (why) => {
       errors.push(`line ${ins.line}: FROM ${rest}: ${why}`);
       froms.push({ line: ins.line, kind: "invalid", raw: rest, text: "" });
@@ -1509,17 +1512,21 @@ function parseDockerfile(text) {
     const image = sub.text;
     const base = { line: ins.line, raw: rest, text: image, ...platform ? { platform } : {}, ...stage ? { stage } : {}, ...sub.used.length ? { args: sub.used } : {} };
     if (image.toLowerCase() === "scratch") froms.push({ ...base, kind: "scratch" });
-    else if (!/[/:@]/.test(image) && stages.has(image.toLowerCase())) froms.push({ ...base, kind: "stage" });
-    else {
+    else if (!/[/:@]/.test(image) && stages.has(image.toLowerCase())) {
+      froms.push({ ...base, kind: "stage" });
+      stageEnv = new Set(envOf.get(image.toLowerCase()) ?? []);
+    } else {
       const ref = parseImageRef(image);
       if (!ref) {
         bad("not a valid image reference");
         if (stage) stages.add(stage);
+        if (stage) envOf.set(stage, stageEnv);
         continue;
       }
       froms.push({ ...base, kind: "image", ref });
     }
     if (stage) stages.add(stage);
+    if (stage) envOf.set(stage, stageEnv);
   }
   const lineOf = (e) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);
   return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e), ...argLines.length ? { argLines } : {} };
