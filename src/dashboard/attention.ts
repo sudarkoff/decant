@@ -1,5 +1,6 @@
 import type { Ecosystem, Env } from '../types';
 import { parsePolicy } from '../policy/schema';
+import { verdictDetails } from '../verdict-details';
 import { compareVersions, parseVersion } from '../semver';
 import { INSTALLED_CHUNK, SCOPE, windowDays } from './queries';
 
@@ -339,8 +340,11 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
        (SELECT json_group_array(json_array(x.source, x.reason)) FROM global_blocks x WHERE ${onInst}) AS blocks,
        (SELECT json_group_array(json_array(x.id, x.severity, x.summary, x.fixed_versions)) FROM vulns x
          WHERE ${onInst} AND (x.id LIKE 'MAL-%' OR x.severity IN ('critical', 'high'))) AS vulns,
-       (SELECT json_group_array(json_array(x.scanner, x.result, x.details)) FROM verdicts x
-         WHERE ${onInst} AND x.result IN ('flagged', 'malicious')) AS verdicts
+       (SELECT json_group_array(json_array(x.scanner, x.result, x.details,
+          (SELECT json_group_array(json(d.details)) FROM (
+             SELECT details FROM verdict_details d
+             WHERE d.eco = x.eco AND d.name = x.name AND d.version = x.version AND d.scanner = x.scanner ORDER BY d.at DESC, d.project_id) d)))
+         FROM verdicts x WHERE ${onInst} AND x.result IN ('flagged', 'malicious')) AS verdicts
      FROM i`,
   );
   const all = [...versions.values()];
@@ -371,7 +375,13 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
       const id = `${r.eco}:${r.name}@${r.version}`;
       const blocks = JSON.parse(r.blocks) as [string, string][];
       const vulns = JSON.parse(r.vulns) as [string, string, string | null, string | null][];
-      const verdicts = JSON.parse(r.verdicts) as [string, string, string | null][];
+      // details: every writer's list merged (verdict_details), or the row's own for rows written before 0008.
+      const verdicts = (JSON.parse(r.verdicts) as [string, string, string | null, string | null][]).map(
+        ([sc, res, row, writers]): [string, string, string | null] => {
+          const d = verdictDetails(sc, row, writers === null ? null : JSON.stringify(writers));
+          return [sc, res, d === undefined ? null : JSON.stringify(d)];
+        },
+      );
       const pkg = { eco: r.eco, name: r.name, version: r.version };
       const mal = vulns.filter(([vid]) => vid.startsWith('MAL-')).map(([vid]) => vid);
       const malSources = blocks.filter(([s]) => isMaliciousSource(s));

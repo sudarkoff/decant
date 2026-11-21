@@ -10,6 +10,7 @@ let e: Env;
 type Tokens = { read: string; ci: string; sync: string };
 let A: Tokens;
 let B: Tokens;
+let C: Tokens;
 
 const dg = (c: string) => `sha256:${c.repeat(64)}`;
 const NODE = 'docker.io/library/node';
@@ -18,6 +19,7 @@ beforeAll(async () => {
   e = env as unknown as Env;
   A = await seedProject(e, 'dka');
   B = await seedProject(e, 'dkb');
+  C = await seedProject(e, 'dkc');
 });
 
 /**
@@ -52,6 +54,11 @@ function call(method: string, path: string, token: string | null, body?: unknown
   const deps: Deps = { fetch, now: () => clock };
   return handle(new Request(`https://h${path}`, init), e, deps, ctx);
 }
+
+const details = async (id: string) => {
+  const r = (await (await call('GET', `/api/verdicts?package=${encodeURIComponent(id)}`, A.ci)).json()) as { verdicts: { details?: unknown }[] };
+  return r.verdicts[0]?.details;
+};
 
 const syncPolicy = (token: string, project: string, p: unknown, ref = 'main') =>
   call('PUT', `/api/projects/${project}/policy`, token, { policy: p, sha: 'abc', ref });
@@ -222,7 +229,7 @@ describe('docker verdicts', () => {
     expect(r.verdicts.map((v) => v.result)).toEqual(['flagged']);
   });
 
-  it('a same-severity write from another project merges details instead of erasing findings', async () => {
+  it('details are kept per writer and merged at read: a later write from another project erases nothing', async () => {
     const id = `docker:${NODE}@${dg('f')}`;
     const put = (token: string, details: unknown) =>
       call('PUT', '/api/verdicts', token, { package: id, scanner: 'grype', scannerVersion: '0.121.3', result: 'flagged', details });
@@ -230,29 +237,34 @@ describe('docker verdicts', () => {
     const b = { id: 'CVE-2026-2', severity: 'critical', package: 'zlib', version: '1', fixed: [] };
     expect((await put(A.ci, [a])).status).toBe(204);
     expect((await put(B.ci, [b])).status).toBe(204);
-    expect((await put(B.ci, [])).status).toBe(204); // a less complete write
-    expect((await put(B.ci, { not: 'an array' })).status).toBe(204);
-    const row = await e.DB.prepare("SELECT details FROM verdicts WHERE eco = 'docker' AND version = ?").bind(dg('f')).first<{ details: string }>();
-    expect(JSON.parse(row!.details)).toEqual([a, b]);
+    expect((await put(A.ci, { not: 'an array' })).status).toBe(204); // stores nothing for A
+    expect((await put(C.ci, [])).status).toBe(204); // a less complete write
+    expect(await details(id)).toEqual([b, a]);
   });
 
-  it('merged details are capped', async () => {
+  it('one writer padding the list cannot hide another writer\'s Critical; malformed entries are dropped', async () => {
     const id = `docker:${NODE}@${dg('0')}`;
-    const many = (from: number) => Array.from({ length: 150 }, (_, i) => ({ id: `CVE-2026-${from + i}` }));
-    await call('PUT', '/api/verdicts', A.ci, { package: id, scanner: 'grype', scannerVersion: 'x', result: 'flagged', details: many(1000) });
-    await call('PUT', '/api/verdicts', B.ci, { package: id, scanner: 'grype', scannerVersion: 'x', result: 'flagged', details: many(5000) });
-    const row = await e.DB.prepare("SELECT details FROM verdicts WHERE eco = 'docker' AND version = ?").bind(dg('0')).first<{ details: string }>();
-    const list = JSON.parse(row!.details) as { id: string }[];
-    expect(list).toHaveLength(200);
-    expect(list[0]!.id).toBe('CVE-2026-1000'); // earlier findings kept first
+    const low = (n: number) => ({ id: `CVE-2026-${n}`, severity: 'low', package: 'p', version: '1', fixed: [] });
+    const junk = [{ id: 'CVE-1' }, { id: '<script>', severity: 'critical', package: 'x', version: '1', fixed: [] }, 'string', { id: 'CVE-9', severity: 'urgent', package: 'x', version: '1', fixed: [] }];
+    const put = (token: string, list: unknown[]) =>
+      call('PUT', '/api/verdicts', token, { package: id, scanner: 'grype', scannerVersion: 'x', result: 'flagged', details: list });
+    await put(A.ci, [...junk, ...Array.from({ length: 300 }, (_, i) => low(1000 + i))]);
+    const crit = { id: 'CVE-2026-7777', severity: 'Critical', package: 'glibc', version: '2.36', fixed: ['2.36-9'] };
+    await put(B.ci, [crit]);
+    await put(A.ci, [...junk, ...Array.from({ length: 300 }, (_, i) => low(5000 + i))]); // A writes again, newer
+    const list = (await details(id)) as { id: string; severity: string }[];
+    expect(list[0]).toEqual({ ...crit, severity: 'critical' });
+    expect(list).toHaveLength(101); // A's list capped at 100 per write, plus B's one
+    expect(list.some((x) => x.id === 'CVE-1' || x.id === '<script>' || x.id === 'CVE-9')).toBe(false);
   });
 
   it('merges legacy string details (GuardDog rule names) too', async () => {
     const id = `npm:merge-me@1.0.0`;
-    const put = (token: string, details: unknown) => call('PUT', '/api/verdicts', token, { package: id, scanner: 'guarddog', scannerVersion: 'x', result: 'flagged', details });
-    await put(A.ci, ['rule-a', { rule: 'rule-b', count: 2 }]);
+    const put = (token: string, d: unknown) => call('PUT', '/api/verdicts', token, { package: id, scanner: 'guarddog', scannerVersion: 'x', result: 'flagged', details: d });
+    await put(A.ci, ['rule-a', { rule: 'rule-b', count: 2 }, { rule: 'bad', count: -1 }]);
     await put(B.ci, ['rule-c', 'rule-a']);
-    const row = await e.DB.prepare("SELECT details FROM verdicts WHERE eco = 'npm' AND name = 'merge-me'").first<{ details: string }>();
-    expect(JSON.parse(row!.details)).toEqual(['rule-a', { rule: 'rule-b', count: 2 }, 'rule-c']);
+    const merged = (await details(id)) as unknown[];
+    expect(merged).toHaveLength(3); // rule-a once; the malformed rule dropped
+    expect(merged).toEqual(expect.arrayContaining(['rule-a', 'rule-c', { rule: 'rule-b', count: 2 }]));
   });
 });

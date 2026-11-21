@@ -4,6 +4,7 @@ import { verifyAdvisoryFix } from '../osv';
 import { clearDecisionCaches, forgetDenied } from '../policy/decider';
 import { parsePolicy, type Policy } from '../policy/schema';
 import { recordImages, type ImageIn } from '../policy/images';
+import { sanitizeDetails, verdictDetails } from '../verdict-details';
 import { globalBlockStmt } from '../policy/store';
 import { DIGEST_RE, isImageRepo, PROJECT_ID_RE as ID_RE } from '../ids';
 import { formatPackageId, parsePackageId, type Deps, type Env, type PackageRef } from '../types';
@@ -12,8 +13,6 @@ const MAX_BODY = 1024 * 1024;
 const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SCANNER_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const RESULTS = new Set(['clean', 'flagged', 'malicious']);
-/** Findings kept when same-severity verdicts from different writers are merged. */
-const MAX_MERGED_DETAILS = 200;
 const SEVERITY_SQL = (col: string) => `(CASE ${col} WHEN 'malicious' THEN 2 WHEN 'flagged' THEN 1 ELSE 0 END)`;
 
 const NO_STORE = { 'cache-control': 'no-store' };
@@ -377,7 +376,8 @@ async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): P
   }
   if (typeof body.result !== 'string' || !RESULTS.has(body.result)) return err(400, 'result must be clean, flagged or malicious');
   const { scanner, scannerVersion, result } = body as { scanner: string; scannerVersion: string; result: string };
-  const details = body.details === undefined ? null : JSON.stringify(body.details);
+  const clean = sanitizeDetails(scanner, body.details);
+  const details = clean === undefined ? null : JSON.stringify(clean);
   const now = deps.now();
 
   const stmts: D1PreparedStatement[] = [
@@ -386,23 +386,21 @@ async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): P
       // (malicious > flagged > clean), so one project's CI cannot clear another's finding.
       `INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, details, scanned_at, project_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-       -- At the same severity the stored findings are kept: details become the union (stored ones first,
-       -- capped), so a less complete write from another project never erases them.
        ON CONFLICT (eco, name, version, scanner) DO UPDATE SET
-         scanner_version = excluded.scanner_version, result = excluded.result,
-         details = CASE
-           WHEN ${SEVERITY_SQL('excluded.result')} > ${SEVERITY_SQL('verdicts.result')} OR json_type(verdicts.details) IS NOT 'array' THEN excluded.details
-           WHEN json_type(excluded.details) IS NOT 'array' THEN verdicts.details
-           ELSE (SELECT json_group_array(CASE WHEN t IN ('object', 'array') THEN json(value) ELSE value END) FROM (
-                   SELECT value, t FROM (
-                     SELECT value, type AS t, 0 AS src, key AS k FROM json_each(verdicts.details)
-                     UNION ALL SELECT value, type, 1, key FROM json_each(excluded.details))
-                   GROUP BY value, t ORDER BY MIN(src * 1000000 + k) LIMIT ${MAX_MERGED_DETAILS}))
-         END,
+         scanner_version = excluded.scanner_version, result = excluded.result, details = excluded.details,
          scanned_at = excluded.scanned_at, project_id = excluded.project_id
        WHERE ${SEVERITY_SQL('excluded.result')} >= ${SEVERITY_SQL('verdicts.result')}`,
     ).bind(ref.eco, ref.name, ref.version, scanner, scannerVersion, result, details, now.toISOString(), writer),
   ];
+  // This writer's own details, whatever the verdict row keeps: readers merge every writer's list.
+  if (Array.isArray(clean)) {
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO verdict_details (eco, name, version, scanner, project_id, details, at) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (eco, name, version, scanner, project_id) DO UPDATE SET details = excluded.details, at = excluded.at`,
+      ).bind(ref.eco, ref.name, ref.version, scanner, writer, details, now.toISOString()),
+    );
+  }
   if (result === 'malicious') {
     stmts.push(globalBlockStmt(env, ref, `verdict:${scanner}`, `malicious verdict from ${scanner} ${scannerVersion}`, now));
   }
@@ -416,21 +414,27 @@ async function getVerdicts(req: Request, env: Env): Promise<Response> {
   const ref: PackageRef | null = id ? parsePackageId(id) : null;
   if (!ref) return err(400, 'package query parameter must be a package ID');
   const r = await env.DB.prepare(
-    `SELECT scanner, scanner_version, result, details, scanned_at FROM verdicts
-     WHERE eco = ? AND name = ? AND version = ? ORDER BY scanner`,
+    `SELECT scanner, scanner_version, result, details, scanned_at,
+       (SELECT json_group_array(json(d.details)) FROM (
+          SELECT details FROM verdict_details d
+          WHERE d.eco = v.eco AND d.name = v.name AND d.version = v.version AND d.scanner = v.scanner ORDER BY d.at DESC, d.project_id) d) AS writers
+     FROM verdicts v WHERE eco = ? AND name = ? AND version = ? ORDER BY scanner`,
   )
     .bind(ref.eco, ref.name, ref.version)
-    .all<{ scanner: string; scanner_version: string; result: string; details: string | null; scanned_at: string }>();
+    .all<{ scanner: string; scanner_version: string; result: string; details: string | null; scanned_at: string; writers: string }>();
   const pkg = formatPackageId(ref);
   return reply({
-    verdicts: r.results.map((v) => ({
-      package: pkg,
-      scanner: v.scanner,
-      scannerVersion: v.scanner_version,
-      result: v.result,
-      ...(v.details !== null ? { details: JSON.parse(v.details) } : {}),
-      scannedAt: v.scanned_at,
-    })),
+    verdicts: r.results.map((v) => {
+      const details = verdictDetails(v.scanner, v.details, v.writers);
+      return {
+        package: pkg,
+        scanner: v.scanner,
+        scannerVersion: v.scanner_version,
+        result: v.result,
+        ...(details !== undefined ? { details } : {}),
+        scannedAt: v.scanned_at,
+      };
+    }),
   });
 }
 

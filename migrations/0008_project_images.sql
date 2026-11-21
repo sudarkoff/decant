@@ -7,3 +7,7 @@ CREATE TABLE project_images (project_id TEXT NOT NULL REFERENCES projects(id), n
 -- a clock for this project only, so one project's CI can never start the shared clock for a digest nobody has
 -- seen published. Digests verified by the Worker itself go in versions (eco 'docker'), shared by every project.
 CREATE TABLE project_image_seen (project_id TEXT NOT NULL REFERENCES projects(id), name TEXT NOT NULL, digest TEXT NOT NULL, first_seen TEXT NOT NULL, PRIMARY KEY (project_id, name, digest));
+-- Verdict details per writer project: each project's CI replaces only its own list; readers merge the lists
+-- (round-robin by severity, capped), so one writer can neither erase nor crowd out another's findings.
+-- verdicts.details keeps the latest accepted write for rows with no verdict_details (written before 0008).
+CREATE TABLE verdict_details (eco TEXT NOT NULL, name TEXT NOT NULL, version TEXT NOT NULL, scanner TEXT NOT NULL, project_id TEXT NOT NULL, details TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY (eco, name, version, scanner, project_id));
