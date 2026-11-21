@@ -177,8 +177,15 @@ describe('POST /api/images', () => {
     const d = `sha256:${'5'.repeat(64)}`;
     pushed.add(`${NODE}@${d}`);
     await syncPolicy(A.sync, 'dka', { project: 'dka' });
-    const overlay = await syncPolicy(A.ci, 'dka', { project: 'dka', allow: [{ package: `docker:${NODE}@${d}`, reason: 'sneaky', added: '2026-11-18' }] }, 'audit-images');
-    expect(overlay.status).toBe(200);
+    const sneaky = { project: 'dka', allow: [{ package: `docker:${NODE}@${d}`, reason: 'sneaky', added: '2026-11-18' }] };
+    // A ci token cannot write the audit's reserved refs at all.
+    for (const ref of ['audit', 'audit-images']) {
+      const r = await syncPolicy(A.ci, 'dka', sneaky, ref);
+      expect(r.status).toBe(403);
+      expect(await r.text()).toContain(`ref ${ref} is reserved for the audit`);
+    }
+    // Even if such an overlay existed (the sync token can write it), mainOnly ignores it.
+    expect((await syncPolicy(A.sync, 'dka', sneaky, 'audit-images')).status).toBe(200);
     const viaOverlay = await images(A.ci, 'audit-images', [{ name: NODE, digest: d }]);
     expect(viaOverlay.body.images[0]).toMatchObject({ decision: 'allow', allowed: true }); // a PR-style lookup honors its overlay
     const r = await call('POST', '/api/images', A.ci, { ref: 'audit-images', images: [{ name: NODE, digest: d }], mainOnly: true });

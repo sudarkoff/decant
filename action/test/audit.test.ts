@@ -246,6 +246,7 @@ function harness(w: World) {
     INPUT_MODE: 'audit',
     INPUT_DECANT_URL: `${D}/`,
     INPUT_TOKEN: 'ci-secret',
+    INPUT_SYNC_TOKEN: 'sync-secret',
     INPUT_GITHUB_TOKEN: 'ghs_secret',
     INPUT_WORKING_DIRECTORY: '/w',
     INPUT_POLICY_PATH: 'decant.json',
@@ -433,9 +434,9 @@ describe('audit: one security PR per run', () => {
     });
     expect(await h.run()).toBe(0);
 
-    // overlay sync with the ci token: main policy plus one verified allow entry, ref "audit"
+    // overlay sync with the sync token (the ref is reserved for it): main policy plus one verified allow entry, ref "audit"
     expect(h.syncs).toHaveLength(1);
-    expect(h.syncs[0]!.auth).toBe('Bearer ci-secret');
+    expect(h.syncs[0]!.auth).toBe('Bearer sync-secret');
     expect(h.syncs[0]!.body.ref).toBe(REF);
     expect(h.syncs[0]!.body.policy.allow).toEqual([{ package: 'npm:lodash@4.17.21', advisory: GHSA, reason: 'security fix', added: '2026-11-19' }]);
     expect(h.syncs[0]!.body.policy.cooldownDays).toBe(7);
@@ -738,6 +739,15 @@ describe('audit: one security PR per run', () => {
   it('decant rejects the ci token (403) on overlay sync → exit 1', async () => {
     const h = harness({ ...DIRECT, syncStatus: 403, exec: npmFake() });
     expect(await h.run()).toBe(1);
+  });
+
+  it('no sync-token → the reserved overlay cannot be written: run fails, nothing installed or opened', async () => {
+    const h = harness({ ...DIRECT, exec: npmFake(), env: { INPUT_SYNC_TOKEN: undefined } });
+    expect(await h.run()).toBe(1);
+    expect(h.syncs).toEqual([]);
+    expect(h.prs).toEqual([]);
+    expect(h.exec.calls.filter((c) => c.cmd === 'npm')).toEqual([]);
+    expect(h.log()).toContain('sync-token is required to ship fixes: decant reserves the overlay ref audit for the sync token');
   });
 
   it('GHSA + CVE aliases merge into one advisory', async () => {

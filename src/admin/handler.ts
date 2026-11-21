@@ -11,6 +11,8 @@ import { formatPackageId, parsePackageId, type Deps, type Env, type PackageRef }
 
 const MAX_BODY = 1024 * 1024;
 const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
+/** Overlay refs only the audit writes, with the sync token. */
+const RESERVED_REFS = new Set(['audit', 'audit-images']);
 const SCANNER_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const RESULTS = new Set(['clean', 'flagged', 'malicious']);
 const SEVERITY_SQL = (col: string) => `(CASE ${col} WHEN 'malicious' THEN 2 WHEN 'flagged' THEN 1 ELSE 0 END)`;
@@ -182,8 +184,12 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
   const project = await env.DB.prepare('SELECT main_ref FROM projects WHERE id = ?').bind(projectId).first<{ main_ref: string }>();
   if (!project) return notFound();
   const isMain = ref === project.main_ref;
+  // The audit's overlay refs: only the sync token may write them, so no ci token (any PR workflow) can put
+  // allow entries where the audit resolves its fixes and candidates.
+  const reserved = RESERVED_REFS.has(ref);
   if (isMain && !isSyncToken) return err(403, `use the sync token for ${project.main_ref}`);
-  if (!isMain && isSyncToken) return err(403, `sync tokens may only sync ${project.main_ref}`);
+  if (reserved && !isSyncToken) return err(403, `ref ${ref} is reserved for the audit (sync token)`);
+  if (!isMain && !reserved && isSyncToken) return err(403, `sync tokens may only sync ${project.main_ref}`);
 
   if (!isMain) {
     const main = await env.DB.prepare('SELECT json FROM policies WHERE project_id = ? AND ref = ?')

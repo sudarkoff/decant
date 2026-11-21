@@ -133,6 +133,7 @@ const stillVulnerable = (p: Pkg, version: string) => p.vulns.some((v) => validFi
 export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const env = deps.env;
   mask(inputs.token);
+  mask(inputs.syncToken);
   mask(inputs.githubToken);
   const stop = (msg: string) => {
     setOutput('result', 'fail', env);
@@ -238,6 +239,8 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       inputs,
       gh,
       client,
+      // The overlay ref `audit` is reserved for the sync token on the Worker: no ci token can write it.
+      overlayClient: inputs.syncToken ? decant(deps.fetch, inputs.decantUrl, inputs.syncToken, { sleep: deps.sleep }) : null,
       raw,
       policy,
       project,
@@ -365,6 +368,8 @@ type FixCtx = {
   inputs: ModeCtx['inputs'];
   gh: GitHubClient;
   client: DecantClient;
+  /** Sync-token client for the reserved overlay ref; null when no sync-token was given. */
+  overlayClient: DecantClient | null;
   raw: Record<string, unknown>;
   policy: Policy;
   project: string;
@@ -418,7 +423,8 @@ async function syncOverlay(ctx: FixCtx, pkgs: Pkg[], outcomes: Outcome[]): Promi
     const next = { ...ctx.raw, allow: [...mainAllow(ctx), ...batch.flatMap((p) => allowEntries(ctx, p))] };
     const check = parsePolicy(next);
     if (!check.ok) throw new FatalError(`overlay policy invalid: ${check.errors.join('; ')}`);
-    const res = await ctx.client.syncPolicy(ctx.project, next, ctx.sha, OVERLAY_REF);
+    if (!ctx.overlayClient) throw new FatalError(`sync-token is required to ship fixes: decant reserves the overlay ref ${OVERLAY_REF} for the sync token`);
+    const res = await ctx.overlayClient.syncPolicy(ctx.project, next, ctx.sha, OVERLAY_REF);
     if (res.status === 401 || res.status === 403) throw new Error(`decant PUT /api/projects/${ctx.project}/policy: HTTP ${res.status}`);
     if (res.status >= 200 && res.status < 300) return batch;
     const failure = `overlay sync HTTP ${res.status}: ${errorText(res.body)}`;
