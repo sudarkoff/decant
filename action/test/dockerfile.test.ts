@@ -254,9 +254,20 @@ describe('parseDockerfile: reading files the way BuildKit does', () => {
     expect(run('RUN --mount=type=cache,target=$X true').errors).toEqual([
       "line 2: decant couldn't parse this line (--mount uses $X with no value decant can see)",
     ]);
-    expect(run('ARG T="a,from=evil"', 'RUN --mount=type=bind,target=$T true').errors).toEqual([
+    expect(run('ARG T=a,from=evil', 'RUN --mount=type=bind,target=$T true').errors).toEqual([
       "line 3: decant couldn't parse this line (--mount: ARG T has a value with ',' or '=')",
     ]);
+    // ENV overrides ARG and decant does not model it: any ENV-set variable in a --mount fails.
+    expect(run('ENV X=a,from=evil', 'RUN --mount=type=cache,id=$X,target=/c true').errors).toEqual([
+      "line 3: decant couldn't parse this line (decant can't evaluate $X set by ENV in a --mount; use a literal)",
+    ]);
+    expect(run('ARG X=ok', 'ENV X safe', 'RUN --mount=type=cache,id=$X,target=/c true').errors[0]).toMatch(/set by ENV/);
+    // A quoted (or backslashed) ARG line is not modelled: using it in a --mount or FROM fails.
+    expect(run('ARG T="a,from=evil"', 'RUN --mount=type=bind,target=$T true').errors[0]).toMatch(/\$T \(its ARG line has quotes or backslashes\) in a --mount/);
+    expect(run("ARG T='/c'", 'RUN --mount=type=cache,target=$T true').errors[0]).toMatch(/its ARG line has quotes/);
+    expect(parseDockerfile(['ARG BASE="node"', 'FROM $BASE'].join('\n')).errors[0]).toMatch(/^line 2: FROM \$BASE: decant can't evaluate \$BASE/);
+    // An ENV not used in a mount is fine.
+    expect(run('ENV PATH=/x:$PATH', 'RUN --mount=type=cache,id=npm-$TARGETPLATFORM,target=/c true').errors).toEqual([]);
     expect(run('RUN --mount=type=bind,target=${X:-a,from=evil} true').errors[0]).toMatch(/a variable expands to/);
     // A from= that is literal next to an ARG is still gated, and the line warns.
     const f = run('ARG C=/c', 'RUN --mount=type=bind,from=alpine,target=$C true');

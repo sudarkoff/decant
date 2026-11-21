@@ -1405,19 +1405,33 @@ function parseDockerfile(text) {
     const word = m[1].toUpperCase();
     const rest = m[2];
     if (word === "ARG") {
+      const quoted = /["'\\]/.test(rest) || rest.includes(escape);
+      const names = (tok) => {
+        const eq = tok.indexOf("=");
+        return { n: eq < 0 ? tok : tok.slice(0, eq), v: eq < 0 ? void 0 : unquote(tok.slice(eq + 1)) };
+      };
       if (seenFrom) {
         for (const tok of rest.split(/\s+/).filter(Boolean)) {
-          const eq = tok.indexOf("=");
-          const n = eq < 0 ? tok : tok.slice(0, eq);
-          stageArgs.set(n, { value: eq < 0 ? globals.get(n)?.value : unquote(tok.slice(eq + 1)) });
+          const { n, v } = names(tok);
+          if (quoted) stageArgs.set(n, { value: void 0, opaque: "quoted" });
+          else if (v === void 0 && globals.has(n)) stageArgs.set(n, { ...globals.get(n) });
+          else stageArgs.set(n, { value: v });
         }
         continue;
       }
       for (const tok of rest.split(/\s+/).filter(Boolean)) {
-        const eq = tok.indexOf("=");
-        if (eq < 0) globals.set(tok, { value: void 0 });
-        else globals.set(tok.slice(0, eq), { value: unquote(tok.slice(eq + 1)) });
+        const { n, v } = names(tok);
+        globals.set(n, quoted ? { value: void 0, opaque: "quoted" } : { value: v });
       }
+      continue;
+    }
+    if (word === "ENV") {
+      const named = [...rest.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=/g)].map((m2) => m2[1]);
+      if (!named.length) {
+        const legacy = /^([A-Za-z_][A-Za-z0-9_]*)\b/.exec(rest);
+        if (legacy) named.push(legacy[1]);
+      }
+      for (const n of named) stageArgs.set(n, { value: void 0, opaque: "env" });
       continue;
     }
     const inner = word === "ONBUILD" ? /^(\S+)\s*(.*)$/.exec(rest) ?? [] : [];
@@ -1483,6 +1497,11 @@ function parseDockerfile(text) {
     }
     const raw = toks[0];
     const sub = substitute(raw, globals);
+    const opaque = sub.used.filter((n) => globals.get(n)?.opaque);
+    if (opaque.length) {
+      bad(`decant can't evaluate ${opaque.map((n) => `$${n}`).join(", ")} (its ARG line has quotes or backslashes); use a literal`);
+      continue;
+    }
     if (sub.missing.length) {
       bad(`${sub.missing.map((n) => `ARG ${n}`).join(", ")} has no default; decant cannot tell which image a build would use`);
       continue;
@@ -1515,6 +1534,11 @@ var PLATFORM_ARGS = new Map(
 function expandMount(value, scope) {
   const all = new Map([...[...PLATFORM_ARGS].map(([k, v]) => [k, { value: v }]), ...scope]);
   const sub = substitute(value, all);
+  for (const n of sub.used) {
+    const o = all.get(n)?.opaque;
+    if (o === "env") return { error: `decant can't evaluate $${n} set by ENV in a --mount; use a literal` };
+    if (o === "quoted") return { error: `decant can't evaluate $${n} (its ARG line has quotes or backslashes) in a --mount; use a literal` };
+  }
   if (sub.missing.length) return { error: `--mount uses ${sub.missing.map((n) => `$${n}`).join(", ")} with no value decant can see` };
   for (const n of sub.used) {
     const v = all.get(n)?.value ?? "";

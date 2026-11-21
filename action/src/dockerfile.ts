@@ -69,7 +69,8 @@ export type ParsedDockerfile = {
   argLines?: { line: number; args: string[] }[];
 };
 
-type Arg = { value: string | undefined };
+/** opaque: decant does not model the value (set by ENV, or an ARG line with quotes or backslashes). */
+type Arg = { value: string | undefined; opaque?: 'env' | 'quoted' };
 
 const DIRECTIVE_RE = /^#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
 /** The parser directives BuildKit knows; any other `# key=value` is a comment. */
@@ -295,20 +296,36 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     const word = m[1]!.toUpperCase();
     const rest = m[2]!;
     if (word === 'ARG') {
+      // A line with quotes or backslashes is not split the way BuildKit would: its names become opaque.
+      const quoted = /["'\\]/.test(rest) || rest.includes(escape);
+      const names = (tok: string) => {
+        const eq = tok.indexOf('=');
+        return { n: eq < 0 ? tok : tok.slice(0, eq), v: eq < 0 ? undefined : unquote(tok.slice(eq + 1)) };
+      };
       if (seenFrom) {
         // Stage ARGs: in scope for later instructions in this stage (a redeclared global keeps its default).
         for (const tok of rest.split(/\s+/).filter(Boolean)) {
-          const eq = tok.indexOf('=');
-          const n = eq < 0 ? tok : tok.slice(0, eq);
-          stageArgs.set(n, { value: eq < 0 ? globals.get(n)?.value : unquote(tok.slice(eq + 1)) });
+          const { n, v } = names(tok);
+          if (quoted) stageArgs.set(n, { value: undefined, opaque: 'quoted' });
+          else if (v === undefined && globals.has(n)) stageArgs.set(n, { ...globals.get(n)! });
+          else stageArgs.set(n, { value: v });
         }
         continue; // invisible to FROM
       }
       for (const tok of rest.split(/\s+/).filter(Boolean)) {
-        const eq = tok.indexOf('=');
-        if (eq < 0) globals.set(tok, { value: undefined });
-        else globals.set(tok.slice(0, eq), { value: unquote(tok.slice(eq + 1)) });
+        const { n, v } = names(tok);
+        globals.set(n, quoted ? { value: undefined, opaque: 'quoted' } : { value: v });
       }
+      continue;
+    }
+    if (word === 'ENV') {
+      // ENV overrides ARG in later expansions; decant does not model ENV values, so its names become opaque.
+      const named = [...rest.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=/g)].map((m) => m[1]!);
+      if (!named.length) {
+        const legacy = /^([A-Za-z_][A-Za-z0-9_]*)\b/.exec(rest);
+        if (legacy) named.push(legacy[1]!);
+      }
+      for (const n of named) stageArgs.set(n, { value: undefined, opaque: 'env' });
       continue;
     }
     // COPY --from=<x> and RUN --mount=…,from=<x> (also under ONBUILD) pull <x> unless it is an earlier stage.
@@ -376,6 +393,11 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     }
     const raw = toks[0]!;
     const sub = substitute(raw, globals);
+    const opaque = sub.used.filter((n) => globals.get(n)?.opaque);
+    if (opaque.length) {
+      bad(`decant can't evaluate ${opaque.map((n) => `$${n}`).join(', ')} (its ARG line has quotes or backslashes); use a literal`);
+      continue;
+    }
     if (sub.missing.length) {
       bad(`${sub.missing.map((n) => `ARG ${n}`).join(', ')} has no default; decant cannot tell which image a build would use`);
       continue;
@@ -421,6 +443,11 @@ const PLATFORM_ARGS = new Map(
 function expandMount(value: string, scope: Map<string, Arg>): { text: string; used: string[] } | { error: string } {
   const all = new Map<string, Arg>([...[...PLATFORM_ARGS].map(([k, v]) => [k, { value: v }] as [string, Arg]), ...scope]);
   const sub = substitute(value, all);
+  for (const n of sub.used) {
+    const o = all.get(n)?.opaque;
+    if (o === 'env') return { error: `decant can't evaluate $${n} set by ENV in a --mount; use a literal` };
+    if (o === 'quoted') return { error: `decant can't evaluate $${n} (its ARG line has quotes or backslashes) in a --mount; use a literal` };
+  }
   if (sub.missing.length) return { error: `--mount uses ${sub.missing.map((n) => `$${n}`).join(', ')} with no value decant can see` };
   for (const n of sub.used) {
     const v = all.get(n)?.value ?? '';
