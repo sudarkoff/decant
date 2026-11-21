@@ -237,11 +237,28 @@ function parsePackageId(id) {
   const colon = id.indexOf(":");
   if (colon < 0) return null;
   const eco = id.slice(0, colon);
-  if (eco !== "npm" && eco !== "go") return null;
+  if (eco !== "npm" && eco !== "go" && eco !== "docker") return null;
   const rest = id.slice(colon + 1);
   const at = rest.lastIndexOf("@");
   if (at <= 0 || at === rest.length - 1) return null;
-  return { eco, name: rest.slice(0, at), version: rest.slice(at + 1) };
+  const name = rest.slice(0, at);
+  const version = rest.slice(at + 1);
+  if (eco === "docker" && !(isImageRepo(name) && DIGEST_RE.test(version))) return null;
+  return { eco, name, version };
+}
+var DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+var DOCKER_HUB_ALIASES = /* @__PURE__ */ new Set(["index.docker.io", "registry-1.docker.io", "registry.hub.docker.com"]);
+var HOST_RE = /^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?$/;
+var PATH_RE = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+function isImageRepo(s) {
+  if (s.length > 255) return false;
+  const parts = s.split("/");
+  if (parts.length < 2) return false;
+  const host = parts[0];
+  if (!HOST_RE.test(host) || !(host.includes(".") || host.includes(":") || host === "localhost")) return false;
+  if (DOCKER_HUB_ALIASES.has(host)) return false;
+  if (host === "docker.io" && parts.length !== 3) return false;
+  return parts.slice(1).every((p) => PATH_RE.test(p));
 }
 var PROJECT_ID_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
@@ -272,7 +289,7 @@ function entry(raw, path, withAdded, errors) {
   for (const k of Object.keys(raw)) if (!allowed.has(k)) errors.push(`${path}.${k} is not allowed`);
   const n = errors.length;
   const out = { package: "", reason: "" };
-  if (typeof raw.package !== "string" || parsePackageId(raw.package) === null) errors.push(`${path}.package must be a package ID like npm:name@1.0.0`);
+  if (typeof raw.package !== "string" || parsePackageId(raw.package) === null) errors.push(`${path}.package must be a package ID like npm:name@1.0.0 (images: docker:docker.io/library/node@sha256:<64 hex>)`);
   else out.package = raw.package;
   if (typeof raw.reason !== "string" || raw.reason === "") errors.push(`${path}.reason must be a non-empty string`);
   else out.reason = raw.reason;
@@ -975,8 +992,8 @@ __export(audit_exports, {
   overrideKey: () => overrideKey,
   run: () => run2
 });
-import { createHash, randomUUID as randomUUID2 } from "node:crypto";
-import { dirname, isAbsolute as isAbsolute2, join as join2, relative as relative2, resolve as resolve2 } from "node:path";
+import { createHash as createHash2, randomUUID as randomUUID2 } from "node:crypto";
+import { dirname, isAbsolute as isAbsolute2, join as join3, relative as relative2, resolve as resolve2 } from "node:path";
 
 // src/semver.ts
 var NUM = "(0|[1-9]\\d*)";
@@ -1028,6 +1045,648 @@ function compareVersions(a, b, eco) {
   const pb = parseVersion(b, eco);
   if (!pa || !pb) return pa ? 1 : pb ? -1 : 0;
   return cmpParsed(pa, pb);
+}
+
+// action/src/audit-images.ts
+import { join as join2 } from "node:path";
+
+// src/oci.ts
+var MANIFEST_ACCEPT = [
+  "application/vnd.oci.image.index.v1+json",
+  "application/vnd.docker.distribution.manifest.list.v2+json",
+  "application/vnd.oci.image.manifest.v1+json",
+  "application/vnd.docker.distribution.manifest.v2+json"
+].join(", ");
+var REGISTRIES = {
+  "docker.io": {
+    api: "https://registry-1.docker.io",
+    token: (path) => `https://auth.docker.io/token?${new URLSearchParams({ service: "registry.docker.io", scope: `repository:${path}:pull` })}`
+  },
+  "ghcr.io": {
+    api: "https://ghcr.io",
+    token: (path) => `https://ghcr.io/token?${new URLSearchParams({ service: "ghcr.io", scope: `repository:${path}:pull` })}`
+  }
+};
+var isKnownRegistry = (registry) => Object.hasOwn(REGISTRIES, registry);
+function splitRepo(name) {
+  const i = name.indexOf("/");
+  return { registry: name.slice(0, i), path: name.slice(i + 1) };
+}
+var TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+async function sha256(bytes) {
+  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return `sha256:${[...h].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+function ociClient(o) {
+  const timeoutMs = o.timeoutMs ?? 1e4;
+  const tokens = /* @__PURE__ */ new Map();
+  async function get(url, init = {}) {
+    return o.fetch(url, { ...init, redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
+  }
+  async function token(reg, path) {
+    let t = tokens.get(path);
+    if (!t) {
+      t = (async () => {
+        const res = await get(reg.token(path));
+        if (res.status === 401 || res.status === 403) return "denied";
+        if (!res.ok) throw new Error(`token endpoint HTTP ${res.status}`);
+        const body = await res.json();
+        const v = typeof body.token === "string" ? body.token : typeof body.access_token === "string" ? body.access_token : "";
+        if (!v) throw new Error("token endpoint returned no token");
+        return v;
+      })();
+      tokens.set(path, t);
+      t.catch(() => tokens.delete(path));
+    }
+    return t;
+  }
+  async function manifest(name, reference) {
+    const { registry, path } = splitRepo(name);
+    const reg = REGISTRIES[registry];
+    if (!reg) return { status: "unsupported" };
+    const byDigest = DIGEST_RE.test(reference);
+    if (!byDigest && !TAG_RE.test(reference)) return { status: "error", message: "invalid tag" };
+    try {
+      const t = await token(reg, path);
+      if (t === "denied") return { status: "denied" };
+      const url = `${reg.api}/v2/${path}/manifests/${reference}`;
+      const headers = { accept: MANIFEST_ACCEPT, authorization: `Bearer ${t}` };
+      let res = await get(url, { method: "HEAD", headers });
+      if (res.status === 404) return { status: "not-found" };
+      if (res.status === 401 || res.status === 403) return { status: "denied" };
+      if (!res.ok) return { status: "error", message: `HTTP ${res.status}` };
+      let digest = res.headers.get("docker-content-digest");
+      if (digest === null) {
+        res = await get(url, { headers });
+        if (res.status === 404) return { status: "not-found" };
+        if (!res.ok) return { status: "error", message: `HTTP ${res.status}` };
+        digest = await sha256(await res.arrayBuffer());
+      }
+      if (!DIGEST_RE.test(digest)) return { status: "error", message: "registry returned a malformed digest" };
+      if (byDigest && digest !== reference) return { status: "error", message: "registry returned a different digest" };
+      return { status: "ok", digest };
+    } catch (e) {
+      const err = e;
+      return { status: "error", message: ["TimeoutError", "AbortError"].includes(err?.name) ? "timed out" : String(err?.message ?? e) };
+    }
+  }
+  return {
+    manifest,
+    /** The digest a tag currently resolves to. */
+    resolveTag: (name, tag) => manifest(name, tag),
+    /** Whether the registry serves this digest. */
+    verifyDigest: (name, digest) => manifest(name, digest)
+  };
+}
+
+// action/src/dockerfile.ts
+var TAG_RE2 = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
+function parseImageRef(ref) {
+  if (ref === "" || /\s/.test(ref)) return null;
+  const parts = ref.split("@");
+  if (parts.length > 2) return null;
+  const digest = parts[1];
+  if (digest !== void 0 && !DIGEST_RE.test(digest)) return null;
+  let rest = parts[0];
+  let tag;
+  const colon = rest.lastIndexOf(":");
+  if (colon > rest.lastIndexOf("/")) {
+    tag = rest.slice(colon + 1);
+    rest = rest.slice(0, colon);
+    if (!TAG_RE2.test(tag)) return null;
+  }
+  const comps = rest.split("/");
+  let registry = "docker.io";
+  const first = comps[0];
+  if (comps.length > 1 && (first.includes(".") || first.includes(":") || first === "localhost")) {
+    registry = DOCKER_HUB_ALIASES.has(first) ? "docker.io" : first;
+    comps.shift();
+  } else if (comps.length === 1 && first.includes(".")) {
+    return null;
+  }
+  if (registry === "docker.io" && comps.length === 1) comps.unshift("library");
+  const path = comps.join("/");
+  const name = `${registry}/${path}`;
+  if (!isImageRepo(name)) return null;
+  return { name, registry, path, ...tag !== void 0 ? { tag } : {}, ...digest !== void 0 ? { digest } : {} };
+}
+var DIRECTIVE_RE = /^#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
+var DIRECTIVES = /* @__PURE__ */ new Set(["syntax", "escape", "check"]);
+var HEREDOC_INSTRUCTIONS = /* @__PURE__ */ new Set(["RUN", "COPY", "ADD"]);
+var INSTRUCTIONS = /* @__PURE__ */ new Set([
+  "FROM",
+  "RUN",
+  "CMD",
+  "LABEL",
+  "MAINTAINER",
+  "EXPOSE",
+  "ENV",
+  "ADD",
+  "COPY",
+  "ENTRYPOINT",
+  "VOLUME",
+  "USER",
+  "WORKDIR",
+  "ARG",
+  "ONBUILD",
+  "STOPSIGNAL",
+  "HEALTHCHECK",
+  "SHELL"
+]);
+var STAGE_RE = /^[a-z][a-z0-9_.-]*$/;
+var HEREDOC_WORD = /^(\d*)<<(-?)(["']?)([A-Za-z0-9_.-]+)\3$/;
+function shellWords(s, esc) {
+  const words = [];
+  let cur = "";
+  let inWord = false;
+  let q = null;
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k];
+    if (q === "'") {
+      cur += ch;
+      if (ch === "'") q = null;
+      continue;
+    }
+    if (ch === esc) {
+      cur += ch + (s[k + 1] ?? "");
+      k++;
+      inWord = true;
+      continue;
+    }
+    if (q === '"') {
+      cur += ch;
+      if (ch === '"') q = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      q = ch;
+      cur += ch;
+      inWord = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inWord) words.push(cur);
+      cur = "";
+      inWord = false;
+      continue;
+    }
+    cur += ch;
+    inWord = true;
+  }
+  if (q !== null) return null;
+  if (inWord) words.push(cur);
+  return words;
+}
+function heredocs(ins, esc) {
+  const a = shellWords(ins, "\\");
+  const b = esc === "\\" ? a : shellWords(ins, esc);
+  if (a === null || b === null || a.length !== b.length || a.some((w, k) => w !== b[k])) return "decant couldn't parse this line (heredoc)";
+  const out = [];
+  for (const w of a) {
+    if (!w.includes("<<")) continue;
+    const m = HEREDOC_WORD.exec(w);
+    if (!m) return "decant couldn't parse this line (heredoc)";
+    out.push({ word: m[4], strip: m[2] === "-" });
+  }
+  return out;
+}
+var VAR_RE = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-+])([^}]*))?\}|([A-Za-z_][A-Za-z0-9_]*))/g;
+function unquote(v) {
+  return v.length >= 2 && (v[0] === '"' || v[0] === "'") && v.at(-1) === v[0] ? v.slice(1, -1) : v;
+}
+function substitute(s, args) {
+  const missing = [];
+  const text = s.replace(VAR_RE, (_m, braced, op, word, bare) => {
+    const n = braced ?? bare;
+    const v = args.get(n)?.value;
+    if (op === void 0) {
+      if (v === void 0) {
+        if (!missing.includes(n)) missing.push(n);
+        return "";
+      }
+      return v;
+    }
+    const w = word ?? "";
+    switch (op) {
+      case ":-":
+        return v === void 0 || v === "" ? w : v;
+      case "-":
+        return v === void 0 ? w : v;
+      case ":+":
+        return v !== void 0 && v !== "" ? w : "";
+      default:
+        return v !== void 0 ? w : "";
+    }
+  });
+  return { text, missing };
+}
+function parseDockerfile(text) {
+  const lines = text.replace(/^﻿/, "").split(/\r?\n/);
+  const froms = [];
+  const errors = [];
+  const directives = /* @__PURE__ */ new Map();
+  let i = 0;
+  for (; i < lines.length; i++) {
+    const m = DIRECTIVE_RE.exec(lines[i].trim());
+    if (!m || !DIRECTIVES.has(m[1].toLowerCase())) break;
+    const k = m[1].toLowerCase();
+    if (directives.has(k)) errors.push(`line ${i + 1}: parser directive ${k} is repeated`);
+    else directives.set(k, { value: m[2], line: i + 1 });
+  }
+  let escape = "\\";
+  const esc = directives.get("escape");
+  if (esc) {
+    if (esc.value === "`" || esc.value === "\\") escape = esc.value;
+    else errors.push(`line ${esc.line}: invalid escape directive (BuildKit accepts \\ or \`)`);
+  }
+  const syn = directives.get("syntax");
+  if (syn) {
+    const ref = parseImageRef(syn.value);
+    if (ref) froms.push({ line: syn.line, kind: "image", raw: syn.value, text: syn.value, ref, syntax: true });
+    else {
+      errors.push(`line ${syn.line}: syntax=${syn.value}: not a valid image reference`);
+      froms.push({ line: syn.line, kind: "invalid", raw: syn.value, text: "", syntax: true });
+    }
+  }
+  const instructions = [];
+  let cur = null;
+  for (; i < lines.length; i++) {
+    const physical = lines[i];
+    const t = physical.trim();
+    if (t === "" || t.startsWith("#")) continue;
+    const trimmedEnd = physical.replace(/\s+$/, "");
+    const continued = trimmedEnd.endsWith(escape);
+    const body = continued ? trimmedEnd.slice(0, -1) : trimmedEnd;
+    if (cur === null) cur = { line: i + 1, parts: [] };
+    cur.parts.push(body.trim());
+    if (continued) continue;
+    const ins = { line: cur.line, text: cur.parts.join(" ").trim() };
+    cur = null;
+    const toks = ins.text.split(/\s+/);
+    const word = toks[0].toUpperCase();
+    if (!INSTRUCTIONS.has(word)) {
+      errors.push(`line ${ins.line}: decant couldn't parse this line (${toks[0].slice(0, 40)} is not a Dockerfile instruction)`);
+      continue;
+    }
+    const inner = word === "ONBUILD" ? (toks[1] ?? "").toUpperCase() : "";
+    if (word === "ONBUILD" && (!INSTRUCTIONS.has(inner) || inner === "ONBUILD" || inner === "FROM" || inner === "MAINTAINER")) {
+      errors.push(`line ${ins.line}: decant couldn't parse this line (ONBUILD ${(toks[1] ?? "").slice(0, 40)} is not allowed)`);
+      continue;
+    }
+    instructions.push(ins);
+    if (!ins.text.includes("<<")) continue;
+    if (!HEREDOC_INSTRUCTIONS.has(word) && !HEREDOC_INSTRUCTIONS.has(inner)) continue;
+    const docs = heredocs(ins.text, escape);
+    if (typeof docs === "string") {
+      errors.push(`line ${ins.line}: ${docs}`);
+      return { froms, errors };
+    }
+    for (const d of docs) {
+      let j = i + 1;
+      while (j < lines.length && (d.strip ? lines[j].replace(/^\t+/, "") : lines[j]) !== d.word) j++;
+      if (j >= lines.length) {
+        errors.push(`line ${ins.line}: heredoc <<${d.word} is never terminated`);
+        return { froms, errors };
+      }
+      i = j;
+    }
+  }
+  if (cur !== null) errors.push(`line ${cur.line}: decant couldn't parse this line (the file ends inside a line continuation)`);
+  const firstIns = instructions[0]?.line ?? lines.length + 1;
+  for (let k = 0; k < Math.min(firstIns - 1, lines.length); k++) {
+    if (k + 1 === syn?.line) continue;
+    if (/syntax\s*[=:]|"syntax"/i.test(lines[k])) {
+      errors.push(`line ${k + 1}: ambiguous frontend (syntax) header; use one "# syntax=<image>@sha256:\u2026" directive at the top of the file`);
+    }
+  }
+  const globals = /* @__PURE__ */ new Map();
+  const stages = /* @__PURE__ */ new Set();
+  let seenFrom = false;
+  for (const ins of instructions) {
+    const m = /^(\S+)\s*(.*)$/.exec(ins.text);
+    if (!m) continue;
+    const word = m[1].toUpperCase();
+    const rest = m[2];
+    if (word === "ARG") {
+      if (seenFrom) continue;
+      for (const tok of rest.split(/\s+/).filter(Boolean)) {
+        const eq = tok.indexOf("=");
+        if (eq < 0) globals.set(tok, { value: void 0 });
+        else globals.set(tok.slice(0, eq), { value: unquote(tok.slice(eq + 1)) });
+      }
+      continue;
+    }
+    if (word !== "FROM") continue;
+    seenFrom = true;
+    const bad = (why) => {
+      errors.push(`line ${ins.line}: FROM ${rest}: ${why}`);
+      froms.push({ line: ins.line, kind: "invalid", raw: rest, text: "" });
+    };
+    const toks = rest.split(/\s+/).filter(Boolean);
+    let platform;
+    let flagError = false;
+    while (toks[0]?.startsWith("--")) {
+      const f = toks.shift();
+      if (/^--platform=\S+$/i.test(f)) platform = f.slice("--platform=".length);
+      else flagError = true;
+    }
+    if (flagError) {
+      bad("unsupported FROM flag");
+      continue;
+    }
+    if (toks.length === 0) {
+      bad("no image");
+      continue;
+    }
+    let stage;
+    if (toks.length === 3 && toks[1].toLowerCase() === "as") {
+      stage = toks[2].toLowerCase();
+      if (!STAGE_RE.test(stage)) {
+        bad(`invalid stage name ${toks[2]}`);
+        continue;
+      }
+    } else if (toks.length !== 1) {
+      bad("expected FROM [--platform=\u2026] <image> [AS <name>]");
+      continue;
+    }
+    const raw = toks[0];
+    const sub = substitute(raw, globals);
+    if (sub.missing.length) {
+      bad(`${sub.missing.map((n) => `ARG ${n}`).join(", ")} has no default; decant cannot tell which image a build would use`);
+      continue;
+    }
+    const image = sub.text;
+    const base = { line: ins.line, raw: rest, text: image, ...platform ? { platform } : {}, ...stage ? { stage } : {} };
+    if (image.toLowerCase() === "scratch") froms.push({ ...base, kind: "scratch" });
+    else if (!/[/:@]/.test(image) && stages.has(image.toLowerCase())) froms.push({ ...base, kind: "stage" });
+    else {
+      const ref = parseImageRef(image);
+      if (!ref) {
+        bad("not a valid image reference");
+        if (stage) stages.add(stage);
+        continue;
+      }
+      froms.push({ ...base, kind: "image", ref });
+    }
+    if (stage) stages.add(stage);
+  }
+  const lineOf = (e) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);
+  return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e) };
+}
+var SKIP_DIRS2 = /* @__PURE__ */ new Set(["node_modules", ".git", "vendor", "testdata"]);
+function isDockerfileName(n) {
+  if (n.endsWith(".dockerignore")) return false;
+  return n === "Dockerfile" || n.endsWith(".Dockerfile") && n.length > ".Dockerfile".length || n.startsWith("Dockerfile.") && n.length > "Dockerfile.".length;
+}
+async function findDockerfiles(root, fs) {
+  const files = [];
+  const symlinks = [];
+  const base = root.replace(/\/+$/, "");
+  async function walk(rel) {
+    for (const e of await fs.readdir(rel ? `${base}/${rel}` : base)) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isSymlink) {
+        if (e.isDir && !SKIP_DIRS2.has(e.name) || isDockerfileName(e.name)) symlinks.push(r);
+        continue;
+      }
+      if (e.isDir) {
+        if (!SKIP_DIRS2.has(e.name)) await walk(r);
+      } else if (isDockerfileName(e.name)) files.push(r);
+    }
+  }
+  await walk("");
+  return { files: files.sort(), symlinks: symlinks.sort() };
+}
+
+// action/src/grype.ts
+import { createHash } from "node:crypto";
+var GRYPE_VERSION = "0.121.3";
+var GRYPE_SHA256 = {
+  amd64: "e9da18cc1429e786722e32161288103600efffd8e483c90761f90485bd1bec85",
+  arm64: "b7815598d48da78bfd16f5b98ef28e1bb09c03d34fc8c3e350f99b6ccb3c7cba"
+};
+var DOWNLOAD_TIMEOUT_MS = 12e4;
+var grypeUrl = (arch) => `https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_${arch}.tar.gz`;
+function grypeArch(platform = process.platform, arch = process.arch) {
+  if (platform !== "linux") throw new Error(`Grype runs on Linux runners only (this is ${platform})`);
+  if (arch === "x64") return "amd64";
+  if (arch === "arm64") return "arm64";
+  throw new Error(`no pinned Grype build for ${arch}`);
+}
+function tail(s) {
+  return s.trim().split("\n").slice(-5).join(" ").slice(0, 500);
+}
+async function installGrype(f, exec, fs, dir, arch, expected = GRYPE_SHA256) {
+  const url = grypeUrl(arch);
+  const res = await request(f, url, { redirect: "follow" }, { label: `download Grype ${GRYPE_VERSION}`, timeoutMs: DOWNLOAD_TIMEOUT_MS });
+  if (!res.ok) throw new Error(`download Grype ${GRYPE_VERSION}: HTTP ${res.status}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  const got = createHash("sha256").update(bytes).digest("hex");
+  if (got !== expected[arch]) throw new Error(`Grype ${GRYPE_VERSION} linux_${arch} checksum mismatch: got ${got}, pinned ${expected[arch]}`);
+  await fs.mkdir(dir);
+  const tarball = `${dir}/grype.tar.gz`;
+  await fs.writeBytes(tarball, bytes);
+  const x = await exec("tar", ["-xzf", tarball, "-C", dir, "grype"]);
+  if (x.code !== 0) throw new Error(`extracting Grype failed: ${tail(x.stderr)}`);
+  return { bin: `${dir}/grype` };
+}
+function grypeEnv(cacheDir) {
+  return {
+    GRYPE_DB_CACHE_DIR: cacheDir,
+    GRYPE_DB_AUTO_UPDATE: "true",
+    GRYPE_DB_REQUIRE_UPDATE_CHECK: "true",
+    GRYPE_DB_VALIDATE_AGE: "true",
+    GRYPE_CHECK_FOR_APP_UPDATE: "false"
+  };
+}
+var SEV = { critical: "critical", high: "high", medium: "moderate", low: "low", negligible: "low" };
+var RANK = { critical: 0, high: 1, moderate: 2, unknown: 3, low: 4 };
+var MAX_TEXT = 100;
+var clip = (s) => {
+  const t = s.replace(/\s+/g, " ").trim();
+  return t.length > MAX_TEXT ? `${t.slice(0, MAX_TEXT - 1)}\u2026` : t;
+};
+var isSerious = (f) => f.severity === "critical" || f.severity === "high";
+function parseGrypeJson(stdout) {
+  let doc;
+  try {
+    doc = JSON.parse(stdout);
+  } catch {
+    throw new Error("grype: invalid JSON output");
+  }
+  if (!doc || !Array.isArray(doc.matches)) throw new Error("grype: no matches in output");
+  const seen = /* @__PURE__ */ new Map();
+  for (const m of doc.matches) {
+    const v = m?.vulnerability;
+    const a = m?.artifact;
+    if (!v || typeof v.id !== "string" || v.id.trim() === "") throw new Error("grype: a match has no vulnerability id");
+    const sev = typeof v.severity === "string" ? SEV[v.severity.toLowerCase()] ?? "unknown" : "unknown";
+    const fix = v.fix;
+    const fixed = fix?.state === "fixed" && Array.isArray(fix.versions) ? fix.versions.filter((x) => typeof x === "string" && x.trim() !== "") : [];
+    const name = typeof a?.name === "string" ? a.name : "?";
+    const version = typeof a?.version === "string" ? a.version : "?";
+    const where = typeof a?.purl === "string" && a.purl ? a.purl : JSON.stringify(a?.locations ?? null);
+    const k = JSON.stringify([v.id, name, version, typeof a?.type === "string" ? a.type : "", where]);
+    const prev = seen.get(k);
+    if (!prev) {
+      seen.set(k, { id: v.id, severity: sev, package: name, version, fixed: [...new Set(fixed)] });
+      continue;
+    }
+    if (RANK[sev] < RANK[prev.severity]) prev.severity = sev;
+    prev.fixed = [.../* @__PURE__ */ new Set([...prev.fixed, ...fixed])];
+  }
+  for (const f of seen.values()) {
+    f.id = clip(f.id);
+    f.package = clip(f.package);
+    f.version = clip(f.version);
+    f.fixed = f.fixed.map(clip);
+  }
+  const findings = [...seen.values()].sort((x, y) => RANK[x.severity] - RANK[y.severity] || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+  return { findings, failing: findings.filter((f) => isSerious(f) && f.fixed.length > 0), unfixed: findings.filter((f) => isSerious(f) && f.fixed.length === 0) };
+}
+var PLATFORM_RE = /^linux\/[a-z0-9]+(?:\/v[0-9]+)?$/;
+async function scanImage(exec, bin, name, digest, env, platform) {
+  const args = [`registry:${name}@${digest}`, "-o", "json", "-q"];
+  if (platform && PLATFORM_RE.test(platform)) args.push("--platform", platform);
+  const r = await exec(bin, args, { env });
+  if (r.code !== 0) throw new Error(`grype exited ${r.code}: ${tail(r.stderr)}`);
+  return parseGrypeJson(r.stdout);
+}
+var MAX_DETAILS = 100;
+function grypeVerdict(r) {
+  const serious = r.findings.filter(isSerious).slice(0, MAX_DETAILS);
+  return { result: serious.length ? "flagged" : "clean", details: serious };
+}
+
+// action/src/audit-images.ts
+var IMAGES_REF = "audit-images";
+var safe2 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var short = (d) => d.slice(0, "sha256:".length + 12);
+var SEV_ORDER = ["critical", "high", "moderate", "low"];
+async function auditImages(deps, client, wd, repoPath) {
+  const env = deps.env;
+  const lines = [];
+  const tree = await findDockerfiles(wd, deps.fs);
+  for (const l of tree.symlinks) warning(`${safe2(l)}: symlinked Dockerfile or directory; not audited`);
+  const groups = /* @__PURE__ */ new Map();
+  const texts = /* @__PURE__ */ new Map();
+  const unpinned = [];
+  for (const rel of tree.files) {
+    const text = await deps.fs.readFile(join2(wd, rel));
+    texts.set(rel, text);
+    const p = parseDockerfile(text);
+    if (p.errors.length) lines.push(`- ${safe2(rel)}: ${p.errors.length} line(s) decant cannot read (the PR scan fails on them)`);
+    for (const f of p.froms) {
+      if (f.kind !== "image" || !f.ref) continue;
+      if (!f.ref.digest) {
+        unpinned.push(`${safe2(rel)}:${f.line}`);
+        continue;
+      }
+      const k = `${f.ref.name}|${f.ref.tag ?? ""}|${f.ref.digest}`;
+      const g = groups.get(k) ?? { name: f.ref.name, tag: f.ref.tag ?? "", digest: f.ref.digest, platform: f.platform, uses: [] };
+      g.uses.push({ rel, line: f.line });
+      groups.set(k, g);
+    }
+  }
+  if (unpinned.length) lines.push(`- Not pinned by digest: ${unpinned.slice(0, 10).join(", ")}${unpinned.length > 10 ? ", \u2026" : ""}`);
+  if (!groups.size) return { bumps: [], files: [], lines };
+  let bin = null;
+  const grype = () => bin ??= installGrype(deps.fetch, deps.exec, deps.fs, `${env.RUNNER_TEMP}/decant-grype`, grypeArch(env.DECANT_GRYPE_PLATFORM || process.platform, env.DECANT_GRYPE_ARCH || process.arch)).then((g) => g.bin);
+  const genv = grypeEnv(`${env.RUNNER_TEMP}/decant-grype-db`);
+  const scans = /* @__PURE__ */ new Map();
+  const serious = (name, digest, platform) => {
+    const k = `${name}@${digest}`;
+    let s = scans.get(k);
+    if (!s) {
+      s = (async () => {
+        try {
+          const r = await scanImage(deps.exec, await grype(), name, digest, genv, platform);
+          const v = grypeVerdict(r);
+          await client.putVerdict({ package: formatPackageId({ eco: "docker", name, version: digest }), scanner: "grype", scannerVersion: GRYPE_VERSION, result: v.result, details: v.details });
+          return r.findings.filter(isSerious);
+        } catch (e) {
+          warning(`${safe2(k)}: ${safe2(e.message).slice(0, 200)}`);
+          return null;
+        }
+      })();
+      scans.set(k, s);
+    }
+    return s;
+  };
+  const oci = ociClient({ fetch: deps.fetch });
+  const candidates = [];
+  for (const g of groups.values()) {
+    const label = `\`${safe2(g.name)}${g.tag ? `:${safe2(g.tag)}` : ""}@${short(g.digest)}\``;
+    if (!isKnownRegistry(g.name.slice(0, g.name.indexOf("/")))) {
+      lines.push(`- ${label}: registry not supported; not scanned`);
+      continue;
+    }
+    const now = await serious(g.name, g.digest, g.platform);
+    const state = now === null ? "scan error" : now.length ? `${now.length} High/Critical` : "clean";
+    if (!g.tag) {
+      lines.push(`- ${label}: ${state}; no tag to follow`);
+      continue;
+    }
+    const r = await oci.resolveTag(g.name, g.tag);
+    if (r.status !== "ok") {
+      lines.push(`- ${label}: ${state}; tag lookup failed (${r.status})`);
+      continue;
+    }
+    if (r.digest === g.digest) {
+      lines.push(`- ${label}: ${state}; up to date`);
+      continue;
+    }
+    candidates.push({ g, to: r.digest });
+  }
+  if (!candidates.length) return { bumps: [], files: [], lines };
+  const reply = await client.images(IMAGES_REF, [...new Map(candidates.map((c) => [`${c.g.name}@${c.to}`, { name: c.g.name, digest: c.to }])).values()]);
+  const decision = new Map(reply.images.map((d) => [`${d.name}@${d.digest}`, d]));
+  const bumps = [];
+  const edited = /* @__PURE__ */ new Map();
+  for (const { g, to } of candidates) {
+    const label = `\`${safe2(g.name)}:${safe2(g.tag)}\` ${short(g.digest)} \u2192 ${short(to)}`;
+    const d = decision.get(`${g.name}@${to}`);
+    if (!d || d.decision !== "allow") {
+      const why = !d ? "no decision" : d.decision === "blocked" ? "blocked" : d.eligibleAt ? `cooldown until ${d.eligibleAt.slice(0, 10)}` : "not verified yet";
+      lines.push(`- ${label}: newer digest waiting (${why})`);
+      continue;
+    }
+    const before = await serious(g.name, g.digest, g.platform);
+    const after = await serious(g.name, to, g.platform);
+    if (before === null || after === null) {
+      lines.push(`- ${label}: scan error; not bumped`);
+      continue;
+    }
+    const left = new Set(after.map((f) => f.id));
+    const fixes = [...new Map(before.filter((f) => !left.has(f.id)).map((f) => [f.id, f])).values()];
+    if (!fixes.length) {
+      lines.push(`- ${label}: fixes no High/Critical finding; not bumped`);
+      continue;
+    }
+    const pending = /* @__PURE__ */ new Map();
+    let ok = true;
+    for (const u of g.uses) {
+      const text = pending.get(u.rel) ?? edited.get(u.rel) ?? texts.get(u.rel);
+      const ls = text.split("\n");
+      const at = ls.findIndex((l, i) => i >= u.line - 1 && i < u.line + 9 && l.includes(`@${g.digest}`));
+      if (at < 0) {
+        ok = false;
+        break;
+      }
+      ls[at] = ls[at].replace(`@${g.digest}`, `@${to}`);
+      pending.set(u.rel, ls.join("\n"));
+    }
+    if (!ok) {
+      lines.push(`- ${label}: the digest is not written on its FROM line (an ARG?); not bumped`);
+      continue;
+    }
+    for (const [rel, t] of pending) edited.set(rel, t);
+    const severity = SEV_ORDER.find((s) => fixes.some((f) => f.severity === s)) ?? "high";
+    bumps.push({ name: g.name, tag: g.tag, from: g.digest, to, fixes, severity, files: [...new Set(g.uses.map((u) => repoPath(join2(wd, u.rel))))] });
+    lines.push(`- ${label}: bump fixes ${fixes.map((f) => safe2(f.id)).join(", ")}`);
+  }
+  const files = [...edited].map(([rel, contents]) => ({ path: repoPath(join2(wd, rel)), contents }));
+  return { bumps, files, lines };
 }
 
 // action/src/decant-client.ts
@@ -1119,6 +1778,15 @@ function decant(f, url, token, retry = {}) {
       }
       return { status: res.status, body };
     },
+    /**
+     * Reports image digests for `ref` and returns each one's decision. decant verifies new digests in the
+     * registry itself before starting any cooldown clock. A main report (sync token) replaces the images in
+     * use, so it is not retried on a gateway error (a late retry could overwrite a newer report).
+     */
+    async images(ref, images, opts = {}) {
+      const res = await call("POST", "/api/images", { body: { ref, images }, retryStatuses: !opts.main });
+      return ok(res, "decant POST /api/images");
+    },
     async getVerdicts(pkgId) {
       const res = await call("GET", `/api/verdicts?package=${encodeURIComponent(pkgId)}`);
       return (await ok(res, "decant GET /api/verdicts")).verdicts ?? [];
@@ -1178,9 +1846,9 @@ function decant(f, url, token, retry = {}) {
 
 // src/vuln-severity.ts
 var GHSA_SEVERITY = { CRITICAL: "critical", HIGH: "high", MODERATE: "moderate", MEDIUM: "moderate", LOW: "low" };
-var RANK = { unknown: 0, low: 1, moderate: 2, high: 3, critical: 4 };
+var RANK2 = { unknown: 0, low: 1, moderate: 2, high: 3, critical: 4 };
 function maxSeverity(...s) {
-  return s.reduce((a, b) => RANK[b] > RANK[a] ? b : a, "unknown");
+  return s.reduce((a, b) => RANK2[b] > RANK2[a] ? b : a, "unknown");
 }
 var CVSS_W = {
   AV: { N: 0.85, A: 0.62, L: 0.55, P: 0.2 },
@@ -1226,7 +1894,7 @@ function severityOf(r) {
 
 // action/src/osv.ts
 var OSV = "https://api.osv.dev";
-var OSV_ECO = { npm: "npm", go: "Go" };
+var OSV_ECO = { npm: "npm", go: "Go", docker: "" };
 var BATCH = 1e3;
 var MAX_PAGES2 = 10;
 var DETAIL_CONCURRENCY = 8;
@@ -1431,7 +2099,7 @@ var ISSUE_LABELS = ["decant:security"];
 var SET_MARKER = /<!-- decant-audit-set: ([0-9a-f]{64}) -->/;
 var NPM_NAME = /^(?:@[A-Za-z0-9~][A-Za-z0-9._~-]*\/)?[A-Za-z0-9~][A-Za-z0-9._~-]*$/;
 var GO_MODULE = /^[A-Za-z0-9][A-Za-z0-9._~+/-]*$/;
-var safe2 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var safe3 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
 var cell = (s, n = 200) => s.replace(/\s+/g, " ").replace(/[|<>]/g, " ").slice(0, n);
 var ymd2 = (d) => d.toISOString().slice(0, 10);
 var isPackageLock = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
@@ -1443,11 +2111,11 @@ function line(v, eco) {
 }
 function overrideKey(name, version) {
   const p = parseVersion(version, "npm");
-  if (!p) throw new PkgError("unresolvable", `cannot build an override for ${safe2(name)}@${safe2(version)}`);
+  if (!p) throw new PkgError("unresolvable", `cannot build an override for ${safe3(name)}@${safe3(version)}`);
   return p.major > 0 ? `${name}@^${p.major}` : `${name}@~0.${p.minor}`;
 }
 function auditSetHash(ids) {
-  return createHash("sha256").update([...ids].sort().join("\n")).digest("hex");
+  return createHash2("sha256").update([...ids].sort().join("\n")).digest("hex");
 }
 var markerOf = (body) => SET_MARKER.exec(body)?.[1] ?? null;
 function advisoryUrl(id) {
@@ -1471,6 +2139,7 @@ var uniqSorted = (vs, eco) => [...new Set(vs)].sort((a, b) => compareVersions(a,
 var targetsOf = (p) => uniqSorted(p.copies.map((c) => c.target), p.eco);
 var oldsOf = (p) => uniqSorted(p.copies.map((c) => c.dep.version), p.eco);
 var idsOf = (p) => targetsOf(p).map((t) => formatPackageId({ eco: p.eco, name: p.name, version: t }));
+var imageIds = (bs) => bs.map((b) => formatPackageId({ eco: "docker", name: b.name, version: b.to }));
 function validFix(v, eco, name, version) {
   const f = v.fixedFor(eco, name, version);
   return f !== null && parseVersion(f, eco) !== null ? f : null;
@@ -1506,7 +2175,7 @@ async function run2({ deps, inputs }) {
   if (!env.RUNNER_TEMP) return stop("RUNNER_TEMP is not set; decant audit runs on GitHub Actions runners");
   const repo = env.GITHUB_REPOSITORY ?? "";
   const wd = inputs.workingDirectory;
-  const policyAbs = join2(wd, inputs.policyPath);
+  const policyAbs = join3(wd, inputs.policyPath);
   const root = env.GITHUB_WORKSPACE || (isAbsolute2(wd) ? wd : process.cwd());
   const repoPath = (abs) => relative2(resolve2(root), resolve2(root, abs)).split("\\").join("/");
   const policyRel = repoPath(policyAbs);
@@ -1526,7 +2195,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
   const tree = await findLockfileTree(wd, deps.fs);
   if (tree.symlinks.length) {
     for (const l of tree.symlinks) {
-      const msg = `${join2(wd, l.path)}: ${l.dir ? "symlinked directory" : "lockfile is a symlink"}; not supported`;
+      const msg = `${join3(wd, l.path)}: ${l.dir ? "symlinked directory" : "lockfile is a symlink"}; not supported`;
       error(msg);
       process.stderr.write(`${msg}
 `);
@@ -1535,7 +2204,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
   }
   const all = [];
   for (const rel of tree.files) {
-    const abs = join2(wd, rel);
+    const abs = join3(wd, rel);
     try {
       const text = await deps.fs.readFile(abs);
       all.push(...isPackageLock(rel) ? parsePackageLock(text, rel, inputs.decantUrl) : parseGoSum(text, rel));
@@ -1576,7 +2245,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       const copies = [...g.copies].map(([dep, vs]) => ({ dep, vulns: vs, target: targetFor(vulns, g.eco, g.name, dep.version) }));
       const p = { eco: g.eco, name: g.name, copies, vulns };
       if (!(g.eco === "npm" ? NPM_NAME : GO_MODULE).test(g.name) || g.name.includes("..")) {
-        outcomes.push({ pkg: p, result: "failed", detail: `invalid package name ${safe2(g.name)}` });
+        outcomes.push({ pkg: p, result: "failed", detail: `invalid package name ${safe3(g.name)}` });
       } else pkgs.push(p);
     }
     const client = decant(deps.fetch, inputs.decantUrl, inputs.token, { sleep: deps.sleep });
@@ -1596,8 +2265,18 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       sha: co.sha,
       tmpFile: async (ext) => `${await (tmp ??= deps.fs.mkdtemp(`${env.RUNNER_TEMP}/decant-audit-`))}/${randomUUID2()}.${ext}`
     };
+    let images = { bumps: [], files: [], lines: [] };
+    try {
+      images = await auditImages(deps, client, wd, repoPath);
+    } catch (e) {
+      if (systemic(e)) throw e;
+      const msg = redact(e.message, [inputs.token, inputs.githubToken]);
+      images.lines.push(`- image audit failed: ${cell(msg)}`);
+      warning(`image audit failed: ${msg}`);
+    }
+    const bumps = images.bumps;
     let prLine = "no fixable advisories";
-    if (pkgs.length) {
+    if (pkgs.length || bumps.length) {
       try {
         const lookup = async (what, f) => {
           try {
@@ -1609,19 +2288,19 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
         };
         const open = await lookup("open", () => gh.findOpenPr(FIX_BRANCH));
         const closed = open ? null : await lookup("closed", () => gh.findClosedUnmergedPr(FIX_BRANCH));
-        const declined = (set) => closed !== null && markerOf(closed.body) === auditSetHash(set.flatMap(idsOf));
+        const declined = (set) => closed !== null && markerOf(closed.body) === auditSetHash([...set.flatMap(idsOf), ...imageIds(bumps)]);
         if (declined(pkgs)) {
           prLine = `declined (#${closed.number} closed without merging the same fixes)`;
           for (const p of pkgs) outcomes.push({ pkg: p, result: "declined", detail: `PR #${closed.number}` });
         } else {
-          const batch = await syncOverlay(ctx, pkgs, outcomes);
+          const batch = pkgs.length ? await syncOverlay(ctx, pkgs, outcomes) : [];
           const locked = new Set(all.filter((d) => d.version).map(formatPackageId));
-          const { fixed, files } = await applyAll(ctx, batch, outcomes, locked);
-          if (!fixed.length) prLine = "nothing to ship";
+          const { fixed, files } = batch.length ? await applyAll(ctx, batch, outcomes, locked) : { fixed: [], files: [] };
+          if (!fixed.length && !bumps.length) prLine = "nothing to ship";
           else if (!open && declined(fixed)) prLine = `declined (#${closed.number} closed without merging the same fixes)`;
           else {
-            strayOverlayVersions(ctx, batch, fixed, files, locked);
-            prLine = await publish(ctx, fixed, files, open, outcomes, unfixed);
+            if (batch.length) strayOverlayVersions(ctx, batch, fixed, files, locked);
+            prLine = await publish(ctx, fixed, [...files, ...images.files], open, outcomes, unfixed, bumps);
           }
         }
       } catch (e) {
@@ -1660,10 +2339,11 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       for (const o of outcomes) {
         const detail = o.detail.replace(/\s+/g, " ").replace(/\|/g, "\\|").slice(0, 200);
         lines.push(
-          `| \`${safe2(o.pkg.name)}\` | ${oldsOf(o.pkg).map(safe2).join(", ")} \u2192 ${targetsOf(o.pkg).map(safe2).join(", ")} | ${o.pkg.vulns.map((v) => safe2(v.id)).join(", ")} | ${o.result}${detail ? `: ${detail}` : ""} |`
+          `| \`${safe3(o.pkg.name)}\` | ${oldsOf(o.pkg).map(safe3).join(", ")} \u2192 ${targetsOf(o.pkg).map(safe3).join(", ")} | ${o.pkg.vulns.map((v) => safe3(v.id)).join(", ")} | ${o.result}${detail ? `: ${detail}` : ""} |`
         );
       }
     } else lines.push("No fixable advisories.");
+    if (images.lines.length) lines.push("", "### Base images", "", ...images.lines);
     const count2 = (r) => outcomes.filter((o) => o.result === r).length;
     lines.push(
       "",
@@ -1739,7 +2419,7 @@ async function applyAll(ctx, pkgs, outcomes, locked) {
         if (!orig.has(abs)) orig.set(abs, cur);
         if (!before.has(abs)) before.set(abs, cur);
       };
-      const dirs = [...new Set(p.copies.map((c) => dirname(join2(ctx.wd, c.dep.file))))].sort();
+      const dirs = [...new Set(p.copies.map((c) => dirname(join3(ctx.wd, c.dep.file))))].sort();
       try {
         for (const dir of dirs) {
           if (p.eco === "npm") await fixNpm(ctx, p, dir, track);
@@ -1751,7 +2431,7 @@ async function applyAll(ctx, pkgs, outcomes, locked) {
         for (const d of done) {
           const left = [];
           for (const dir of d.dirs) left.push(...await remaining(ctx, d.p, dir));
-          if (left.length) throw new PkgError("unresolvable", `would regress ${safe2(d.p.name)}: ${left.join("; ")}`);
+          if (left.length) throw new PkgError("unresolvable", `would regress ${safe3(d.p.name)}: ${left.join("; ")}`);
         }
         const ok = /* @__PURE__ */ new Set([...idsOf(p), ...done.flatMap((d) => idsOf(d.p))]);
         for (const abs of before.keys()) {
@@ -1760,7 +2440,7 @@ async function applyAll(ctx, pkgs, outcomes, locked) {
           const rel = ctx.repoPath(abs);
           const deps2 = isPackageLock(rel) ? parsePackageLock(text, rel, ctx.inputs.decantUrl) : rel === "go.sum" || rel.endsWith("/go.sum") ? parseGoSum(text, rel) : [];
           const stray = deps2.map((d) => formatPackageId(d)).find((id) => overlayOnly.has(id) && !ok.has(id));
-          if (stray) throw new PkgError("unresolvable", `pulls in overlay-only ${safe2(stray)}`);
+          if (stray) throw new PkgError("unresolvable", `pulls in overlay-only ${safe3(stray)}`);
         }
         const o = { pkg: p, result: "fixed", detail: "" };
         outcomes.push(o);
@@ -1770,7 +2450,7 @@ async function applyAll(ctx, pkgs, outcomes, locked) {
         for (const [abs, b] of before) await put(abs, b);
         const msg = redact(e.message, [inputs.token, inputs.githubToken]);
         const result = e instanceof PkgError ? e.result : "failed";
-        if (result === "failed") warning(`${safe2(p.name)}: ${msg}`);
+        if (result === "failed") warning(`${safe3(p.name)}: ${msg}`);
         outcomes.push({ pkg: p, result, detail: msg });
       }
     }
@@ -1790,18 +2470,18 @@ function strayOverlayVersions(ctx, overlay, fixed, files, locked) {
   const hits = /* @__PURE__ */ new Set();
   for (const f of files) {
     const deps = isPackageLock(f.path) ? parsePackageLock(f.contents, f.path, ctx.inputs.decantUrl) : /(^|\/)go\.sum$/.test(f.path) ? parseGoSum(f.contents, f.path) : [];
-    for (const d of deps) if (d.version && stray.has(formatPackageId(d))) hits.add(`${safe2(formatPackageId(d))} in ${safe2(f.path)}`);
+    for (const d of deps) if (d.version && stray.has(formatPackageId(d))) hits.add(`${safe3(formatPackageId(d))} in ${safe3(f.path)}`);
   }
   if (hits.size) throw new FatalError(`lockfiles would contain overlay-only versions with no allow entry in this PR: ${[...hits].sort().join(", ")}`);
 }
 async function remaining(ctx, p, dir) {
   if (p.eco === "npm") {
     const left2 = await stale(ctx, `${dir}/package-lock.json`, p);
-    return left2.length ? [`${ctx.repoPath(`${dir}/package-lock.json`)} still locks ${uniqSorted(left2.map((c) => c.dep.version), "npm").map(safe2).join(", ")}`] : [];
+    return left2.length ? [`${ctx.repoPath(`${dir}/package-lock.json`)} still locks ${uniqSorted(left2.map((c) => c.dep.version), "npm").map(safe3).join(", ")}`] : [];
   }
   const sumAbs = `${dir}/go.sum`;
   const left = parseGoSum(await ctx.deps.fs.readFile(sumAbs), sumAbs).filter((d) => d.name === p.name && stillVulnerable(p, d.version));
-  return left.length ? [`${ctx.repoPath(sumAbs)} still has ${left.map((d) => safe2(d.version)).join(", ")}`] : [];
+  return left.length ? [`${ctx.repoPath(sumAbs)} still has ${left.map((d) => safe3(d.version)).join(", ")}`] : [];
 }
 async function reusable(ctx, open, files, hash) {
   const { gh } = ctx;
@@ -1814,9 +2494,9 @@ async function reusable(ctx, open, files, hash) {
   for (const f of files) if (await gh.fileAt(f.path, open.headSha) !== f.contents) return false;
   return true;
 }
-async function publish(ctx, fixed, changed, open, outcomes, unfixed) {
+async function publish(ctx, fixed, changed, open, outcomes, unfixed, bumps = []) {
   const { gh } = ctx;
-  const ids = fixed.flatMap(idsOf);
+  const ids = [...fixed.flatMap(idsOf), ...imageIds(bumps)];
   const hash = auditSetHash(ids);
   const added = fixed.flatMap((p) => allowEntries(ctx, p));
   const files = [...changed];
@@ -1828,13 +2508,16 @@ async function publish(ctx, fixed, changed, open, outcomes, unfixed) {
 ` });
   }
   const vulns = [...new Map(fixed.flatMap((p) => p.vulns).map((v) => [v.id, v])).values()];
-  const title = `decant: security fixes (${plural(fixed.length, "package", "packages")}, ${plural(vulns.length, "advisory", "advisories")})`;
-  const sev = maxSev(vulns.map(sevOf));
+  const imageVulns = new Set(bumps.flatMap((b) => b.fixes.map((f) => f.id)).filter((id) => !vulns.some((v) => v.id === id || v.aliases.includes(id))));
+  const scope = [fixed.length ? plural(fixed.length, "package", "packages") : "", bumps.length ? plural(bumps.length, "image", "images") : ""].filter(Boolean).join(", ");
+  const title = `decant: security fixes (${scope}, ${plural(vulns.length + imageVulns.size, "advisory", "advisories")})`;
+  const sevs = [...vulns.map(sevOf), ...bumps.map((b) => b.severity)];
+  const sev = maxSev(sevs);
   const majors = fixed.filter((p) => p.copies.some((c) => line(c.dep.version, p.eco) !== line(c.target, p.eco)));
-  const approve = SEVERITIES.filter((s) => vulns.some((v) => sevOf(v) === s) && ctx.policy.autoShip[s] !== "auto");
+  const approve = SEVERITIES.filter((s) => sevs.includes(s) && ctx.policy.autoShip[s] !== "auto");
   const auto = !majors.length && !approve.length;
   const left = outcomes.filter((o) => o.result !== "fixed" && o.result !== "declined");
-  const body = prBody2({ fixed, added, left, unfixed, auto, majors, approve, cooldownDays: ctx.policy.cooldownDays, paths: files.map((f) => f.path), hash });
+  const body = prBody2({ fixed, added, left, unfixed, auto, majors, approve, cooldownDays: ctx.policy.cooldownDays, paths: files.map((f) => f.path), hash, bumps });
   const labels = ["decant:security", `decant:${sev}`];
   let pr;
   let what;
@@ -1884,35 +2567,52 @@ async function publish(ctx, fixed, changed, open, outcomes, unfixed) {
   return what;
 }
 function prBody2(b) {
-  const link = (v) => `[${safe2(v.id)}](${advisoryUrl(v.id)})`;
-  const out = [
-    `Security fixes from decant audit: ${plural(b.fixed.length, "package", "packages")} upgraded to versions that fix their advisories.`,
-    "",
-    "| Package | From \u2192 To | Advisories | Severity |",
-    "|---|---|---|---|",
-    ...b.fixed.map(
-      (p) => `| \`${safe2(p.name)}\` | ${oldsOf(p).map(safe2).join(", ")} \u2192 ${targetsOf(p).map(safe2).join(", ")} | ${p.vulns.map(link).join(", ")} | ${maxSev(p.vulns.map(sevOf))} |`
-    ),
-    ""
-  ];
+  const link = (v) => `[${safe3(v.id)}](${advisoryUrl(v.id)})`;
+  const idLink = (id) => `[${safe3(id)}](${advisoryUrl(id)})`;
+  const out = [];
+  if (b.fixed.length) {
+    out.push(
+      `Security fixes from decant audit: ${plural(b.fixed.length, "package", "packages")} upgraded to versions that fix their advisories.`,
+      "",
+      "| Package | From \u2192 To | Advisories | Severity |",
+      "|---|---|---|---|",
+      ...b.fixed.map(
+        (p) => `| \`${safe3(p.name)}\` | ${oldsOf(p).map(safe3).join(", ")} \u2192 ${targetsOf(p).map(safe3).join(", ")} | ${p.vulns.map(link).join(", ")} | ${maxSev(p.vulns.map(sevOf))} |`
+      ),
+      ""
+    );
+  }
+  if (b.bumps.length) {
+    const short2 = (d) => d.slice(0, "sha256:".length + 12);
+    out.push(
+      `Base image digest bumps: ${plural(b.bumps.length, "image", "images")} moved to the digest its tag points at now. Each new digest has cleared the ${b.cooldownDays}-day cooldown (counted from when decant first verified it) and removes the High/Critical findings listed.`,
+      "",
+      "| Image | From \u2192 To | Fixes | Severity |",
+      "|---|---|---|---|",
+      ...b.bumps.map(
+        (x) => `| \`${safe3(x.name)}:${safe3(x.tag)}\` | ${short2(x.from)} \u2192 ${short2(x.to)} | ${x.fixes.slice(0, 10).map((f) => idLink(f.id)).join(", ")}${x.fixes.length > 10 ? ", \u2026" : ""} | ${x.severity} |`
+      ),
+      ""
+    );
+  }
   const summaries = b.fixed.flatMap((p) => p.vulns.filter((v) => v.summary).map((v) => `- ${link(v)}: ${cell(v.summary, 200)}`));
   if (summaries.length) out.push("<details><summary>Advisory summaries</summary>", "", ...[...new Set(summaries)], "", "</details>", "");
   if (b.left.length) {
     out.push("**Not included** (see the `decant: unfixed advisories` issue):");
     const label = { fixed: "fixed", declined: "declined", unverified: "not verified", unresolvable: "unresolvable", failed: "failed" };
-    for (const o of b.left) out.push(`- \`${safe2(o.pkg.name)}\` ${oldsOf(o.pkg).map(safe2).join(", ")}: ${label[o.result]}: ${cell(o.detail)}`);
+    for (const o of b.left) out.push(`- \`${safe3(o.pkg.name)}\` ${oldsOf(o.pkg).map(safe3).join(", ")}: ${label[o.result]}: ${cell(o.detail)}`);
     out.push("");
   }
   if (b.unfixed.length) {
     const rows = [...new Map(b.unfixed.map((u) => [`${u.vuln.id}|${depKey(u.dep)}`, u])).values()];
     out.push("**No fixed release yet** (tracked in the `decant: unfixed advisories` issue):");
-    for (const u of rows.slice(0, 30)) out.push(`- ${link(u.vuln)} \`${safe2(u.dep.name)}@${safe2(u.dep.version)}\``);
+    for (const u of rows.slice(0, 30)) out.push(`- ${link(u.vuln)} \`${safe3(u.dep.name)}@${safe3(u.dep.version)}\``);
     if (rows.length > 30) out.push(`- \u2026and ${rows.length - 30} more`);
     out.push("");
   }
   if (b.added.length) {
     out.push(
-      `**Cooldown skip:** this PR adds \`allow\` entries for ${b.added.map((a) => `\`${safe2(a.package)}\``).join(", ")}, each citing its advisory, so the fixed versions ship without waiting out the ${b.cooldownDays}-day cooldown. decant honors each only while OSV lists that version as fixed; none is exempt from the scan.`,
+      `**Cooldown skip:** this PR adds \`allow\` entries for ${b.added.map((a) => `\`${safe3(a.package)}\``).join(", ")}, each citing its advisory, so the fixed versions ship without waiting out the ${b.cooldownDays}-day cooldown. decant honors each only while OSV lists that version as fixed; none is exempt from the scan.`,
       ""
     );
   }
@@ -1921,7 +2621,7 @@ function prBody2(b) {
   else {
     out.push("Auto-merge is off; review and merge.");
     if (b.majors.length) {
-      out.push(`- **major upgrade: auto-merge disabled.** ${b.majors.map((p) => `\`${safe2(p.name)}\``).join(", ")} crosses a major (or 0.x minor) version line.`);
+      out.push(`- **major upgrade: auto-merge disabled.** ${b.majors.map((p) => `\`${safe3(p.name)}\``).join(", ")} crosses a major (or 0.x minor) version line.`);
     }
     for (const s of b.approve) out.push(`- autoShip.${s} is \`approve\`.`);
   }
@@ -2009,7 +2709,7 @@ async function fixGo(ctx, p, dir, track) {
   const { deps, inputs } = ctx;
   await track(`${dir}/go.mod`);
   await track(`${dir}/go.sum`);
-  const here = p.copies.filter((c) => dirname(join2(ctx.wd, c.dep.file)) === dir).map((c) => c.target);
+  const here = p.copies.filter((c) => dirname(join3(ctx.wd, c.dep.file)) === dir).map((c) => c.target);
   const target2 = uniqSorted(here.length ? here : targetsOf(p), "go").at(-1);
   const base = inputs.decantUrl.replace(/\/+$/, "");
   const netrc = await ctx.tmpFile("netrc");
@@ -2049,7 +2749,7 @@ function unfixedBody(items) {
     "",
     "| Advisory | Severity | Package | Lockfile | Reason |",
     "|---|---|---|---|---|",
-    ...rows.map((i) => `| [${safe2(i.vuln.id)}](${advisoryUrl(i.vuln.id)}) | ${i.vuln.malicious ? "malicious" : i.vuln.severity} | \`${safe2(i.dep.name)}@${safe2(i.dep.version)}\` | ${safe2(i.dep.file)} | ${i.reason} |`)
+    ...rows.map((i) => `| [${safe3(i.vuln.id)}](${advisoryUrl(i.vuln.id)}) | ${i.vuln.malicious ? "malicious" : i.vuln.severity} | \`${safe3(i.dep.name)}@${safe3(i.dep.version)}\` | ${safe3(i.dep.file)} | ${i.reason} |`)
   ].join("\n");
 }
 function blockedBody(hits) {
@@ -2058,7 +2758,7 @@ function blockedBody(hits) {
     "",
     "| Package | Source | Reason | Lockfiles |",
     "|---|---|---|---|",
-    ...hits.map((h) => `| \`${safe2(h.package)}\` | ${safe2(h.source)} | ${h.reason.replace(/[|\n<>]/g, " ").slice(0, 200)} | ${h.files.map(safe2).join(", ")} |`)
+    ...hits.map((h) => `| \`${safe3(h.package)}\` | ${safe3(h.source)} | ${h.reason.replace(/[|\n<>]/g, " ").slice(0, 200)} | ${h.files.map(safe3).join(", ")} |`)
   ].join("\n");
 }
 async function pruneAllow(ctx, now) {
@@ -2073,7 +2773,7 @@ async function pruneAllow(ctx, now) {
     try {
       at = p.eco === "npm" ? await npmPublishTime(deps.fetch, p.name, p.version) : await goPublishTime(deps.fetch, p.name, p.version);
     } catch (err) {
-      warning(`prune: ${safe2(e.package)}: ${err.message}`);
+      warning(`prune: ${safe3(e.package)}: ${err.message}`);
     }
     if (!at) {
       unknown++;
@@ -2092,7 +2792,7 @@ async function pruneAllow(ctx, now) {
     "",
     "| package | reason | published |",
     "| --- | --- | --- |",
-    ...expired.map((x) => `| ${safe2(x.e.package)} | ${x.e.reason.replace(/[|\n<>]/g, " ").slice(0, 100)} | ${ymd2(x.at)} |`)
+    ...expired.map((x) => `| ${safe3(x.e.package)} | ${x.e.reason.replace(/[|\n<>]/g, " ").slice(0, 100)} | ${ymd2(x.at)} |`)
   ].join("\n");
   const title = "decant: prune allow entries";
   const open = await gh.findOpenPr(PRUNE_BRANCH);
@@ -2126,8 +2826,182 @@ __export(scan_exports, {
   MARKER: () => MARKER,
   run: () => run3
 });
-import { join as join3 } from "node:path";
+import { join as join5 } from "node:path";
+import { tmpdir as tmpdir2 } from "node:os";
+
+// action/src/docker-gate.ts
+import { join as join4 } from "node:path";
 import { tmpdir } from "node:os";
+
+// action/src/git.ts
+var SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+async function fileAtCommit(deps, wd, sha, rel) {
+  const r = await deps.exec("git", ["show", `${sha}:./${rel}`], { cwd: wd });
+  if (r.code === 0) return r.stdout;
+  if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null;
+  throw new Error(
+    `git show ${sha.slice(0, 12)}:${rel} failed: ${r.stderr.trim().slice(0, 300)} (actions/checkout needs fetch-depth: 0)`
+  );
+}
+
+// action/src/docker-gate.ts
+var safe4 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var safeLine = (s) => s.replace(/[^A-Za-z0-9@._~/+:= #=$-]/g, "?");
+var safeText = (s) => s.replace(/\s+/g, " ").replace(/[^A-Za-z0-9._~/+:,;=!?#%&*()'"{}$^@ -]/g, "?");
+var MAX_IMAGES = 200;
+var MAX_LISTED = 5;
+var fmtTime = (iso) => `${iso.slice(0, 16).replace("T", " ")} UTC`;
+function findingList(fs) {
+  const shown = fs.slice(0, MAX_LISTED).map((f) => `${safe4(f.id)} (${safe4(f.package)} ${safe4(f.version)}${f.fixed.length ? ` \u2192 ${safe4(f.fixed[0])}` : ""})`);
+  return `${shown.join(", ")}${fs.length > MAX_LISTED ? `, +${fs.length - MAX_LISTED} more` : ""}`;
+}
+function pinned(f, digest) {
+  const base = f.text.replace(/@sha256:[0-9a-f]*$/, "");
+  return f.syntax ? `# syntax=${base}@${digest}` : `FROM ${f.platform ? `--platform=${f.platform} ` : ""}${base}@${digest}`;
+}
+async function changedDockerfiles(deps, wd, baseSha) {
+  const tree = await findDockerfiles(wd, deps.fs);
+  const changed = [];
+  const unchanged = [];
+  for (const rel of tree.files) {
+    if (await fileAtCommit(deps, wd, baseSha, rel) !== await deps.fs.readFile(join4(wd, rel))) changed.push(rel);
+    else unchanged.push(rel);
+  }
+  return { changed, unchanged, symlinks: tree.symlinks };
+}
+async function dockerGate(o) {
+  const { deps, wd, baseSha, ref, client } = o;
+  const env = deps.env;
+  const rows = [];
+  const files = await changedDockerfiles(deps, wd, baseSha);
+  if (files.symlinks.length) return { rows, fatal: `symlinked Dockerfile or directory (${files.symlinks.map(safe4).join(", ")}); decant does not scan through symlinks` };
+  if (!files.changed.length) return { rows, fatal: null };
+  const atBase = /* @__PURE__ */ new Set();
+  const addBase = (text) => {
+    if (text === null) return;
+    for (const f of parseDockerfile(text).froms) if (f.kind === "image" && f.ref?.digest) atBase.add(`${f.ref.name}@${f.ref.digest}`);
+  };
+  for (const rel of files.unchanged) addBase(await deps.fs.readFile(join4(wd, rel)));
+  for (const rel of files.changed) addBase(await fileAtCommit(deps, wd, baseSha, rel));
+  const oci = ociClient({ fetch: deps.fetch });
+  const candidates = /* @__PURE__ */ new Map();
+  for (const rel of files.changed) {
+    const parsed = parseDockerfile(await deps.fs.readFile(join4(wd, rel)));
+    for (const e of parsed.errors) {
+      rows.push({ file: rel, line: Number(/^line (\d+)/.exec(e)?.[1] ?? 0), image: "\u2014", cooldown: "\u2014", grype: "\u2014", problems: ["cannot read this line (see log)"], notes: [] });
+      error(safeText(e.replace(/^line (\d+): /, `${rel}:$1: `)), join4(wd, rel));
+    }
+    for (const f of parsed.froms) {
+      if (f.kind !== "image" || !f.ref) continue;
+      const r = f.ref;
+      if (r.digest) {
+        const k = `${r.name}@${r.digest}`;
+        if (atBase.has(k)) continue;
+        const c = candidates.get(k) ?? { name: r.name, digest: r.digest, platform: f.platform, uses: [] };
+        c.uses.push({ file: rel, line: f.line });
+        candidates.set(k, c);
+        continue;
+      }
+      const res = await oci.resolveTag(r.name, r.tag ?? "latest");
+      const fix = res.status === "ok" ? `pin it: \`${safeLine(pinned(f, res.digest))}\`` : res.status === "unsupported" ? `can't resolve: registry ${safe4(r.registry)} is not supported; pin the digest you build from` : res.status === "denied" ? "can't resolve: anonymous pull refused (private image?); pin the digest you build from" : `can't resolve the tag (${res.status === "not-found" ? "not found" : safeText(res.message)})`;
+      const what = f.syntax ? "syntax frontend image is not pinned by digest" : "not pinned by digest";
+      rows.push({ file: rel, line: f.line, image: safe4(f.text), cooldown: "\u2014", grype: "\u2014", problems: [`${what}; ${fix}`], notes: [] });
+      error(`${safe4(rel)}:${f.line}: ${safe4(f.text)} is ${what}; ${fix.replace(/`/g, "")}`, join4(wd, rel));
+    }
+  }
+  if (candidates.size > MAX_IMAGES) return { rows, fatal: `too many new image digests (${candidates.size}); split the change` };
+  if (!candidates.size) return { rows, fatal: null };
+  const list = [...candidates.values()];
+  const reply = await client.images(ref, list.map((c) => ({ name: c.name, digest: c.digest })));
+  const decisions = new Map(reply.images.map((d) => [`${d.name}@${d.digest}`, d]));
+  let installed = null;
+  const grype = () => installed ??= installGrype(deps.fetch, deps.exec, deps.fs, `${env.RUNNER_TEMP || tmpdir()}/decant-grype`, grypeArch(env.DECANT_GRYPE_PLATFORM || process.platform, env.DECANT_GRYPE_ARCH || process.arch)).then((g) => g.bin);
+  const grypeEnvs = grypeEnv(`${env.RUNNER_TEMP || tmpdir()}/decant-grype-db`);
+  for (const c of list) {
+    const id = formatPackageId({ eco: "docker", name: c.name, version: c.digest });
+    const use = c.uses[0];
+    const row = { file: use.file, line: use.line, image: safe4(`${c.name}@${c.digest}`), cooldown: "\u2014", grype: "\u2014", problems: [], notes: [] };
+    rows.push(row);
+    if (c.uses.length > 1) row.notes.push(`also ${c.uses.slice(1).map((u) => `${safe4(u.file)}:${u.line}`).join(", ")}`);
+    const d = decisions.get(`${c.name}@${c.digest}`);
+    if (!d) {
+      row.problems.push("decant returned no decision");
+      continue;
+    }
+    if (d.decision === "blocked") {
+      row.cooldown = "blocked";
+      row.problems.push(`blocked by decant (${d.blocks.map((b) => `${safe4(b.source)}: ${b.reason.replace(/[|\n<>`]/g, " ").slice(0, 100)}`).join("; ")})`);
+      continue;
+    }
+    if (d.decision === "allow") row.cooldown = d.allowed ? "allowed by policy" : `cleared (first seen ${fmtTime(d.firstSeen)})`;
+    else if (d.clock === "unverified") {
+      row.cooldown = "not verified";
+      row.problems.push(`decant could not verify this digest in the registry (${safeText(d.note ?? "unknown")}); it stays in cooldown until it can`);
+    } else {
+      row.cooldown = `until ${fmtTime(d.eligibleAt)}`;
+      row.problems.push(`waiting for cooldown until ${fmtTime(d.eligibleAt)} (first seen by decant ${fmtTime(d.firstSeen)}${d.clock === "project" ? ", this project only" : ""})`);
+    }
+    const cached = await client.getVerdicts(id);
+    if (cached.some((v) => v.result === "malicious")) row.problems.push(`malicious (${cached.filter((v) => v.result === "malicious").map((v) => safe4(v.scanner)).join(", ")})`);
+    const registry = c.name.slice(0, c.name.indexOf("/"));
+    if (!isKnownRegistry(registry)) {
+      row.grype = "not scanned";
+      if (d.allowed) row.notes.push(`registry ${safe4(registry)} is not scannable; accepted by an allow entry`);
+      else row.problems.push(`not scannable: decant scans Docker Hub and ghcr.io images only; add an allow entry for ${safe4(id)} to accept it`);
+      continue;
+    }
+    try {
+      const res = await scanImage(deps.exec, await grype(), c.name, c.digest, grypeEnvs, c.platform);
+      const v = grypeVerdict(res);
+      await client.putVerdict({ package: id, scanner: "grype", scannerVersion: GRYPE_VERSION, result: v.result, details: v.details });
+      row.grype = res.failing.length ? `${res.failing.length} fixable High/Critical` : res.unfixed.length ? `${res.unfixed.length} High/Critical, no fix` : "clean";
+      if (res.failing.length) row.problems.push(`vulnerable: ${findingList(res.failing)}`);
+      if (res.unfixed.length) {
+        row.notes.push(`no fix yet: ${findingList(res.unfixed)}`);
+        warning(`${row.image}: ${res.unfixed.length} High/Critical finding(s) with no fix yet`);
+      }
+    } catch (e) {
+      row.grype = "scan error";
+      row.problems.push("scan error (see log)");
+      error(`${row.image}: ${safeText(e.message).slice(0, 300)}`);
+    }
+  }
+  return { rows, fatal: null };
+}
+function renderImages(rows, limit = Infinity) {
+  if (!rows.length) return [];
+  const out = ["", "### Base images", "", "| Image | Dockerfile | Cooldown | Grype | Status |", "|---|---|---|---|---|"];
+  let size2 = out.join("\n").length;
+  for (const [i, r] of rows.entries()) {
+    const status = r.problems.length ? `\u274C ${r.problems.join("; ")}` : `\u2705 ${r.notes.length ? r.notes.join("; ") : "ok"}`;
+    const line2 = `| ${r.image === "\u2014" ? "\u2014" : `\`${r.image}\``} | ${safe4(r.file)}:${r.line} | ${r.cooldown} | ${r.grype} | ${status.replace(/\|/g, "\\|")} |`;
+    if (size2 + line2.length + 1 > limit) {
+      out.push(`
+\u2026 and ${rows.length - i} more image row(s) (see the job summary).`);
+      break;
+    }
+    out.push(line2);
+    size2 += line2.length + 1;
+  }
+  return out;
+}
+var OTHER_IMAGE_FILES = /^(?:(?:docker-)?compose(?:\.[\w-]+)?\.ya?ml|fly\.toml)$/;
+async function otherImageFiles(deps, wd) {
+  const out = [];
+  const base = wd.replace(/\/+$/, "");
+  const skip = /* @__PURE__ */ new Set(["node_modules", ".git", "vendor", "testdata"]);
+  async function walk(rel) {
+    for (const e of await deps.fs.readdir(rel ? `${base}/${rel}` : base)) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isSymlink) continue;
+      if (e.isDir) {
+        if (!skip.has(e.name)) await walk(r);
+      } else if (OTHER_IMAGE_FILES.test(e.name)) out.push(r);
+    }
+  }
+  await walk("");
+  return out.sort();
+}
 
 // action/src/event.ts
 async function readPayload(deps) {
@@ -2144,17 +3018,6 @@ function isForkPr(payload) {
   return !head || head.full_name !== payload.repository?.full_name;
 }
 
-// action/src/git.ts
-var SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
-async function fileAtCommit(deps, wd, sha, rel) {
-  const r = await deps.exec("git", ["show", `${sha}:./${rel}`], { cwd: wd });
-  if (r.code === 0) return r.stdout;
-  if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null;
-  throw new Error(
-    `git show ${sha.slice(0, 12)}:${rel} failed: ${r.stderr.trim().slice(0, 300)} (actions/checkout needs fetch-depth: 0)`
-  );
-}
-
 // action/src/guarddog.ts
 import { fileURLToPath } from "node:url";
 var GUARDDOG_VERSION = "3.2.0";
@@ -2162,15 +3025,15 @@ var MAX_LOCATIONS = 5;
 var MAX_MESSAGE = 200;
 var MAX_RULE = 100;
 var MAX_LOCATION = 200;
-function clip(s, n) {
+function clip2(s, n) {
   const t = s.replace(/\s+/g, " ").trim();
   return t.length > n ? `${t.slice(0, n - 1)}\u2026` : t;
 }
 function finding(rule, count2, message, locations) {
-  const f = { rule: clip(rule, MAX_RULE) };
+  const f = { rule: clip2(rule, MAX_RULE) };
   if (count2 !== void 0) f.count = count2;
-  if (typeof message === "string" && message.trim()) f.message = clip(message, MAX_MESSAGE);
-  const locs = [...new Set(locations.filter((l) => typeof l === "string" && l.trim() !== "").map((l) => clip(l, MAX_LOCATION)))];
+  if (typeof message === "string" && message.trim()) f.message = clip2(message, MAX_MESSAGE);
+  const locs = [...new Set(locations.filter((l) => typeof l === "string" && l.trim() !== "").map((l) => clip2(l, MAX_LOCATION)))];
   if (locs.length) f.locations = locs.slice(0, MAX_LOCATIONS);
   return f;
 }
@@ -2178,7 +3041,7 @@ function normalizeFindings(details) {
   if (!Array.isArray(details)) return [];
   const out = [];
   for (const d of details) {
-    if (typeof d === "string" && d.trim()) out.push({ rule: clip(d, MAX_RULE) });
+    if (typeof d === "string" && d.trim()) out.push({ rule: clip2(d, MAX_RULE) });
     else if (d && typeof d === "object" && typeof d.rule === "string") {
       const o = d;
       const count2 = typeof o.count === "number" && Number.isInteger(o.count) && o.count >= 0 ? o.count : void 0;
@@ -2187,7 +3050,7 @@ function normalizeFindings(details) {
   }
   return out;
 }
-function tail(s) {
+function tail2(s) {
   return s.trim().split("\n").slice(-5).join(" ").slice(0, 500);
 }
 function actionDir(override, moduleUrl = import.meta.url) {
@@ -2212,7 +3075,7 @@ async function installGuardDog(exec, readFile2, dir, actionPath, env) {
   const supported = supportedPythons(await readFile2(req));
   const python = pythonInterpreter(env);
   const ver = await exec(python, ["-c", 'import sys; print("%d.%d" % sys.version_info[:2])']);
-  if (ver.code !== 0) throw new Error(`${python} failed to run: ${tail(ver.stderr)}`);
+  if (ver.code !== 0) throw new Error(`${python} failed to run: ${tail2(ver.stderr)}`);
   const found = ver.stdout.trim();
   if (!supported.includes(found)) {
     throw new Error(
@@ -2220,7 +3083,7 @@ async function installGuardDog(exec, readFile2, dir, actionPath, env) {
     );
   }
   const venv = await exec(python, ["-m", "venv", dir]);
-  if (venv.code !== 0) throw new Error(`${python} -m venv failed: ${tail(venv.stderr)}`);
+  if (venv.code !== 0) throw new Error(`${python} -m venv failed: ${tail2(venv.stderr)}`);
   const pip = await exec(`${dir}/bin/pip`, [
     "install",
     "--disable-pip-version-check",
@@ -2231,7 +3094,7 @@ async function installGuardDog(exec, readFile2, dir, actionPath, env) {
     "-r",
     req
   ]);
-  if (pip.code !== 0) throw new Error(`pip install of GuardDog failed: ${tail(pip.stderr)}`);
+  if (pip.code !== 0) throw new Error(`pip install of GuardDog failed: ${tail2(pip.stderr)}`);
   return { bin: `${dir}/bin/guarddog` };
 }
 var hasFindings = (v) => Array.isArray(v) ? v.length > 0 : typeof v === "object" && v !== null ? Object.keys(v).length > 0 : typeof v === "string" ? v !== "" : !!v;
@@ -2293,7 +3156,7 @@ async function scan(exec, bin, eco, path) {
   if (r.code !== 0) {
     const anomaly = archiveAnomaly(r, path);
     if (anomaly) return { result: "flagged", details: [{ rule: ARCHIVE_ANOMALY, message: anomaly }] };
-    throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail(r.stderr)}`);
+    throw new Error(`guarddog ${eco} scan exited ${r.code}: ${tail2(r.stderr)}`);
   }
   return parseGuardDogJson(r.stdout);
 }
@@ -2316,27 +3179,27 @@ function fail(msg) {
 `);
   return 1;
 }
-var safe3 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
-var safeText = (s) => s.replace(/\s+/g, " ").replace(/[^A-Za-z0-9._~/+:,;=!?#%&*()'"{}$^ -]/g, "?");
+var safe5 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+var safeText2 = (s) => s.replace(/\s+/g, " ").replace(/[^A-Za-z0-9._~/+:,;=!?#%&*()'"{}$^ -]/g, "?");
 var count = (f) => f.count !== void 0 ? ` (${f.count})` : "";
 var NOT_SCANNED = "contents NOT scanned by GuardDog (archive anomaly; can be deliberate scan evasion). Inspect the archive manually before adding decant:reviewed";
 var notScanned = (f) => f.rule === ARCHIVE_ANOMALY;
 function findingText(f) {
-  const msg = f.message ? `: ${safeText(f.message)}` : "";
-  const at = f.locations?.length ? ` at ${f.locations.map(safeText).join(", ")}` : "";
-  return `${safe3(f.rule)}${count(f)}${msg}${at}${notScanned(f) ? ` - ${NOT_SCANNED}` : ""}`;
+  const msg = f.message ? `: ${safeText2(f.message)}` : "";
+  const at = f.locations?.length ? ` at ${f.locations.map(safeText2).join(", ")}` : "";
+  return `${safe5(f.rule)}${count(f)}${msg}${at}${notScanned(f) ? ` - ${NOT_SCANNED}` : ""}`;
 }
 function findingLine(r, f) {
-  const msg = f.message ? `: \`${safeText(f.message)}\`` : "";
-  const at = f.locations?.length ? ` at ${f.locations.map((l) => `\`${safeText(l)}\``).join(", ")}` : "";
-  return `- \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` \`${safe3(f.rule)}\`${count(f)}${msg}${at}${notScanned(f) ? ` \u26A0\uFE0F **${NOT_SCANNED}**` : ""}`;
+  const msg = f.message ? `: \`${safeText2(f.message)}\`` : "";
+  const at = f.locations?.length ? ` at ${f.locations.map((l) => `\`${safeText2(l)}\``).join(", ")}` : "";
+  return `- \`${safe5(r.dep.name)}@${safe5(r.dep.version)}\` \`${safe5(f.rule)}\`${count(f)}${msg}${at}${notScanned(f) ? ` \u26A0\uFE0F **${NOT_SCANNED}**` : ""}`;
 }
 var isPackageLock2 = (rel) => rel === "package-lock.json" || rel.endsWith("/package-lock.json");
 var shellQuote = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
 function newReviewScope(p) {
   return p.action === "synchronize" || p.action === "reopened" || p.action === "edited" && !!p.changes?.base;
 }
-var fmtTime = (d) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+var fmtTime2 = (d) => `${d.toISOString().slice(0, 16).replace("T", " ")} UTC`;
 async function pool(items, n, fn) {
   let next = 0;
   const worker = async () => {
@@ -2353,12 +3216,14 @@ function parseLock(rel, text, decantUrl) {
 async function cooldownNote(deps, dep, cooldownDays) {
   try {
     const t = dep.eco === "npm" ? await npmPublishTime(deps.fetch, dep.name, dep.version) : await goPublishTime(deps.fetch, dep.name, dep.version);
-    if (t) return `waiting for cooldown until ${fmtTime(new Date(t.getTime() + cooldownDays * 864e5))}`;
+    if (t) return `waiting for cooldown until ${fmtTime2(new Date(t.getTime() + cooldownDays * 864e5))}`;
   } catch {
   }
   return "waiting for cooldown (publish time unknown)";
 }
-function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
+function render(rows, pass, failOn, ref, limit = Infinity, note = "", images = []) {
+  const imageText = renderImages(images, limit === Infinity ? Infinity : Math.floor(limit / 3)).join("\n");
+  if (limit !== Infinity) limit -= imageText.length;
   const head = [
     MARKER,
     `## decant scan: ${pass ? "\u2705 pass" : "\u274C fail"}`,
@@ -2373,10 +3238,10 @@ function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
   let size2 = head.length;
   let cut = false;
   for (const [i, r] of rows.entries()) {
-    const vulns = r.vulns.length ? r.vulns.map((v) => `${safe3(v.id)} (${v.malicious ? "malicious" : v.severity})`).join(", ") : "\u2014";
+    const vulns = r.vulns.length ? r.vulns.map((v) => `${safe5(v.id)} (${v.malicious ? "malicious" : v.severity})`).join(", ") : "\u2014";
     const status = r.problems.length ? `\u274C ${r.problems.join("; ")}` : r.warn ? `\u26A0\uFE0F ${r.notes.join("; ")}` : `\u2705 ${r.notes.length ? r.notes.join("; ") : "ok"}`;
     const source = r.dep.source === "registry" ? r.dep.eco : "other";
-    const line2 = `| \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` | ${source} | ${r.osv} | ${r.guarddog} | ${vulns} | ${status} |`;
+    const line2 = `| \`${safe5(r.dep.name)}@${safe5(r.dep.version)}\` | ${source} | ${r.osv} | ${r.guarddog} | ${vulns} | ${status} |`;
     if (size2 + line2.length + 1 > limit) {
       lines.push(`
 \u2026 and ${rows.length - i} more (see the job summary).`);
@@ -2386,7 +3251,7 @@ function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
     lines.push(line2);
     size2 += line2.length + 1;
   }
-  const findings = rows.filter((r) => r.flagged).flatMap((r) => r.findings.length ? r.findings.map((f) => findingLine(r, f)) : [`- \`${safe3(r.dep.name)}@${safe3(r.dep.version)}\` (no rule details recorded)`]);
+  const findings = rows.filter((r) => r.flagged).flatMap((r) => r.findings.length ? r.findings.map((f) => findingLine(r, f)) : [`- \`${safe5(r.dep.name)}@${safe5(r.dep.version)}\` (no rule details recorded)`]);
   if (findings.length && !cut) {
     const title = "\n### GuardDog findings\n";
     lines.push(title);
@@ -2403,15 +3268,16 @@ function render(rows, pass, failOn, ref, limit = Infinity, note = "") {
   }
   return `${head}
 ${lines.join("\n")}
-`;
+${imageText ? `${imageText}
+` : ""}`;
 }
 async function changedLockfiles(deps, wd, baseSha) {
   const tree = await findLockfileTree(wd, deps.fs);
   const out = tree.symlinks.map((l) => l.path);
   for (const rel of tree.files) {
-    if (await fileAtCommit(deps, wd, baseSha, rel) !== await deps.fs.readFile(join3(wd, rel))) out.push(rel);
+    if (await fileAtCommit(deps, wd, baseSha, rel) !== await deps.fs.readFile(join5(wd, rel))) out.push(rel);
   }
-  return out.map(safe3);
+  return out.map(safe5);
 }
 async function run3({ deps, inputs }) {
   const env = deps.env;
@@ -2438,10 +3304,13 @@ async function run3({ deps, inputs }) {
     try {
       const changed = await changedLockfiles(deps, wd, baseSha);
       if (changed.length) return stop(`fork changes lockfiles (${changed.join(", ")}); push the branch to this repo to scan it`);
+      const df = await changedDockerfiles(deps, wd, baseSha);
+      const touched = [...df.changed, ...df.symlinks].map(safe5);
+      if (touched.length) return stop(`fork changes Dockerfiles (${touched.join(", ")}); push the branch to this repo to scan it`);
     } catch (e) {
       return stop(`decant scan: ${e.message}`);
     }
-    notice("fork PR changes no lockfile; nothing to scan");
+    notice("fork PR changes no lockfile or Dockerfile; nothing to scan");
     setOutput("result", "pass", env);
     return 0;
   }
@@ -2449,7 +3318,7 @@ async function run3({ deps, inputs }) {
   if (!SEVERITIES.includes(inputs.failOn)) return stop(`fail-on must be one of ${SEVERITIES.join(", ")}`);
   const failOn = inputs.failOn;
   let cooldownDays = 7;
-  const policyFile = join3(wd, inputs.policyPath);
+  const policyFile = join5(wd, inputs.policyPath);
   if (await deps.fs.exists(policyFile)) {
     let parsed;
     try {
@@ -2478,7 +3347,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     const tree = await findLockfileTree(wd, deps.fs);
     if (tree.symlinks.length) {
       for (const l of tree.symlinks) {
-        const msg = `${join3(wd, l.path)}: ${l.dir ? "symlinked directory" : "lockfile is a symlink"}; not supported`;
+        const msg = `${join5(wd, l.path)}: ${l.dir ? "symlinked directory" : "lockfile is a symlink"}; not supported`;
         error(msg);
         process.stderr.write(`${msg}
 `);
@@ -2486,7 +3355,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       return stop(`${tree.symlinks.length} symlink(s) in ${wd}; decant does not scan through symlinks`);
     }
     for (const rel of tree.files) {
-      const abs = join3(wd, rel);
+      const abs = join5(wd, rel);
       const head = await deps.fs.readFile(abs);
       const base = await fileAtCommit(deps, wd, baseSha, rel);
       if (base === head) continue;
@@ -2532,7 +3401,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       else {
         r.warn = true;
         r.notes.push("not from the registry; not scanned");
-        warning(`${safe3(d.name)}@${safe3(d.version)} in ${d.file} is not from the registry and was not scanned`, d.file);
+        warning(`${safe5(d.name)}@${safe5(d.version)} in ${d.file} is not from the registry and was not scanned`, d.file);
       }
       rows.push(r);
     }
@@ -2540,10 +3409,10 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
     const regDeps = [...registry.values()];
     const vulnsByKey = regDeps.length ? await createOsv(deps.fetch).queryVulns(regDeps) : /* @__PURE__ */ new Map();
     const client = decant(deps.fetch, inputs.decantUrl, inputs.token, { sleep: deps.sleep });
-    const scratch = `${env.RUNNER_TEMP || tmpdir()}/decant-scan`;
+    const scratch = `${env.RUNNER_TEMP || tmpdir2()}/decant-scan`;
     let gd = null;
     const guarddog = () => {
-      gd ??= installGuardDog(deps.exec, deps.fs.readFile, `${env.RUNNER_TEMP || tmpdir()}/decant-guarddog`, actionDir(env.GITHUB_ACTION_PATH), env);
+      gd ??= installGuardDog(deps.exec, deps.fs.readFile, `${env.RUNNER_TEMP || tmpdir2()}/decant-guarddog`, actionDir(env.GITHUB_ACTION_PATH), env);
       return gd;
     };
     if (regDeps.length) await deps.fs.mkdir(scratch);
@@ -2554,7 +3423,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
         await evaluate(r, i);
       } catch (e) {
         const msg = e.message;
-        error(`${safe3(r.dep.name)}@${safe3(r.dep.version)}: ${msg}`);
+        error(`${safe5(r.dep.name)}@${safe5(r.dep.version)}: ${msg}`);
         r.problems.push("scan error (see log)");
       }
     });
@@ -2567,7 +3436,7 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       if (blocked.has(id)) problem("blocked by decant");
       const cached = await client.getVerdicts(id);
       const of = (s) => cached.find((v) => v.scanner === s);
-      if (cached.some((v) => v.result === "malicious")) r.problems.push(`malicious (${cached.filter((v) => v.result === "malicious").map((v) => safe3(v.scanner)).join(", ")})`);
+      if (cached.some((v) => v.result === "malicious")) r.problems.push(`malicious (${cached.filter((v) => v.result === "malicious").map((v) => safe5(v.scanner)).join(", ")})`);
       r.vulns = vulnsByKey.get(depKey(d)) ?? [];
       const mal = r.vulns.filter((v) => v.malicious).map((v) => v.id);
       const osvResult = mal.length ? "malicious" : "clean";
@@ -2607,15 +3476,23 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
           r.findings = res.details;
         }
       }
-      if (gdResult !== "clean" && r.findings.length) r.notes.push(`GuardDog: ${r.findings.map((f) => `${safe3(f.rule)}${count(f)}`).join(", ")}`);
+      if (gdResult !== "clean" && r.findings.length) r.notes.push(`GuardDog: ${r.findings.map((f) => `${safe5(f.rule)}${count(f)}`).join(", ")}`);
       if (gdResult === "flagged") r.flagged = true;
+    }
+    const gate = await dockerGate({ deps, wd, baseSha, ref, client });
+    if (gate.fatal) return stop(gate.fatal);
+    const imageRows = gate.rows;
+    let imageNote = "";
+    if (imageRows.length) {
+      const others = await otherImageFiles(deps, wd);
+      if (others.length) imageNote = `Images referenced in ${others.slice(0, 5).map((f) => `\`${safe5(f)}\``).join(", ")}${others.length > 5 ? ", \u2026" : ""} are not gated (Dockerfiles only).`;
     }
     const anyFlagged = regRows.some((r) => r.flagged);
     const reviewed = anyFlagged ? await gh.labelAddedByWriter(n, REVIEWED) : false;
     for (const r of regRows) {
       if (!r.flagged) continue;
       const what = r.findings.length ? r.findings.map(findingText).join("; ") : "no rule details recorded";
-      warning(`${safe3(r.dep.name)}@${safe3(r.dep.version)} flagged by GuardDog: ${what}`);
+      warning(`${safe5(r.dep.name)}@${safe5(r.dep.version)} flagged by GuardDog: ${what}`);
       if (reviewed) r.notes.unshift(`flagged; ${REVIEWED} by a writer`);
       else r.problems.push(`flagged by GuardDog (needs ${REVIEWED} from a writer)`);
     }
@@ -2629,10 +3506,10 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
       securityNote = `**Auto-merge is off:** a dependency was flagged by GuardDog, so this \`${SECURITY}\` PR must be merged manually after review.`;
     }
     const all = [...regRows, ...rows];
-    const pass = all.every((r) => r.problems.length === 0);
+    const pass = all.every((r) => r.problems.length === 0) && imageRows.every((r) => r.problems.length === 0);
     setOutput("result", pass ? "pass" : "fail", env);
     setOutput("flagged", anyFlagged ? "true" : "false", env);
-    if (all.length === 0) {
+    if (all.length === 0 && imageRows.length === 0) {
       const body = `${MARKER}
 ## decant scan: \u2705 pass
 
@@ -2641,9 +3518,14 @@ No new dependency versions.`;
       await gh.updateComment(n, MARKER, body);
       return 0;
     }
-    appendSummary(render(all, pass, failOn, ref, Infinity, securityNote), env);
-    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT, securityNote));
-    if (!pass) return fail(`decant scan failed: ${all.filter((r) => r.problems.length).length} dependency version(s) need attention`);
+    const note = [securityNote, imageNote].filter(Boolean).join("\n\n");
+    appendSummary(render(all, pass, failOn, ref, Infinity, note, imageRows), env);
+    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT, note, imageRows));
+    if (!pass) {
+      const deps2 = all.filter((r) => r.problems.length).length;
+      const imgs = imageRows.filter((r) => r.problems.length).length;
+      return fail(`decant scan failed: ${[deps2 ? `${deps2} dependency version(s)` : "", imgs ? `${imgs} base image(s)` : ""].filter(Boolean).join(" and ")} need attention`);
+    }
     return 0;
   } catch (e) {
     return stop(`decant scan: ${e.message}`);
@@ -2720,7 +3602,7 @@ __export(sync_exports, {
   overlayPolicy: () => overlayPolicy,
   run: () => run5
 });
-import { join as join4 } from "node:path";
+import { join as join6 } from "node:path";
 
 // action/src/dep-summary.ts
 var MAX_VIA = 5;
@@ -2918,11 +3800,46 @@ async function sendDependencySummary(deps, client, wd, project, sha) {
     warning(`dependency summary not sent: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
+var MAX_IMAGES2 = 200;
+var safe6 = (s) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, "?");
+async function sendImages(deps, client, wd, ref) {
+  try {
+    const tree = await findDockerfiles(wd, deps.fs);
+    const byKey = /* @__PURE__ */ new Map();
+    let unpinned = 0;
+    for (const rel of tree.files) {
+      const p = parseDockerfile(await deps.fs.readFile(join6(wd, rel)));
+      if (p.errors.length) warning(`${safe6(rel)}: ${p.errors.length} line(s) decant cannot read; the PR scan fails on them`);
+      for (const f of p.froms) {
+        if (f.kind !== "image" || !f.ref) continue;
+        if (!f.ref.digest) {
+          unpinned++;
+          continue;
+        }
+        const k = `${f.ref.name}@${f.ref.digest}`;
+        const cur = byKey.get(k) ?? { name: f.ref.name, digest: f.ref.digest, files: [] };
+        if (!cur.files.includes(rel) && cur.files.length < 20) cur.files.push(rel);
+        byKey.set(k, cur);
+      }
+    }
+    if (unpinned) warning(`${unpinned} base image(s) on the default branch are not pinned by digest; see docs/adopt.md`);
+    let images = [...byKey.values()];
+    if (images.length > MAX_IMAGES2) {
+      warning(`${images.length} base images; reporting the first ${MAX_IMAGES2}`);
+      images = images.slice(0, MAX_IMAGES2);
+    }
+    const r = await client.images(ref, images, { main: true });
+    const waiting = r.images.filter((i) => i.clock === "unverified");
+    if (waiting.length) warning(`decant could not verify ${waiting.length} image digest(s) in the registry yet: ${waiting.slice(0, 5).map((i) => safe6(`${i.name}@${i.digest.slice(0, 19)}`)).join(", ")}`);
+  } catch (e) {
+    warning(`base images not reported: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
 async function run5({ deps, inputs }) {
   const env = deps.env;
   mask(inputs.token);
   mask(inputs.syncToken);
-  const policyFile = join4(inputs.workingDirectory, inputs.policyPath);
+  const policyFile = join6(inputs.workingDirectory, inputs.policyPath);
   if (!await deps.fs.exists(policyFile)) return fail3(`decant.json not found at ${policyFile}`);
   let raw;
   try {
@@ -2988,7 +3905,10 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
   const client = decant(deps.fetch, inputs.decantUrl, token, { sleep: deps.sleep });
   const res = await client.syncPolicy(project, raw, env.GITHUB_SHA ?? "", ref);
   if (res.status < 200 || res.status >= 300) return fail3(`decant rejected the policy (HTTP ${res.status}): ${errorText2(res.body)}`);
-  if (event !== "pull_request") await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? "");
+  if (event !== "pull_request") {
+    await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? "");
+    await sendImages(deps, client, inputs.workingDirectory, ref);
+  }
   setOutput("ref", ref, env);
   return 0;
 }
