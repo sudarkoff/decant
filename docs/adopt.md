@@ -172,6 +172,29 @@ docker build --secret id=npmrc,src=$HOME/.npmrc --secret id=netrc,src=$HOME/.net
 
 In CI, run the `setup` step first, then the same command; it reads the files `setup` wrote. Set `GOPROXY` in the Dockerfile with `ENV GOPROXY=https://<your-domain>/go`.
 
+### Pin base images by digest
+
+The PR scan gates base images too. Every `FROM` (and a `# syntax=` frontend, which is code BuildKit runs) in a changed `Dockerfile`, `*.Dockerfile` or `Dockerfile.*` must be `scratch`, an earlier stage, or pinned by digest. The tag stays as documentation:
+
+```dockerfile
+# syntax=docker/dockerfile:1@sha256:<digest>
+FROM node:22-alpine@sha256:<digest> AS build
+FROM build AS test
+FROM scratch
+```
+
+Find a tag's current digest with `docker buildx imagetools inspect node:22-alpine` (the `Digest:` line), or let the scan tell you: an unpinned `FROM` fails with a fix-it naming the digest the tag resolves to now. Use the index (multi-arch) digest, the one `imagetools inspect` prints first.
+
+What the scan checks for each digest that is new in the PR:
+
+- **Cooldown.** A digest's age counts from when decant first verified it in the registry (never the image's own `created` time, which the publisher controls). Main-branch sync reports the digests in use, so adopting decant does not block images you already build from. An `allow` entry skips the cooldown, as for npm and Go: `{ "package": "docker:docker.io/library/node@sha256:<digest>", "reason": "…", "added": "2026-11-20" }`. Names are fully qualified (`docker.io/library/node`, `ghcr.io/org/app`).
+- **Blocks.** `block` entries with `docker:` ids work like any other.
+- **Vulnerabilities.** Grype (pinned) scans the image straight from the registry. High or Critical findings with a fixed version fail the PR; findings with no fix are reported and pass. The daily audit re-scans every image in use and, once the tag points at a newer digest that has cleared the cooldown and removes a High or Critical finding, bumps the digest in the same security PR as npm and Go fixes.
+- **Registries.** decant resolves and scans public images on Docker Hub and ghcr.io. Images on other or private registries have a per-project cooldown clock and cannot be scanned, so they fail unless an `allow` entry names the digest.
+- **What fails closed.** An `ARG` in `FROM` without a default, a line decant cannot parse (it accepts only Dockerfile instructions, `#` comments and `RUN`/`COPY`/`ADD` heredocs it can read unambiguously), a digest the registry does not have, or a Grype or Grype database error.
+
+Images referenced outside Dockerfiles (compose files, `fly.toml`) are noted in the report but not gated.
+
 ## 8. Renovate and Dependabot
 
 Set their minimum release age equal to your `cooldownDays` so they stop proposing versions decant would still hide.
@@ -202,7 +225,8 @@ updates:
 - A flagged dependency on a `decant:security` PR (an audit fix) turns auto-merge off and says so in the report. `decant:reviewed` can still make the check green, but a person must merge it.
 - Lockfiles or directories that are symlinks fail the scan. decant does not follow them.
 - GuardDog runs in its sandbox. A runner that cannot run it fails closed: the scan fails instead of passing unchecked.
-- Fork PRs have no secrets: one that changes no lockfile passes; one that changes a lockfile fails until the branch is pushed to this repo.
+- Fork PRs have no secrets: one that changes no lockfile or Dockerfile passes; one that changes either fails until the branch is pushed to this repo.
+- Base images: see [Pin base images by digest](#pin-base-images-by-digest). The report has a **Base images** table with each new digest's cooldown and Grype result.
 
 ## Emergency bypass
 

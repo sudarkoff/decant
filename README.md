@@ -16,6 +16,7 @@ New releases rest before they're poured: decant serves a version only after it h
 - **Scan.** New versions are checked for known vulnerabilities and malware heuristics before use.
 - **Keep.** Versions in use are kept in R2, so rollbacks work even after an upstream deletion.
 - **Survive outages.** Cached packages are served when npm, GitHub or the Go proxy are down.
+- **Base images too.** Every Dockerfile `FROM` must be pinned by digest; a new digest waits out the same cooldown (counted from when decant first verified it) and is scanned with Grype in the PR. The daily audit bumps digests that fix High or Critical findings.
 - **Security fast lane.** A fix for a known advisory can skip the cooldown (never the scan) via a policy entry that cites the advisory ID.
 - **Policy as code.** One policy file in your repo; approval is a merged PR, and git history is the audit trail.
 - **Cheap to self-host.** `wrangler deploy` into your own Cloudflare account.
@@ -31,6 +32,6 @@ New releases rest before they're poured: decant serves a version only after it h
 - A daily cron re-checks stored versions against OSV and blocks any newly flagged as malicious.
 - Tokens are per project: `read` for installs, `sync` for main-branch policy sync, `ci` for overlays and verdicts, and one operator token for admin.
 
-v1 supports npm and Go. See [docs/deploy.md](docs/deploy.md) to set it up.
+v1 supports npm and Go, plus Docker base images in CI (pinned by digest, cooldown, Grype scan). See [docs/deploy.md](docs/deploy.md) to set it up.
 
 Optional private dashboard (behind Cloudflare Access): [setup](docs/deploy.md#dashboard-optional).
