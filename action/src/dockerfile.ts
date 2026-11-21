@@ -73,7 +73,8 @@ const INSTRUCTIONS = new Set([
 ]);
 /** Docker's stage name rule (checked on the lowercased name). */
 const STAGE_RE = /^[a-z][a-z0-9_.-]*$/;
-const HEREDOC_WORD = /^(\d*)<<(-?)([^<]+)$/;
+/** A heredoc word: optional fd digits, <<, optional -, then a plain name with at most one pair of matching quotes. */
+const HEREDOC_WORD = /^(\d*)<<(-?)(["']?)([A-Za-z0-9_.-]+)\3$/;
 
 /**
  * Splits an instruction into shell words, keeping each word's raw text (quotes and escapes included).
@@ -91,7 +92,7 @@ function shellWords(s: string, esc: string): string[] | null {
       if (ch === "'") q = null;
       continue;
     }
-    if (ch === '\\' || ch === esc) {
+    if (ch === esc) {
       cur += ch + (s[k + 1] ?? '');
       k++;
       inWord = true;
@@ -123,20 +124,21 @@ function shellWords(s: string, esc: string): string[] | null {
 }
 
 /**
- * The heredocs an instruction opens, in order. A word is a heredoc only when the whole word is
- * `[n]<<[-]NAME` (NAME possibly quoted); any other word containing `<<` (`<<<`, `a<<b`, `"<<X"`), or an
- * unclosed quote, is an error string: decant cannot tell how BuildKit reads the rest of the file.
+ * The heredocs an instruction opens, in order. Strict, no shell emulation: the line is split into words
+ * twice, with `\\` and with the Dockerfile's escape character, and both splits must agree; a word containing
+ * `<<` must be exactly `[n]<<[-]NAME` or `[n]<<[-]"NAME"` / `'NAME'` (NAME of letters, digits, `_`, `.`, `-`).
+ * Anything else fails closed: decant cannot tell how BuildKit reads the rest of the file.
  */
 function heredocs(ins: string, esc: string): { word: string; strip: boolean }[] | string {
-  const words = shellWords(ins, esc);
-  if (words === null) return 'unclosed quote; decant cannot tell how BuildKit reads the rest of the file';
+  const a = shellWords(ins, '\\');
+  const b = esc === '\\' ? a : shellWords(ins, esc);
+  if (a === null || b === null || a.length !== b.length || a.some((w, k) => w !== b[k])) return "decant couldn't parse this line (heredoc)";
   const out: { word: string; strip: boolean }[] = [];
-  for (const w of words) {
+  for (const w of a) {
     if (!w.includes('<<')) continue;
     const m = HEREDOC_WORD.exec(w);
-    const name = m ? m[3]!.replace(/["'\\]/g, '') : '';
-    if (!m || name === '' || /\s/.test(name)) return `ambiguous heredoc ${w}; decant cannot tell how BuildKit reads the rest of the file`;
-    out.push({ word: name, strip: m[2] === '-' });
+    if (!m) return "decant couldn't parse this line (heredoc)";
+    out.push({ word: m[4]!, strip: m[2] === '-' });
   }
   return out;
 }

@@ -4,6 +4,7 @@ import { memFs } from './fakes';
 
 const D = `sha256:${'a'.repeat(64)}`;
 const E = `sha256:${'b'.repeat(64)}`;
+const HD = (line: number) => `line ${line}: decant couldn't parse this line (heredoc)`;
 
 describe('parseImageRef', () => {
   it('normalizes Docker Hub short names and aliases', () => {
@@ -132,7 +133,7 @@ describe('parseDockerfile: reading files the way BuildKit does', () => {
 
   it('an unterminated or ambiguous (quoted) heredoc fails closed', () => {
     expect(parseDockerfile([`FROM node@${D}`, 'RUN <<EOF', 'echo hi'].join('\n')).errors).toEqual(['line 2: heredoc <<EOF is never terminated']);
-    expect(parseDockerfile([`FROM node@${D}`, 'RUN echo "<<EOF"', 'FROM alpine'].join('\n')).errors[0]).toMatch(/^line 2: ambiguous heredoc/);
+    expect(parseDockerfile([`FROM node@${D}`, 'RUN echo "<<EOF"', 'FROM alpine'].join('\n')).errors[0]).toBe(HD(2));
     // Not a heredoc instruction: << means nothing there.
     expect(parseDockerfile([`FROM node@${D}`, 'LABEL x="<<EOF"', 'FROM alpine'].join('\n')).froms).toHaveLength(2);
   });
@@ -187,10 +188,30 @@ describe('parseDockerfile: reading files the way BuildKit does', () => {
     const ok = parseDockerfile([`FROM node@${D}`, 'RUN 3<<my-doc.v1 cat', 'FROM fake', 'my-doc.v1', 'FROM alpine'].join('\n'));
     expect(ok.errors).toEqual([]);
     expect(ok.froms.map((f) => f.text)).toEqual([`node@${D}`, 'alpine']);
-    expect(parseDockerfile([`FROM node@${D}`, 'RUN cat <<<"x"', 'FROM alpine'].join('\n')).errors[0]).toMatch(/^line 2: ambiguous heredoc <<<"x"/);
-    expect(parseDockerfile([`FROM node@${D}`, 'RUN cat<<EOF', 'EOF'].join('\n')).errors[0]).toMatch(/^line 2: ambiguous heredoc cat<<EOF/);
-    expect(parseDockerfile([`FROM node@${D}`, "RUN echo 'unclosed <<EOF"].join('\n')).errors[0]).toMatch(/^line 2: unclosed quote/);
+    expect(parseDockerfile([`FROM node@${D}`, 'RUN cat <<<"x"', 'FROM alpine'].join('\n')).errors[0]).toBe(HD(2));
+    expect(parseDockerfile([`FROM node@${D}`, 'RUN cat<<EOF', 'EOF'].join('\n')).errors[0]).toBe(HD(2));
+    expect(parseDockerfile([`FROM node@${D}`, "RUN echo 'unclosed <<EOF"].join('\n')).errors[0]).toBe(HD(2));
     expect(parseDockerfile([`FROM node@${D}`, 'RUN <<END.X', 'echo'].join('\n')).errors).toEqual(['line 2: heredoc <<END.X is never terminated']);
+  });
+
+  it('heredoc names are strict: backslashes, mixed or partial quotes and # names fail closed', () => {
+    for (const w of ['<<E\\OF', `<<"EOF'`, '<<E"OF"', '<<"E"OF', '<<#EOF', "<<'#x'"]) {
+      expect(parseDockerfile([`FROM node@${D}`, `RUN cat ${w}`, 'EOF', 'FROM alpine'].join('\n')).errors[0], w).toBe(HD(2));
+    }
+  });
+
+  it('plain <<EOF and <<-\'EOF\' still work', () => {
+    const r = parseDockerfile([`FROM node@${D}`, 'RUN <<EOF', 'FROM x', 'EOF', "RUN <<-'EOF'", '\tFROM y', '\tEOF', 'FROM alpine'].join('\n'));
+    expect(r.errors).toEqual([]);
+    expect(r.froms.map((f) => f.text)).toEqual([`node@${D}`, 'alpine']);
+  });
+
+  it('with a backtick escape directive, a heredoc line must split the same both ways', () => {
+    const ok = parseDockerfile(['# escape=`', `FROM node@${D}`, 'RUN <<EOF', 'FROM x', 'EOF'].join('\n'));
+    expect(ok.errors).toEqual([]);
+    // A backslash or backtick changes the word split under one escape but not the other: fail closed.
+    expect(parseDockerfile(['# escape=`', `FROM node@${D}`, 'RUN echo \\"x <<EOF', 'EOF'].join('\n')).errors[0]).toBe(HD(3));
+    expect(parseDockerfile(['# escape=`', `FROM node@${D}`, 'RUN echo `"x <<EOF', 'EOF'].join('\n')).errors[0]).toBe(HD(3));
   });
 
   it('stage names follow Docker; a reference with / : or @ is never a stage', () => {
