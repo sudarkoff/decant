@@ -144,6 +144,8 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
 
   if (!inputs.githubToken) return stop('github-token is required');
   if (!inputs.token) return stop('token is required (ci token)');
+  // The overlay ref the audit ships fixes through is reserved for the sync token: fail now, not mid-run.
+  if (!inputs.syncToken) return stop('sync-token is required: decant reserves the audit overlay ref for the sync token (see docs/release.md)');
   if (!inputs.decantUrl) return stop('decant-url is required');
   // Credential files go in a private directory under the runner's per-job temp dir, never a shared /tmp.
   if (!env.RUNNER_TEMP) return stop('RUNNER_TEMP is not set; decant audit runs on GitHub Actions runners');

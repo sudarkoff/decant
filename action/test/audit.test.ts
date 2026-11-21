@@ -741,13 +741,14 @@ describe('audit: one security PR per run', () => {
     expect(await h.run()).toBe(1);
   });
 
-  it('no sync-token → the reserved overlay cannot be written: run fails, nothing installed or opened', async () => {
+  it('no sync-token → fails at the start, before any work', async () => {
     const h = harness({ ...DIRECT, exec: npmFake(), env: { INPUT_SYNC_TOKEN: undefined } });
     expect(await h.run()).toBe(1);
     expect(h.syncs).toEqual([]);
     expect(h.prs).toEqual([]);
-    expect(h.exec.calls.filter((c) => c.cmd === 'npm')).toEqual([]);
-    expect(h.log()).toContain('sync-token is required to ship fixes: decant reserves the overlay ref audit for the sync token');
+    expect(h.f.calls).toEqual([]);
+    expect(h.exec.calls).toEqual([]);
+    expect(h.log()).toContain('sync-token is required: decant reserves the audit overlay ref for the sync token');
   });
 
   it('GHSA + CVE aliases merge into one advisory', async () => {
@@ -1345,6 +1346,15 @@ describe('audit: base images', () => {
     expect(await h.run()).toBe(0);
     expect(h.prs).toEqual([]);
     expect(h.summary()).toContain('would introduce CVE-2026-5 (high); not bumped');
+  });
+
+  it('introduced findings are keyed on id + package: the same advisory on a new package counts as new', async () => {
+    const onPkg = (id: string, sev: string, pkg: string) => ({ ...match(id, sev, ['9']), artifact: { name: pkg, version: '1', type: 'deb' } });
+    const { w } = world({ grype: { [OLD]: [onPkg('CVE-2026-1', 'Critical', 'openssl'), onPkg('CVE-2026-3', 'High', 'zlib')], [NEW]: [onPkg('CVE-2026-3', 'High', 'libxml2')] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toEqual([]);
+    expect(h.summary()).toContain('would introduce CVE-2026-3 (high); not bumped');
   });
 
   it('lower-severity findings a bump introduces are listed in the PR and count toward approval', async () => {

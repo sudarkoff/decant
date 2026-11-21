@@ -148,10 +148,12 @@ export async function auditImages(deps: ActionDeps, client: DecantClient, wd: st
       lines.push(`- ${label}: scan error; not bumped`);
       continue;
     }
-    const beforeIds = new Set(before.map((f) => f.id));
+    const fkey = (f: GrypeFinding) => `${f.id}\u0000${f.package}`;
+    const beforeIds = new Set(before.map(fkey));
     const afterIds = new Set(after.map((f) => f.id));
     const fixes = [...new Map(before.filter((f) => isSerious(f) && !afterIds.has(f.id)).map((f) => [f.id, f])).values()];
-    const introduced = [...new Map(after.filter((f) => !beforeIds.has(f.id)).map((f) => [f.id, f])).values()];
+    // Introduced: an advisory on a package the pinned digest did not have it on (id + package).
+    const introduced = [...new Map(after.filter((f) => !beforeIds.has(fkey(f))).map((f) => [fkey(f), f])).values()];
     if (!fixes.length) {
       lines.push(`- ${label}: fixes no High/Critical finding; not bumped`);
       continue;
