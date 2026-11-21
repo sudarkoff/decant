@@ -20,6 +20,8 @@ export type ImageBump = {
   to: string;
   /** High/Critical findings of `from` that `to` no longer has. */
   fixes: GrypeFinding[];
+  /** Findings `to` has that `from` did not (never High/Critical: such a bump is refused). */
+  introduced: GrypeFinding[];
   severity: Severity;
   /** Repo-relative Dockerfiles changed. */
   files: string[];
@@ -78,8 +80,8 @@ export async function auditImages(deps: ActionDeps, client: DecantClient, wd: st
     (bin ??= installGrype(deps.fetch, deps.exec, deps.fs, `${env.RUNNER_TEMP}/decant-grype`, grypeArch(env.DECANT_GRYPE_PLATFORM || process.platform, env.DECANT_GRYPE_ARCH || process.arch)).then((g) => g.bin));
   const genv = grypeEnv(`${env.RUNNER_TEMP}/decant-grype-db`);
   const scans = new Map<string, Promise<GrypeFinding[] | null>>();
-  /** Serious findings of name@digest (scanned once per run; verdict stored), or null on a scan error. */
-  const serious = (name: string, digest: string, platform?: string) => {
+  /** All findings of name@digest (scanned once per run; verdict stored), or null on a scan error. */
+  const findings = (name: string, digest: string, platform?: string) => {
     const k = `${name}@${digest}`;
     let s = scans.get(k);
     if (!s) {
@@ -88,7 +90,7 @@ export async function auditImages(deps: ActionDeps, client: DecantClient, wd: st
           const r = await scanImage(deps.exec, await grype(), name, digest, genv, platform);
           const v = grypeVerdict(r);
           await client.putVerdict({ package: formatPackageId({ eco: 'docker', name, version: digest }), scanner: 'grype', scannerVersion: GRYPE_VERSION, result: v.result, details: v.details });
-          return r.findings.filter(isSerious);
+          return r.findings;
         } catch (e) {
           warning(`${safe(k)}: ${safe((e as Error).message).slice(0, 200)}`);
           return null;
@@ -107,7 +109,8 @@ export async function auditImages(deps: ActionDeps, client: DecantClient, wd: st
       lines.push(`- ${label}: registry not supported; not scanned`);
       continue;
     }
-    const now = await serious(g.name, g.digest, g.platform);
+    const all = await findings(g.name, g.digest, g.platform);
+    const now = all === null ? null : all.filter(isSerious);
     const state = now === null ? 'scan error' : now.length ? `${now.length} High/Critical` : 'clean';
     if (!g.tag) {
       lines.push(`- ${label}: ${state}; no tag to follow`);
@@ -126,7 +129,8 @@ export async function auditImages(deps: ActionDeps, client: DecantClient, wd: st
   }
   if (!candidates.length) return { bumps: [], files: [], lines };
 
-  const reply = await client.images(IMAGES_REF, [...new Map(candidates.map((c) => [`${c.g.name}@${c.to}`, { name: c.g.name, digest: c.to }])).values()]);
+  // mainOnly: only main's allow entries count, so no overlay (whatever its name) can skip a candidate's cooldown.
+  const reply = await client.images(IMAGES_REF, [...new Map(candidates.map((c) => [`${c.g.name}@${c.to}`, { name: c.g.name, digest: c.to }])).values()], { mainOnly: true });
   const decision = new Map(reply.images.map((d) => [`${d.name}@${d.digest}`, d]));
   const bumps: ImageBump[] = [];
   const edited = new Map<string, string>();
@@ -138,16 +142,23 @@ export async function auditImages(deps: ActionDeps, client: DecantClient, wd: st
       lines.push(`- ${label}: newer digest waiting (${why})`);
       continue;
     }
-    const before = await serious(g.name, g.digest, g.platform);
-    const after = await serious(g.name, to, g.platform);
+    const before = await findings(g.name, g.digest, g.platform);
+    const after = await findings(g.name, to, g.platform);
     if (before === null || after === null) {
       lines.push(`- ${label}: scan error; not bumped`);
       continue;
     }
-    const left = new Set(after.map((f) => f.id));
-    const fixes = [...new Map(before.filter((f) => !left.has(f.id)).map((f) => [f.id, f])).values()];
+    const beforeIds = new Set(before.map((f) => f.id));
+    const afterIds = new Set(after.map((f) => f.id));
+    const fixes = [...new Map(before.filter((f) => isSerious(f) && !afterIds.has(f.id)).map((f) => [f.id, f])).values()];
+    const introduced = [...new Map(after.filter((f) => !beforeIds.has(f.id)).map((f) => [f.id, f])).values()];
     if (!fixes.length) {
       lines.push(`- ${label}: fixes no High/Critical finding; not bumped`);
+      continue;
+    }
+    const worse = introduced.filter(isSerious);
+    if (worse.length) {
+      lines.push(`- ${label}: would introduce ${worse.map((f) => `${safe(f.id)} (${f.severity})`).join(', ')}; not bumped`);
       continue;
     }
     // Rewrite the digest on each FROM (or its continuation lines); a digest set elsewhere (an ARG) is not touched.
@@ -170,7 +181,7 @@ export async function auditImages(deps: ActionDeps, client: DecantClient, wd: st
     }
     for (const [rel, t] of pending) edited.set(rel, t);
     const severity = SEV_ORDER.find((s) => fixes.some((f) => f.severity === s)) ?? 'high';
-    bumps.push({ name: g.name, tag: g.tag, from: g.digest, to, fixes, severity, files: [...new Set(g.uses.map((u) => repoPath(join(wd, u.rel))))] });
+    bumps.push({ name: g.name, tag: g.tag, from: g.digest, to, fixes, introduced, severity, files: [...new Set(g.uses.map((u) => repoPath(join(wd, u.rel))))] });
     lines.push(`- ${label}: bump fixes ${fixes.map((f) => safe(f.id)).join(', ')}`);
   }
   const files = [...edited].map(([rel, contents]) => ({ path: repoPath(join(wd, rel)), contents }));

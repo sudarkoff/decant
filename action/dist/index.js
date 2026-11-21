@@ -1594,7 +1594,7 @@ async function auditImages(deps, client, wd, repoPath) {
   const grype = () => bin ??= installGrype(deps.fetch, deps.exec, deps.fs, `${env.RUNNER_TEMP}/decant-grype`, grypeArch(env.DECANT_GRYPE_PLATFORM || process.platform, env.DECANT_GRYPE_ARCH || process.arch)).then((g) => g.bin);
   const genv = grypeEnv(`${env.RUNNER_TEMP}/decant-grype-db`);
   const scans = /* @__PURE__ */ new Map();
-  const serious = (name, digest, platform) => {
+  const findings = (name, digest, platform) => {
     const k = `${name}@${digest}`;
     let s = scans.get(k);
     if (!s) {
@@ -1603,7 +1603,7 @@ async function auditImages(deps, client, wd, repoPath) {
           const r = await scanImage(deps.exec, await grype(), name, digest, genv, platform);
           const v = grypeVerdict(r);
           await client.putVerdict({ package: formatPackageId({ eco: "docker", name, version: digest }), scanner: "grype", scannerVersion: GRYPE_VERSION, result: v.result, details: v.details });
-          return r.findings.filter(isSerious);
+          return r.findings;
         } catch (e) {
           warning(`${safe2(k)}: ${safe2(e.message).slice(0, 200)}`);
           return null;
@@ -1621,7 +1621,8 @@ async function auditImages(deps, client, wd, repoPath) {
       lines.push(`- ${label}: registry not supported; not scanned`);
       continue;
     }
-    const now = await serious(g.name, g.digest, g.platform);
+    const all = await findings(g.name, g.digest, g.platform);
+    const now = all === null ? null : all.filter(isSerious);
     const state = now === null ? "scan error" : now.length ? `${now.length} High/Critical` : "clean";
     if (!g.tag) {
       lines.push(`- ${label}: ${state}; no tag to follow`);
@@ -1639,7 +1640,7 @@ async function auditImages(deps, client, wd, repoPath) {
     candidates.push({ g, to: r.digest });
   }
   if (!candidates.length) return { bumps: [], files: [], lines };
-  const reply = await client.images(IMAGES_REF, [...new Map(candidates.map((c) => [`${c.g.name}@${c.to}`, { name: c.g.name, digest: c.to }])).values()]);
+  const reply = await client.images(IMAGES_REF, [...new Map(candidates.map((c) => [`${c.g.name}@${c.to}`, { name: c.g.name, digest: c.to }])).values()], { mainOnly: true });
   const decision = new Map(reply.images.map((d) => [`${d.name}@${d.digest}`, d]));
   const bumps = [];
   const edited = /* @__PURE__ */ new Map();
@@ -1651,16 +1652,23 @@ async function auditImages(deps, client, wd, repoPath) {
       lines.push(`- ${label}: newer digest waiting (${why})`);
       continue;
     }
-    const before = await serious(g.name, g.digest, g.platform);
-    const after = await serious(g.name, to, g.platform);
+    const before = await findings(g.name, g.digest, g.platform);
+    const after = await findings(g.name, to, g.platform);
     if (before === null || after === null) {
       lines.push(`- ${label}: scan error; not bumped`);
       continue;
     }
-    const left = new Set(after.map((f) => f.id));
-    const fixes = [...new Map(before.filter((f) => !left.has(f.id)).map((f) => [f.id, f])).values()];
+    const beforeIds = new Set(before.map((f) => f.id));
+    const afterIds = new Set(after.map((f) => f.id));
+    const fixes = [...new Map(before.filter((f) => isSerious(f) && !afterIds.has(f.id)).map((f) => [f.id, f])).values()];
+    const introduced = [...new Map(after.filter((f) => !beforeIds.has(f.id)).map((f) => [f.id, f])).values()];
     if (!fixes.length) {
       lines.push(`- ${label}: fixes no High/Critical finding; not bumped`);
+      continue;
+    }
+    const worse = introduced.filter(isSerious);
+    if (worse.length) {
+      lines.push(`- ${label}: would introduce ${worse.map((f) => `${safe2(f.id)} (${f.severity})`).join(", ")}; not bumped`);
       continue;
     }
     const pending = /* @__PURE__ */ new Map();
@@ -1682,7 +1690,7 @@ async function auditImages(deps, client, wd, repoPath) {
     }
     for (const [rel, t] of pending) edited.set(rel, t);
     const severity = SEV_ORDER.find((s) => fixes.some((f) => f.severity === s)) ?? "high";
-    bumps.push({ name: g.name, tag: g.tag, from: g.digest, to, fixes, severity, files: [...new Set(g.uses.map((u) => repoPath(join2(wd, u.rel))))] });
+    bumps.push({ name: g.name, tag: g.tag, from: g.digest, to, fixes, introduced, severity, files: [...new Set(g.uses.map((u) => repoPath(join2(wd, u.rel))))] });
     lines.push(`- ${label}: bump fixes ${fixes.map((f) => safe2(f.id)).join(", ")}`);
   }
   const files = [...edited].map(([rel, contents]) => ({ path: repoPath(join2(wd, rel)), contents }));
@@ -1784,7 +1792,8 @@ function decant(f, url, token, retry = {}) {
      * use, so it is not retried on a gateway error (a late retry could overwrite a newer report).
      */
     async images(ref, images, opts = {}) {
-      const res = await call("POST", "/api/images", { body: { ref, images }, retryStatuses: !opts.main });
+      const body = opts.mainOnly ? { ref, images, mainOnly: true } : { ref, images };
+      const res = await call("POST", "/api/images", { body, retryStatuses: !opts.main });
       return ok(res, "decant POST /api/images");
     },
     async getVerdicts(pkgId) {
@@ -2511,7 +2520,8 @@ async function publish(ctx, fixed, changed, open, outcomes, unfixed, bumps = [])
   const imageVulns = new Set(bumps.flatMap((b) => b.fixes.map((f) => f.id)).filter((id) => !vulns.some((v) => v.id === id || v.aliases.includes(id))));
   const scope = [fixed.length ? plural(fixed.length, "package", "packages") : "", bumps.length ? plural(bumps.length, "image", "images") : ""].filter(Boolean).join(", ");
   const title = `decant: security fixes (${scope}, ${plural(vulns.length + imageVulns.size, "advisory", "advisories")})`;
-  const sevs = [...vulns.map(sevOf), ...bumps.map((b) => b.severity)];
+  const sevOfFinding = (s) => s === "critical" || s === "high" || s === "moderate" || s === "low" ? s : "moderate";
+  const sevs = [...vulns.map(sevOf), ...bumps.map((b) => b.severity), ...bumps.flatMap((b) => b.introduced.map((f) => sevOfFinding(f.severity)))];
   const sev = maxSev(sevs);
   const majors = fixed.filter((p) => p.copies.some((c) => line(c.dep.version, p.eco) !== line(c.target, p.eco)));
   const approve = SEVERITIES.filter((s) => sevs.includes(s) && ctx.policy.autoShip[s] !== "auto");
@@ -2594,6 +2604,8 @@ function prBody2(b) {
       ),
       ""
     );
+    const intro = b.bumps.flatMap((x) => x.introduced.map((f) => `- \`${safe3(x.name)}:${safe3(x.tag)}\` ${idLink(f.id)} (${f.severity}) in \`${safe3(f.package)}\` ${safe3(f.version)}`));
+    if (intro.length) out.push("**Introduced by the new digests** (below High; counted for the approval rules):", ...intro.slice(0, 30), ...intro.length > 30 ? [`- \u2026and ${intro.length - 30} more`] : [], "");
   }
   const summaries = b.fixed.flatMap((p) => p.vulns.filter((v) => v.summary).map((v) => `- ${link(v)}: ${cell(v.summary, 200)}`));
   if (summaries.length) out.push("<details><summary>Advisory summaries</summary>", "", ...[...new Set(summaries)], "", "</details>", "");

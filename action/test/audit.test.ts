@@ -1313,7 +1313,7 @@ describe('audit: base images', () => {
     const { w, posts, verdicts } = world({ grype: { [OLD]: [match('CVE-2026-1', 'Critical', ['3.1']), match('CVE-2026-2', 'High', [])], [NEW]: [match('CVE-2026-2', 'High', [])] } });
     const h = harness(w);
     expect(await h.run()).toBe(0);
-    expect(posts).toEqual([{ ref: 'audit-images', images: [{ name: NODE, digest: NEW }] }]);
+    expect(posts).toEqual([{ ref: 'audit-images', images: [{ name: NODE, digest: NEW }], mainOnly: true }]);
     expect(verdicts.map((v) => [v.package, v.result])).toEqual([
       [`docker:${NODE}@${OLD}`, 'flagged'],
       [`docker:${NODE}@${NEW}`, 'flagged'],
@@ -1327,6 +1327,25 @@ describe('audit: base images', () => {
     expect(h.labels).toEqual([{ n: 10, labels: ['decant:security', 'decant:critical'] }]);
     expect(h.syncs).toEqual([]); // no overlay: image bumps need no allow entry
     expect(h.summary()).toContain('bump fixes CVE-2026-1');
+  });
+
+  it('a bump that would introduce a new High/Critical is refused, and the summary says why', async () => {
+    const { w } = world({ grype: { [OLD]: [match('CVE-2026-1', 'Critical', ['3.1'])], [NEW]: [match('CVE-2026-5', 'High', ['9'])] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toEqual([]);
+    expect(h.summary()).toContain('would introduce CVE-2026-5 (high); not bumped');
+  });
+
+  it('lower-severity findings a bump introduces are listed in the PR and count toward approval', async () => {
+    const { w } = world({ grype: { [OLD]: [match('CVE-2026-1', 'High', ['3.1'])], [NEW]: [match('CVE-2026-6', 'Medium', [])] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    const body = h.prs[0]!.body as string;
+    expect(body).toContain('**Introduced by the new digests**');
+    expect(body).toContain('[CVE-2026-6](https://osv.dev/vulnerability/CVE-2026-6) (moderate) in `openssl` 3.0');
+    expect(body).toContain('autoShip.moderate is `approve`');
+    expect(h.autoMerges).toEqual([]);
   });
 
   it('the newer digest is still in cooldown → no PR, summary says when', async () => {

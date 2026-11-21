@@ -173,8 +173,9 @@ export function decant(
      * registry itself before starting any cooldown clock. A main report (sync token) replaces the images in
      * use, so it is not retried on a gateway error (a late retry could overwrite a newer report).
      */
-    async images(ref: string, images: { name: string; digest: string; files?: string[] }[], opts: { main?: boolean } = {}): Promise<ImagesReply> {
-      const res = await call('POST', '/api/images', { body: { ref, images }, retryStatuses: !opts.main });
+    async images(ref: string, images: { name: string; digest: string; files?: string[] }[], opts: { main?: boolean; mainOnly?: boolean } = {}): Promise<ImagesReply> {
+      const body = opts.mainOnly ? { ref, images, mainOnly: true } : { ref, images };
+      const res = await call('POST', '/api/images', { body, retryStatuses: !opts.main });
       return ok<ImagesReply>(res, 'decant POST /api/images');
     },
 

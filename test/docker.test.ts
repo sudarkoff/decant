@@ -173,6 +173,18 @@ describe('POST /api/images', () => {
     expect(r.body.images[0]).toMatchObject({ clock: 'unverified', decision: 'allow', allowed: true });
   });
 
+  it('mainOnly: allow entries in an overlay (even one named audit-images) cannot skip the audit\'s cooldown', async () => {
+    const d = `sha256:${'5'.repeat(64)}`;
+    pushed.add(`${NODE}@${d}`);
+    await syncPolicy(A.sync, 'dka', { project: 'dka' });
+    const overlay = await syncPolicy(A.ci, 'dka', { project: 'dka', allow: [{ package: `docker:${NODE}@${d}`, reason: 'sneaky', added: '2026-11-18' }] }, 'audit-images');
+    expect(overlay.status).toBe(200);
+    const viaOverlay = await images(A.ci, 'audit-images', [{ name: NODE, digest: d }]);
+    expect(viaOverlay.body.images[0]).toMatchObject({ decision: 'allow', allowed: true }); // a PR-style lookup honors its overlay
+    const r = await call('POST', '/api/images', A.ci, { ref: 'audit-images', images: [{ name: NODE, digest: d }], mainOnly: true });
+    expect(((await r.json()) as ImagesReply).images[0]).toMatchObject({ decision: 'cooldown', allowed: false });
+  });
+
   it('a private or unsupported-registry digest gets a per-project clock that never affects other projects', async () => {
     const priv = 'docker.io/private/app';
     const quay = 'quay.io/acme/app';

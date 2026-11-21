@@ -310,7 +310,8 @@ async function postImages(req: Request, env: Env, deps: Deps, projectId: string,
   const isMain = body.ref === project.main_ref;
   if (isMain && !isSyncToken) return err(403, `use the sync token for ${project.main_ref}`);
   if (!isMain && isSyncToken) return err(403, `sync tokens may only report ${project.main_ref}`);
-  return reply(await recordImages(env, deps, projectId, body.ref, isMain, list));
+  // mainOnly: decide with main's allows only (the audit's candidates), whatever overlay exists under `ref`.
+  return reply(await recordImages(env, deps, projectId, body.ref, isMain, list, body.mainOnly === true));
 }
 
 const DEP_ECOS = new Set(['npm', 'go']);

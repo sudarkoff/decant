@@ -58,6 +58,7 @@ export async function recordImages(
   ref: string,
   isMain: boolean,
   images: ImageIn[],
+  mainOnly = false,
 ): Promise<{ cooldownDays: number; images: ImageDecision[] }> {
   const db = env.DB;
   const now = deps.now();
@@ -144,7 +145,7 @@ export async function recordImages(
       `SELECT a.name AS name, a.version AS version FROM allows a JOIN projects pr ON pr.id = a.project_id
        WHERE a.project_id = ?1 AND a.ref IN (pr.main_ref, ?2) AND a.eco = 'docker'
          AND (a.advisory IS NULL OR a.verified_at IS NOT NULL)`,
-    ).bind(projectId, ref),
+    ).bind(projectId, mainOnly ? null : ref),
     db.prepare(
       `SELECT b.name AS name, b.version AS version, b.source AS source, b.reason AS reason FROM json_each(?1) j
        CROSS JOIN global_blocks b WHERE b.eco = 'docker' AND b.name = j.value ->> 0 AND b.version = j.value ->> 1

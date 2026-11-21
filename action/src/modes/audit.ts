@@ -579,7 +579,9 @@ async function publish(
   const imageVulns = new Set(bumps.flatMap((b) => b.fixes.map((f) => f.id)).filter((id) => !vulns.some((v) => v.id === id || v.aliases.includes(id))));
   const scope = [fixed.length ? plural(fixed.length, 'package', 'packages') : '', bumps.length ? plural(bumps.length, 'image', 'images') : ''].filter(Boolean).join(', ');
   const title = `decant: security fixes (${scope}, ${plural(vulns.length + imageVulns.size, 'advisory', 'advisories')})`;
-  const sevs = [...vulns.map(sevOf), ...bumps.map((b) => b.severity)];
+  // A bump's lower-severity introduced findings count toward the label and the approval rules too.
+  const sevOfFinding = (s: string): Severity => (s === 'critical' || s === 'high' || s === 'moderate' || s === 'low' ? s : 'moderate');
+  const sevs = [...vulns.map(sevOf), ...bumps.map((b) => b.severity), ...bumps.flatMap((b) => b.introduced.map((f) => sevOfFinding(f.severity)))];
   const sev = maxSev(sevs);
   // Crossing a major (or 0.x minor) line may break callers: never merge that unattended.
   const majors = fixed.filter((p) => p.copies.some((c) => line(c.dep.version, p.eco) !== line(c.target, p.eco)));
@@ -683,6 +685,8 @@ function prBody(b: {
       ),
       '',
     );
+    const intro = b.bumps.flatMap((x) => x.introduced.map((f) => `- \`${safe(x.name)}:${safe(x.tag)}\` ${idLink(f.id)} (${f.severity}) in \`${safe(f.package)}\` ${safe(f.version)}`));
+    if (intro.length) out.push('**Introduced by the new digests** (below High; counted for the approval rules):', ...intro.slice(0, 30), ...(intro.length > 30 ? [`- …and ${intro.length - 30} more`] : []), '');
   }
   const summaries = b.fixed.flatMap((p) => p.vulns.filter((v) => v.summary).map((v) => `- ${link(v)}: ${cell(v.summary, 200)}`));
   if (summaries.length) out.push('<details><summary>Advisory summaries</summary>', '', ...[...new Set(summaries)], '', '</details>', '');
