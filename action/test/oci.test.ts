@@ -101,6 +101,72 @@ describe('oci client', () => {
     expect(await ociClient({ fetch: big }).resolveTag('docker.io/library/node', '22')).toEqual({ status: 'error', message: 'manifest larger than 4 MB' });
   });
 
+  it('anonymous by default: the token request carries no Authorization header', async () => {
+    const f = registry((c) => (c.method === 'HEAD' ? new Response(null, { headers: { 'docker-content-digest': D } }) : undefined));
+    expect(await ociClient({ fetch: f }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'ok', digest: D });
+    expect(f.calls.find((c) => c.url === HUB_TOKEN)!.headers.get('authorization')).toBeNull();
+  });
+
+  it('with Docker Hub credentials, the auth.docker.io token request uses HTTP Basic (same scope and service)', async () => {
+    const f = registry((c) => (c.method === 'HEAD' ? new Response(null, { headers: { 'docker-content-digest': D } }) : undefined));
+    const oci = ociClient({ fetch: f, dockerHub: { username: 'hubuser', token: 'dckr_pat_secret' } });
+    expect(await oci.verifyDigest('docker.io/library/node', D)).toEqual({ status: 'ok', digest: D });
+    const tok = f.calls.find((c) => c.url === HUB_TOKEN)!;
+    expect(tok.headers.get('authorization')).toBe(`Basic ${btoa('hubuser:dckr_pat_secret')}`);
+    expect(f.calls.find((c) => c.method === 'HEAD')!.headers.get('authorization')).toBe('Bearer anon-tok');
+  });
+
+  it('never sends Docker Hub credentials to ghcr.io (or anywhere but auth.docker.io)', async () => {
+    const f = registry((c) => (c.method === 'HEAD' ? new Response(null, { headers: { 'docker-content-digest': D } }) : undefined));
+    const oci = ociClient({ fetch: f, dockerHub: { username: 'hubuser', token: 'dckr_pat_secret' } });
+    expect(await oci.verifyDigest('ghcr.io/acme/api', D)).toEqual({ status: 'ok', digest: D });
+    expect(await oci.verifyDigest('docker.io/library/node', D)).toEqual({ status: 'ok', digest: D });
+    const basic = `Basic ${btoa('hubuser:dckr_pat_secret')}`;
+    for (const c of f.calls) {
+      const leaks = c.url.includes('dckr_pat_secret') || [...c.headers.values()].some((v) => v.includes('dckr_pat_secret') || v === basic);
+      expect(leaks).toBe(new URL(c.url).host === 'auth.docker.io' && c.url === HUB_TOKEN);
+    }
+    expect(f.calls.filter((c) => new URL(c.url).host === 'ghcr.io').every((c) => c.headers.get('authorization') !== basic)).toBe(true);
+  });
+
+  it('credentials rejected by auth.docker.io are an error (unverified), not a private image', async () => {
+    const f = fakeFetch(() => new Response('', { status: 401 }));
+    expect(await ociClient({ fetch: f, dockerHub: { username: 'u', token: 't' } }).verifyDigest('docker.io/library/node', D)).toEqual({
+      status: 'error',
+      message: 'Docker Hub credentials rejected (HTTP 401)',
+    });
+  });
+
+  it('HTTP 429 from the token endpoint or the manifest is "rate limited"', async () => {
+    const tok429 = fakeFetch(() => new Response('', { status: 429 }));
+    expect(await ociClient({ fetch: tok429 }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: 'rate limited' });
+    const head429 = registry(() => new Response('', { status: 429 }));
+    expect(await ociClient({ fetch: head429 }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: 'rate limited' });
+  });
+
+  it('a shared token cache reuses a token across clients until expires_in (minus a margin), keyed by credentials', async () => {
+    let now = 1_000_000;
+    const f = fakeFetch((c) => {
+      if (c.url === HUB_TOKEN) return jsonRes({ token: c.headers.get('authorization') ? 'auth-tok' : 'anon-tok', expires_in: 300 });
+      return new Response(null, { headers: { 'docker-content-digest': D } });
+    });
+    const cache = new Map();
+    const mk = (creds?: { username: string; token: string }) => ociClient({ fetch: f, tokenCache: cache, now: () => now, dockerHub: creds });
+    const toks = () => f.calls.filter((c) => c.url === HUB_TOKEN).length;
+    await mk().verifyDigest('docker.io/library/node', D);
+    await mk().verifyDigest('docker.io/library/node', D);
+    expect(toks()).toBe(1);
+    await mk({ username: 'u', token: 't' }).verifyDigest('docker.io/library/node', D);
+    expect(toks()).toBe(2); // an anonymous token is never used for an authenticated client
+    expect(f.calls.at(-1)!.headers.get('authorization')).toBe('Bearer auth-tok');
+    now += 269_000;
+    await mk().verifyDigest('docker.io/library/node', D);
+    expect(toks()).toBe(2);
+    now += 2_000; // past expires_in minus 30 s
+    await mk().verifyDigest('docker.io/library/node', D);
+    expect(toks()).toBe(3);
+  });
+
   it('rejects an invalid tag without a request', async () => {
     const f = fakeFetch(() => undefined);
     expect((await ociClient({ fetch: f }).resolveTag('docker.io/library/node', '../x')).status).toBe('error');
