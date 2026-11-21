@@ -1,4 +1,4 @@
-import { ociClient } from '../oci';
+import { ociClient, type TokenCache } from '../oci';
 import type { Deps, Env } from '../types';
 import { decide } from './decide';
 import type { Policy } from './schema';
@@ -43,6 +43,9 @@ export interface ImageDecision {
 }
 
 type Row = Record<string, unknown>;
+
+/** Registry pull tokens shared by requests on this isolate, each until its expires_in (minus a margin). */
+const tokenCache: TokenCache = new Map();
 const key = (n: unknown, v: unknown) => `${String(n)}@${String(v)}`;
 
 /**
@@ -84,7 +87,9 @@ export async function recordImages(
   const clock = new Map<string, { clock: Clock; note?: string }>();
   const toShare: string[][] = [];
   const toOwn: string[][] = [];
-  const oci = ociClient({ fetch: deps.fetch, timeoutMs: deps.timeoutMs });
+  const dockerHub = env.DOCKERHUB_USERNAME && env.DOCKERHUB_TOKEN ? { username: env.DOCKERHUB_USERNAME, token: env.DOCKERHUB_TOKEN } : undefined;
+  const oci = ociClient({ fetch: deps.fetch, timeoutMs: deps.timeoutMs, dockerHub, tokenCache, now: () => deps.now().getTime() });
+  let rateLimitLogged = false;
   // Digests with no clock at all go first, so re-checking per-project ones can never starve new ones under the cap.
   const pending = uniq
     .filter((i) => !shared.has(key(i.name, i.digest)))
@@ -103,6 +108,13 @@ export async function recordImages(
       } else if (r.status === 'denied' || r.status === 'unsupported') {
         if (!own.has(k)) toOwn.push([i.name, i.digest]);
         clock.set(k, { clock: 'project', note: r.status === 'denied' ? 'anonymous pull refused (private image?)' : 'registry not supported' });
+      } else if (r.status === 'error' && r.message === 'rate limited') {
+        // Transient (Docker Hub limits anonymous pulls from shared egress): no clock; logged once per call.
+        if (!rateLimitLogged) {
+          rateLimitLogged = true;
+          console.warn(`decant: registry rate limited digest verification (${i.name.split('/')[0]}, ${dockerHub ? 'authenticated' : 'anonymous'})`);
+        }
+        clock.set(k, { clock: 'unverified', note: 'registry rate limited; retry later' });
       } else {
         // not-found (e.g. not pushed yet) or a registry error: no clock; fail closed until verified.
         clock.set(k, { clock: 'unverified', note: r.status === 'not-found' ? 'registry does not have this digest' : `registry error: ${r.message}` });
