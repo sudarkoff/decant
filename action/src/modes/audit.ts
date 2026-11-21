@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { formatPackageId, parsePackageId } from '../../../src/ids';
 import { parsePolicy, SEVERITIES, type AllowEntry, type Policy, type Severity } from '../../../src/policy/schema';
 import { compareVersions, parseVersion } from '../../../src/semver';
+import { auditImages, type ImageAudit, type ImageBump } from '../audit-images';
 import { defaultHeadCheckout } from '../checkout';
 import { decant, type DecantClient } from '../decant-client';
 import type { ActionDeps } from '../deps';
@@ -100,6 +101,7 @@ const uniqSorted = (vs: string[], eco: 'npm' | 'go') => [...new Set(vs)].sort((a
 const targetsOf = (p: Pkg) => uniqSorted(p.copies.map((c) => c.target), p.eco);
 const oldsOf = (p: Pkg) => uniqSorted(p.copies.map((c) => c.dep.version), p.eco);
 const idsOf = (p: Pkg) => targetsOf(p).map((t) => formatPackageId({ eco: p.eco, name: p.name, version: t }));
+const imageIds = (bs: ImageBump[]) => bs.map((b) => formatPackageId({ eco: 'docker', name: b.name, version: b.to }));
 
 /** The fix for `version` if the advisory affects it and names a valid fixed version; else null. */
 function validFix(v: Vuln, eco: 'npm' | 'go', name: string, version: string): string | null {
@@ -248,9 +250,21 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       tmpFile: async (ext) => `${await (tmp ??= deps.fs.mkdtemp(`${env.RUNNER_TEMP}/decant-audit-`))}/${randomUUID()}.${ext}`,
     };
 
+    // 3b. Base images: re-scan what is in use, and find digest bumps that cleared cooldown and fix High/Critical.
+    let images: ImageAudit = { bumps: [], files: [], lines: [] };
+    try {
+      images = await auditImages(deps, client, wd, repoPath);
+    } catch (e) {
+      if (systemic(e)) throw e;
+      const msg = redact((e as Error).message, [inputs.token, inputs.githubToken]);
+      images.lines.push(`- image audit failed: ${cell(msg)}`);
+      warning(`image audit failed: ${msg}`);
+    }
+    const bumps = images.bumps;
+
     // 4. One security PR for the whole run.
     let prLine = 'no fixable advisories';
-    if (pkgs.length) {
+    if (pkgs.length || bumps.length) {
       try {
         // A failed lookup must fail the run: guessing "no PR" could open a duplicate or reopen a declined set.
         const lookup = async <T>(what: string, f: () => Promise<T>): Promise<T> => {
@@ -263,19 +277,19 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
         };
         const open = await lookup('open', () => gh.findOpenPr(FIX_BRANCH));
         const closed = open ? null : await lookup('closed', () => gh.findClosedUnmergedPr(FIX_BRANCH));
-        const declined = (set: Pkg[]) => closed !== null && markerOf(closed.body) === auditSetHash(set.flatMap(idsOf));
+        const declined = (set: Pkg[]) => closed !== null && markerOf(closed.body) === auditSetHash([...set.flatMap(idsOf), ...imageIds(bumps)]);
         if (declined(pkgs)) {
           prLine = `declined (#${closed!.number} closed without merging the same fixes)`;
           for (const p of pkgs) outcomes.push({ pkg: p, result: 'declined', detail: `PR #${closed!.number}` });
         } else {
-          const batch = await syncOverlay(ctx, pkgs, outcomes);
+          const batch = pkgs.length ? await syncOverlay(ctx, pkgs, outcomes) : [];
           const locked = new Set(all.filter((d) => d.version).map(formatPackageId));
-          const { fixed, files } = await applyAll(ctx, batch, outcomes, locked);
-          if (!fixed.length) prLine = 'nothing to ship';
+          const { fixed, files } = batch.length ? await applyAll(ctx, batch, outcomes, locked) : { fixed: [] as Pkg[], files: [] };
+          if (!fixed.length && !bumps.length) prLine = 'nothing to ship';
           else if (!open && declined(fixed)) prLine = `declined (#${closed!.number} closed without merging the same fixes)`;
           else {
-            strayOverlayVersions(ctx, batch, fixed, files, locked);
-            prLine = await publish(ctx, fixed, files, open, outcomes, unfixed);
+            if (batch.length) strayOverlayVersions(ctx, batch, fixed, files, locked);
+            prLine = await publish(ctx, fixed, [...files, ...images.files], open, outcomes, unfixed, bumps);
           }
         }
       } catch (e) {
@@ -325,6 +339,7 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
         );
       }
     } else lines.push('No fixable advisories.');
+    if (images.lines.length) lines.push('', '### Base images', '', ...images.lines);
     const count = (r: Result) => outcomes.filter((o) => o.result === r).length;
     lines.push(
       '',
@@ -546,9 +561,10 @@ async function publish(
   open: Pr | null,
   outcomes: Outcome[],
   unfixed: { vuln: Vuln; dep: Dep }[],
+  bumps: ImageBump[] = [],
 ): Promise<string> {
   const { gh } = ctx;
-  const ids = fixed.flatMap(idsOf);
+  const ids = [...fixed.flatMap(idsOf), ...imageIds(bumps)];
   const hash = auditSetHash(ids);
   const added = fixed.flatMap((p) => allowEntries(ctx, p));
   const files = [...changed];
@@ -560,14 +576,17 @@ async function publish(
   }
 
   const vulns = [...new Map(fixed.flatMap((p) => p.vulns).map((v) => [v.id, v])).values()];
-  const title = `decant: security fixes (${plural(fixed.length, 'package', 'packages')}, ${plural(vulns.length, 'advisory', 'advisories')})`;
-  const sev = maxSev(vulns.map(sevOf));
+  const imageVulns = new Set(bumps.flatMap((b) => b.fixes.map((f) => f.id)).filter((id) => !vulns.some((v) => v.id === id || v.aliases.includes(id))));
+  const scope = [fixed.length ? plural(fixed.length, 'package', 'packages') : '', bumps.length ? plural(bumps.length, 'image', 'images') : ''].filter(Boolean).join(', ');
+  const title = `decant: security fixes (${scope}, ${plural(vulns.length + imageVulns.size, 'advisory', 'advisories')})`;
+  const sevs = [...vulns.map(sevOf), ...bumps.map((b) => b.severity)];
+  const sev = maxSev(sevs);
   // Crossing a major (or 0.x minor) line may break callers: never merge that unattended.
   const majors = fixed.filter((p) => p.copies.some((c) => line(c.dep.version, p.eco) !== line(c.target, p.eco)));
-  const approve = SEVERITIES.filter((s) => vulns.some((v) => sevOf(v) === s) && ctx.policy.autoShip[s] !== 'auto');
+  const approve = SEVERITIES.filter((s) => sevs.includes(s) && ctx.policy.autoShip[s] !== 'auto');
   const auto = !majors.length && !approve.length;
   const left = outcomes.filter((o) => o.result !== 'fixed' && o.result !== 'declined');
-  const body = prBody({ fixed, added, left, unfixed, auto, majors, approve, cooldownDays: ctx.policy.cooldownDays, paths: files.map((f) => f.path), hash });
+  const body = prBody({ fixed, added, left, unfixed, auto, majors, approve, cooldownDays: ctx.policy.cooldownDays, paths: files.map((f) => f.path), hash, bumps });
   const labels = ['decant:security', `decant:${sev}`];
 
   let pr: { number: number; nodeId: string; url: string };
@@ -633,19 +652,38 @@ function prBody(b: {
   cooldownDays: number;
   paths: string[];
   hash: string;
+  bumps: ImageBump[];
 }): string {
   const link = (v: Vuln) => `[${safe(v.id)}](${advisoryUrl(v.id)})`;
-  const out = [
-    `Security fixes from decant audit: ${plural(b.fixed.length, 'package', 'packages')} upgraded to versions that fix their advisories.`,
-    '',
-    '| Package | From → To | Advisories | Severity |',
-    '|---|---|---|---|',
-    ...b.fixed.map(
-      (p) =>
-        `| \`${safe(p.name)}\` | ${oldsOf(p).map(safe).join(', ')} → ${targetsOf(p).map(safe).join(', ')} | ${p.vulns.map(link).join(', ')} | ${maxSev(p.vulns.map(sevOf))} |`,
-    ),
-    '',
-  ];
+  const idLink = (id: string) => `[${safe(id)}](${advisoryUrl(id)})`;
+  const out: string[] = [];
+  if (b.fixed.length) {
+    out.push(
+      `Security fixes from decant audit: ${plural(b.fixed.length, 'package', 'packages')} upgraded to versions that fix their advisories.`,
+      '',
+      '| Package | From → To | Advisories | Severity |',
+      '|---|---|---|---|',
+      ...b.fixed.map(
+        (p) =>
+          `| \`${safe(p.name)}\` | ${oldsOf(p).map(safe).join(', ')} → ${targetsOf(p).map(safe).join(', ')} | ${p.vulns.map(link).join(', ')} | ${maxSev(p.vulns.map(sevOf))} |`,
+      ),
+      '',
+    );
+  }
+  if (b.bumps.length) {
+    const short = (d: string) => d.slice(0, 'sha256:'.length + 12);
+    out.push(
+      `Base image digest bumps: ${plural(b.bumps.length, 'image', 'images')} moved to the digest its tag points at now. Each new digest has cleared the ${b.cooldownDays}-day cooldown (counted from when decant first verified it) and removes the High/Critical findings listed.`,
+      '',
+      '| Image | From → To | Fixes | Severity |',
+      '|---|---|---|---|',
+      ...b.bumps.map(
+        (x) =>
+          `| \`${safe(x.name)}:${safe(x.tag)}\` | ${short(x.from)} → ${short(x.to)} | ${x.fixes.slice(0, 10).map((f) => idLink(f.id)).join(', ')}${x.fixes.length > 10 ? ', …' : ''} | ${x.severity} |`,
+      ),
+      '',
+    );
+  }
   const summaries = b.fixed.flatMap((p) => p.vulns.filter((v) => v.summary).map((v) => `- ${link(v)}: ${cell(v.summary, 200)}`));
   if (summaries.length) out.push('<details><summary>Advisory summaries</summary>', '', ...[...new Set(summaries)], '', '</details>', '');
   if (b.left.length) {
