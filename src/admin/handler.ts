@@ -4,7 +4,7 @@ import { verifyAdvisoryFix } from '../osv';
 import { clearDecisionCaches, forgetDenied } from '../policy/decider';
 import { parsePolicy, type Policy } from '../policy/schema';
 import { recordImages, type ImageIn } from '../policy/images';
-import { sanitizeDetails, verdictDetails } from '../verdict-details';
+import { hasKnownShape, sanitizeDetails, verdictDetails } from '../verdict-details';
 import { globalBlockStmt } from '../policy/store';
 import { DIGEST_RE, isImageRepo, PROJECT_ID_RE as ID_RE } from '../ids';
 import { formatPackageId, parsePackageId, type Deps, type Env, type PackageRef } from '../types';
@@ -392,13 +392,17 @@ async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): P
        WHERE ${SEVERITY_SQL('excluded.result')} >= ${SEVERITY_SQL('verdicts.result')}`,
     ).bind(ref.eco, ref.name, ref.version, scanner, scannerVersion, result, details, now.toISOString(), writer),
   ];
-  // This writer's own details, whatever the verdict row keeps: readers merge every writer's list.
-  if (Array.isArray(clean)) {
+  // This writer's own details (known scanner shapes only; others live on the verdict row alone), and only
+  // when the write was accepted at the stored severity: the upsert above ran first in this batch, so the
+  // row's result equals this one exactly when this write was not a downgrade.
+  if (hasKnownShape(scanner) && Array.isArray(clean)) {
     stmts.push(
       env.DB.prepare(
-        `INSERT INTO verdict_details (eco, name, version, scanner, project_id, details, at) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO verdict_details (eco, name, version, scanner, project_id, details, at)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS (
+           SELECT 1 FROM verdicts WHERE eco = ?1 AND name = ?2 AND version = ?3 AND scanner = ?4 AND result = ?8)
          ON CONFLICT (eco, name, version, scanner, project_id) DO UPDATE SET details = excluded.details, at = excluded.at`,
-      ).bind(ref.eco, ref.name, ref.version, scanner, writer, details, now.toISOString()),
+      ).bind(ref.eco, ref.name, ref.version, scanner, writer, details, now.toISOString(), result),
     );
   }
   if (result === 'malicious') {

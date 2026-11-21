@@ -50,6 +50,9 @@ function guarddogEntry(d: unknown): Entry | null {
   return { ident: rule, rank: 4, value: v };
 }
 
+/** Scanners whose details decant validates and keeps per writer. */
+export const hasKnownShape = (scanner: string) => entryOf(scanner) !== null;
+
 const entryOf = (scanner: string) => (scanner === 'grype' ? grypeEntry : scanner === 'guarddog' ? guarddogEntry : null);
 
 function entries(scanner: string, details: unknown): Entry[] | null {

@@ -258,6 +258,32 @@ describe('docker verdicts', () => {
     expect(list.some((x) => x.id === 'CVE-1' || x.id === '<script>' || x.id === 'CVE-9')).toBe(false);
   });
 
+  it("an unknown scanner's details never go per writer: they stay on the verdict row", async () => {
+    const id = `docker:${NODE}@sha256:${'3'.repeat(64)}`;
+    await call('PUT', '/api/verdicts', A.ci, { package: id, scanner: 'custom', scannerVersion: '1', result: 'flagged', details: [{ id: 'X-1' }] });
+    const n = await e.DB.prepare("SELECT COUNT(*) AS n FROM verdict_details WHERE scanner = 'custom'").first<{ n: number }>();
+    expect(n!.n).toBe(0);
+    expect(await details(id)).toEqual([{ id: 'X-1' }]);
+  });
+
+  it("a lower-severity write from another project does not change the details shown for a flagged verdict", async () => {
+    const id = `docker:${NODE}@sha256:${'4'.repeat(64)}`;
+    const crit = { id: 'CVE-2026-4242', severity: 'critical', package: 'glibc', version: '1', fixed: ['2'] };
+    const put = (token: string, result: string, d: unknown) => call('PUT', '/api/verdicts', token, { package: id, scanner: 'grype', scannerVersion: 'x', result, details: d });
+    await put(A.ci, 'flagged', [crit]);
+    await put(B.ci, 'clean', [{ id: 'CVE-2026-1', severity: 'low', package: 'p', version: '1', fixed: [] }]);
+    expect(await details(id)).toEqual([crit]);
+    const rows = await e.DB.prepare('SELECT project_id FROM verdict_details WHERE version = ?').bind(`sha256:${'4'.repeat(64)}`).all();
+    expect(rows.results).toEqual([{ project_id: 'dka' }]);
+    // The dashboard reads the same merged details: still the Critical, still flagged.
+    await e.DB.prepare("INSERT OR IGNORE INTO project_images (project_id, name, digest, files, synced_at) VALUES ('dka', ?, ?, '[]', 'x')")
+      .bind(NODE, `sha256:${'4'.repeat(64)}`)
+      .run();
+    const { attention } = await import('../src/dashboard/attention');
+    const open = (await attention(e, 'dka', 30, clock)).open.map((i) => i.key);
+    expect(open).toContain(`vuln:CVE-2026-4242:docker:${id.slice('docker:'.length)}:dka`);
+  });
+
   it('merges legacy string details (GuardDog rule names) too', async () => {
     const id = `npm:merge-me@1.0.0`;
     const put = (token: string, d: unknown) => call('PUT', '/api/verdicts', token, { package: id, scanner: 'guarddog', scannerVersion: 'x', result: 'flagged', details: d });
