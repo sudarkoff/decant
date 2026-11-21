@@ -66,22 +66,77 @@ const DIRECTIVE_RE = /^#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
 /** The parser directives BuildKit knows; any other `# key=value` is a comment. */
 const DIRECTIVES = new Set(['syntax', 'escape', 'check']);
 const HEREDOC_INSTRUCTIONS = new Set(['RUN', 'COPY', 'ADD']);
-const HEREDOC_RE = /<<(-?)(["']?)([A-Za-z0-9_]+)\2/g;
+/** Every Dockerfile instruction; any other logical line fails the parse (fail closed). */
+const INSTRUCTIONS = new Set([
+  'FROM', 'RUN', 'CMD', 'LABEL', 'MAINTAINER', 'EXPOSE', 'ENV', 'ADD', 'COPY', 'ENTRYPOINT',
+  'VOLUME', 'USER', 'WORKDIR', 'ARG', 'ONBUILD', 'STOPSIGNAL', 'HEALTHCHECK', 'SHELL',
+]);
 /** Docker's stage name rule (checked on the lowercased name). */
 const STAGE_RE = /^[a-z][a-z0-9_.-]*$/;
+const HEREDOC_WORD = /^(\d*)<<(-?)([^<]+)$/;
 
 /**
- * The heredocs an instruction opens, in order; a string when a `<<WORD` sits inside quotes, where decant
- * cannot tell whether BuildKit reads it as a heredoc (it fails closed rather than guess).
+ * Splits an instruction into shell words, keeping each word's raw text (quotes and escapes included).
+ * Null when a quote is never closed.
  */
-function heredocs(ins: string): { word: string; strip: boolean }[] | string {
+function shellWords(s: string, esc: string): string[] | null {
+  const words: string[] = [];
+  let cur = '';
+  let inWord = false;
+  let q: string | null = null;
+  for (let k = 0; k < s.length; k++) {
+    const ch = s[k]!;
+    if (q === "'") {
+      cur += ch;
+      if (ch === "'") q = null;
+      continue;
+    }
+    if (ch === '\\' || ch === esc) {
+      cur += ch + (s[k + 1] ?? '');
+      k++;
+      inWord = true;
+      continue;
+    }
+    if (q === '"') {
+      cur += ch;
+      if (ch === '"') q = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      q = ch;
+      cur += ch;
+      inWord = true;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (inWord) words.push(cur);
+      cur = '';
+      inWord = false;
+      continue;
+    }
+    cur += ch;
+    inWord = true;
+  }
+  if (q !== null) return null;
+  if (inWord) words.push(cur);
+  return words;
+}
+
+/**
+ * The heredocs an instruction opens, in order. A word is a heredoc only when the whole word is
+ * `[n]<<[-]NAME` (NAME possibly quoted); any other word containing `<<` (`<<<`, `a<<b`, `"<<X"`), or an
+ * unclosed quote, is an error string: decant cannot tell how BuildKit reads the rest of the file.
+ */
+function heredocs(ins: string, esc: string): { word: string; strip: boolean }[] | string {
+  const words = shellWords(ins, esc);
+  if (words === null) return 'unclosed quote; decant cannot tell how BuildKit reads the rest of the file';
   const out: { word: string; strip: boolean }[] = [];
-  for (const m of ins.matchAll(HEREDOC_RE)) {
-    const before = ins.slice(0, m.index);
-    const dq = (before.match(/"/g) ?? []).length;
-    const sq = (before.match(/'/g) ?? []).length;
-    if (dq % 2 === 1 || sq % 2 === 1) return `ambiguous heredoc <<${m[3]} inside quotes; decant cannot tell how BuildKit reads the rest of the file`;
-    out.push({ word: m[3]!, strip: m[1] === '-' });
+  for (const w of words) {
+    if (!w.includes('<<')) continue;
+    const m = HEREDOC_WORD.exec(w);
+    const name = m ? m[3]!.replace(/["'\\]/g, '') : '';
+    if (!m || name === '' || /\s/.test(name)) return `ambiguous heredoc ${w}; decant cannot tell how BuildKit reads the rest of the file`;
+    out.push({ word: name, strip: m[2] === '-' });
   }
   return out;
 }
@@ -171,12 +226,25 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     cur.parts.push(body.trim());
     if (continued) continue;
     const ins = { line: cur.line, text: cur.parts.join(' ').trim() };
-    instructions.push(ins);
     cur = null;
+    // Every logical line must be an instruction decant knows: anything else (`//` comments, a JSON header,
+    // a typo) means decant may not read the file the way BuildKit does.
+    const toks = ins.text.split(/\s+/);
+    const word = toks[0]!.toUpperCase();
+    if (!INSTRUCTIONS.has(word)) {
+      errors.push(`line ${ins.line}: decant couldn't parse this line (${toks[0]!.slice(0, 40)} is not a Dockerfile instruction)`);
+      continue;
+    }
+    const inner = word === 'ONBUILD' ? (toks[1] ?? '').toUpperCase() : '';
+    if (word === 'ONBUILD' && (!INSTRUCTIONS.has(inner) || inner === 'ONBUILD' || inner === 'FROM' || inner === 'MAINTAINER')) {
+      errors.push(`line ${ins.line}: decant couldn't parse this line (ONBUILD ${(toks[1] ?? '').slice(0, 40)} is not allowed)`);
+      continue;
+    }
+    instructions.push(ins);
     // Heredocs (RUN, COPY, ADD): their bodies are not instructions. Skip through each terminator in turn.
-    const word = /^\S+/.exec(ins.text)?.[0].toUpperCase() ?? '';
-    if (!HEREDOC_INSTRUCTIONS.has(word)) continue;
-    const docs = heredocs(ins.text);
+    if (!ins.text.includes('<<')) continue;
+    if (!HEREDOC_INSTRUCTIONS.has(word) && !HEREDOC_INSTRUCTIONS.has(inner)) continue; // literal text elsewhere
+    const docs = heredocs(ins.text, escape);
     if (typeof docs === 'string') {
       errors.push(`line ${ins.line}: ${docs}`);
       return { froms, errors }; // the rest of the file cannot be read with confidence
@@ -191,7 +259,17 @@ export function parseDockerfile(text: string): ParsedDockerfile {
       i = j;
     }
   }
-  if (cur !== null) instructions.push({ line: cur.line, text: cur.parts.join(' ').trim() });
+  if (cur !== null) errors.push(`line ${cur.line}: decant couldn't parse this line (the file ends inside a line continuation)`);
+
+  // A frontend named anywhere but a recognized `# syntax=` directive (a `// syntax=` line, a JSON header,
+  // a syntax line after the directive block) may still be what BuildKit runs: fail closed.
+  const firstIns = instructions[0]?.line ?? lines.length + 1;
+  for (let k = 0; k < Math.min(firstIns - 1, lines.length); k++) {
+    if (k + 1 === syn?.line) continue;
+    if (/syntax\s*[=:]|"syntax"/i.test(lines[k]!)) {
+      errors.push(`line ${k + 1}: ambiguous frontend (syntax) header; use one "# syntax=<image>@sha256:…" directive at the top of the file`);
+    }
+  }
 
   const globals = new Map<string, Arg>();
   const stages = new Set<string>();
@@ -265,7 +343,9 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     }
     if (stage) stages.add(stage);
   }
-  return { froms, errors };
+  // Report in file order (instruction errors are found before FROM errors).
+  const lineOf = (e: string) => Number(/^line (\d+)/.exec(e)?.[1] ?? 0);
+  return { froms, errors: errors.map((e, k) => ({ e, k })).sort((a, b) => lineOf(a.e) - lineOf(b.e) || a.k - b.k).map((x) => x.e) };
 }
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'vendor', 'testdata']);

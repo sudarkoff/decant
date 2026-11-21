@@ -159,6 +159,40 @@ describe('parseDockerfile: reading files the way BuildKit does', () => {
     expect(parseDockerfile(['# syntax=not a ref', `FROM node@${D}`].join('\n')).errors[0]).toMatch(/^line 1: syntax/);
   });
 
+  it('every logical line must be a known instruction: anything else fails closed', () => {
+    expect(parseDockerfile([`FROM node@${D}`, 'RUNN echo hi'].join('\n')).errors).toEqual([
+      "line 2: decant couldn't parse this line (RUNN is not a Dockerfile instruction)",
+    ]);
+    expect(parseDockerfile([`FROM node@${D}`, 'ONBUILD FROM alpine', 'ONBUILD NOPE x', 'ONBUILD RUN ok'].join('\n')).errors).toEqual([
+      "line 2: decant couldn't parse this line (ONBUILD FROM is not allowed)",
+      "line 3: decant couldn't parse this line (ONBUILD NOPE is not allowed)",
+    ]);
+    expect(parseDockerfile([`FROM node@${D} \\`].join('\n')).errors[0]).toMatch(/ends inside a line continuation/);
+  });
+
+  it('a // syntax= line or a JSON syntax header is not something decant reads: fail closed', () => {
+    const slash = parseDockerfile(['// syntax=docker/dockerfile:1', `FROM node@${D}`].join('\n'));
+    expect(slash.errors).toEqual([
+      "line 1: decant couldn't parse this line (// is not a Dockerfile instruction)",
+      'line 1: ambiguous frontend (syntax) header; use one "# syntax=<image>@sha256:…" directive at the top of the file',
+    ]);
+    const json = parseDockerfile(['{"syntax": "docker/dockerfile:1"}', `FROM node@${D}`].join('\n'));
+    expect(json.errors.length).toBeGreaterThan(0);
+    expect(json.errors.join('\n')).toContain("decant couldn't parse");
+    // A syntax comment after the directive block is ambiguous too.
+    expect(parseDockerfile(['# hello', '# syntax=docker/dockerfile:1', `FROM node@${D}`].join('\n')).errors[0]).toMatch(/^line 2: ambiguous frontend/);
+  });
+
+  it('heredocs are whole shell words: names with . or -, digits before <<; <<< and embedded << fail', () => {
+    const ok = parseDockerfile([`FROM node@${D}`, 'RUN 3<<my-doc.v1 cat', 'FROM fake', 'my-doc.v1', 'FROM alpine'].join('\n'));
+    expect(ok.errors).toEqual([]);
+    expect(ok.froms.map((f) => f.text)).toEqual([`node@${D}`, 'alpine']);
+    expect(parseDockerfile([`FROM node@${D}`, 'RUN cat <<<"x"', 'FROM alpine'].join('\n')).errors[0]).toMatch(/^line 2: ambiguous heredoc <<<"x"/);
+    expect(parseDockerfile([`FROM node@${D}`, 'RUN cat<<EOF', 'EOF'].join('\n')).errors[0]).toMatch(/^line 2: ambiguous heredoc cat<<EOF/);
+    expect(parseDockerfile([`FROM node@${D}`, "RUN echo 'unclosed <<EOF"].join('\n')).errors[0]).toMatch(/^line 2: unclosed quote/);
+    expect(parseDockerfile([`FROM node@${D}`, 'RUN <<END.X', 'echo'].join('\n')).errors).toEqual(['line 2: heredoc <<END.X is never terminated']);
+  });
+
   it('stage names follow Docker; a reference with / : or @ is never a stage', () => {
     expect(parseDockerfile('FROM node AS 1bad').errors[0]).toMatch(/invalid stage name/);
     expect(parseDockerfile('FROM node AS a/b').errors[0]).toMatch(/invalid stage name/);

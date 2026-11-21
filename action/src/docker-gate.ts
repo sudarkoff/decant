@@ -94,7 +94,7 @@ export async function dockerGate(o: GateOpts): Promise<{ rows: ImageRow[]; fatal
     const parsed = parseDockerfile(await deps.fs.readFile(join(wd, rel)));
     for (const e of parsed.errors) {
       rows.push({ file: rel, line: Number(/^line (\d+)/.exec(e)?.[1] ?? 0), image: '—', cooldown: '—', grype: '—', problems: ['cannot read this line (see log)'], notes: [] });
-      error(`${safe(rel)}: ${safeText(e)}`, join(wd, rel));
+      error(safeText(e.replace(/^line (\d+): /, `${rel}:$1: `)), join(wd, rel));
     }
     for (const f of parsed.froms) {
       if (f.kind !== 'image' || !f.ref) continue;
