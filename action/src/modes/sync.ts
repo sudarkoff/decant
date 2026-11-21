@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { parsePolicy, type Policy } from '../../../src/policy/schema';
 import { decant, type DecantClient } from '../decant-client';
 import { capSummary, dependencySummary } from '../dep-summary';
+import { findDockerfiles, parseDockerfile } from '../dockerfile';
 import type { ActionDeps } from '../deps';
 import { isForkPr, readPayload, type Payload } from '../event';
 import { error, mask, notice, setOutput, warning } from '../gh-io';
@@ -74,6 +75,48 @@ async function sendDependencySummary(deps: ActionDeps, client: DecantClient, wd:
     if (res.status < 200 || res.status >= 300) warning(`decant did not store the dependency summary (HTTP ${res.status}): ${errorText(res.body)}`);
   } catch (e) {
     warning(`dependency summary not sent: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+const MAX_IMAGES = 200;
+const safe = (s: string) => s.replace(/[^A-Za-z0-9@._~/+:-]/g, '?');
+
+/**
+ * Default branch only: report the base images pinned in the Dockerfiles (repo, digest, files). decant starts
+ * each digest's cooldown clock (after verifying it in the registry) and lists them as in use for the
+ * dashboard. Best effort: every failure is a warning; the PR scan is what gates.
+ */
+async function sendImages(deps: ActionDeps, client: DecantClient, wd: string, ref: string): Promise<void> {
+  try {
+    const tree = await findDockerfiles(wd, deps.fs);
+    const byKey = new Map<string, { name: string; digest: string; files: string[] }>();
+    let unpinned = 0;
+    for (const rel of tree.files) {
+      const p = parseDockerfile(await deps.fs.readFile(join(wd, rel)));
+      if (p.errors.length) warning(`${safe(rel)}: ${p.errors.length} line(s) decant cannot read; the PR scan fails on them`);
+      for (const f of p.froms) {
+        if (f.kind !== 'image' || !f.ref) continue;
+        if (!f.ref.digest) {
+          unpinned++;
+          continue;
+        }
+        const k = `${f.ref.name}@${f.ref.digest}`;
+        const cur = byKey.get(k) ?? { name: f.ref.name, digest: f.ref.digest, files: [] };
+        if (!cur.files.includes(rel) && cur.files.length < 20) cur.files.push(rel);
+        byKey.set(k, cur);
+      }
+    }
+    if (unpinned) warning(`${unpinned} base image(s) on the default branch are not pinned by digest; see docs/adopt.md`);
+    let images = [...byKey.values()];
+    if (images.length > MAX_IMAGES) {
+      warning(`${images.length} base images; reporting the first ${MAX_IMAGES}`);
+      images = images.slice(0, MAX_IMAGES);
+    }
+    const r = await client.images(ref, images, { main: true });
+    const waiting = r.images.filter((i) => i.clock === 'unverified');
+    if (waiting.length) warning(`decant could not verify ${waiting.length} image digest(s) in the registry yet: ${waiting.slice(0, 5).map((i) => safe(`${i.name}@${i.digest.slice(0, 19)}`)).join(', ')}`);
+  } catch (e) {
+    warning(`base images not reported: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -151,7 +194,10 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
   const client = decant(deps.fetch, inputs.decantUrl, token, { sleep: deps.sleep });
   const res = await client.syncPolicy(project, raw, env.GITHUB_SHA ?? '', ref);
   if (res.status < 200 || res.status >= 300) return fail(`decant rejected the policy (HTTP ${res.status}): ${errorText(res.body)}`);
-  if (event !== 'pull_request') await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? '');
+  if (event !== 'pull_request') {
+    await sendDependencySummary(deps, client, inputs.workingDirectory, project, env.GITHUB_SHA ?? '');
+    await sendImages(deps, client, inputs.workingDirectory, ref);
+  }
   setOutput('ref', ref, env);
   return 0;
 }
