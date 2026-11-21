@@ -89,7 +89,7 @@ describe('parseDockerfile', () => {
   it('joins line continuations, skips comments (also inside continuations), keeps the first line number', () => {
     const r = parseDockerfile(
       [
-        '# syntax=docker/dockerfile:1',
+        '# a leading comment',
         '  # a comment',
         'FROM \\',
         '# comment inside the continuation',
@@ -114,6 +114,57 @@ describe('parseDockerfile', () => {
     expect(r.froms.filter((f) => f.kind !== 'invalid')).toEqual([]);
     expect(r.errors).toHaveLength(5);
     expect(r.errors[3]).toContain('line 4');
+  });
+});
+
+describe('parseDockerfile: reading files the way BuildKit does', () => {
+  it('a fake FROM inside a heredoc is not a FROM', () => {
+    const r = parseDockerfile([`FROM node@${D}`, 'RUN <<EOF', 'FROM alpine:3.20', 'EOF', 'COPY <<-"END" /x', '\tFROM busybox', '\tEND'].join('\n'));
+    expect(r.errors).toEqual([]);
+    expect(r.froms.map((f) => f.text)).toEqual([`node@${D}`]);
+  });
+
+  it('a real unpinned FROM after heredocs (several on one line) is seen', () => {
+    const r = parseDockerfile([`FROM node@${D}`, "RUN <<A cat - <<'B'", 'a', 'A', 'b', 'B', 'FROM alpine:3.20'].join('\n'));
+    expect(r.errors).toEqual([]);
+    expect(r.froms.map((f) => f.text)).toEqual([`node@${D}`, 'alpine:3.20']);
+  });
+
+  it('an unterminated or ambiguous (quoted) heredoc fails closed', () => {
+    expect(parseDockerfile([`FROM node@${D}`, 'RUN <<EOF', 'echo hi'].join('\n')).errors).toEqual(['line 2: heredoc <<EOF is never terminated']);
+    expect(parseDockerfile([`FROM node@${D}`, 'RUN echo "<<EOF"', 'FROM alpine'].join('\n')).errors[0]).toMatch(/^line 2: ambiguous heredoc/);
+    // Not a heredoc instruction: << means nothing there.
+    expect(parseDockerfile([`FROM node@${D}`, 'LABEL x="<<EOF"', 'FROM alpine'].join('\n')).froms).toHaveLength(2);
+  });
+
+  it('a late escape directive is a comment (ignored), as in BuildKit', () => {
+    const r = parseDockerfile(['FROM `', `  node@${D}`, '# escape=`'].join('\n'));
+    expect(r.errors[0]).toMatch(/^line 1: FROM `/);
+    const blankFirst = parseDockerfile(['', '# escape=`', 'FROM node:22 `', '  AS x'].join('\n'));
+    expect(blankFirst.froms[0]!.kind).toBe('invalid'); // escape not applied: the backtick is literal
+  });
+
+  it('an unknown directive ends the directive block; a repeated or invalid one is an error', () => {
+    const r = parseDockerfile(['# foo=bar', '# escape=`', 'FROM `', `  node@${D}`].join('\n'));
+    expect(r.froms[0]!.kind).toBe('invalid');
+    expect(parseDockerfile(['# escape=`', '# ESCAPE=`', `FROM node@${D}`].join('\n')).errors).toEqual(['line 2: parser directive escape is repeated']);
+    expect(parseDockerfile(['# escape=x', `FROM node@${D}`].join('\n')).errors).toEqual(['line 1: invalid escape directive (BuildKit accepts \\ or `)']);
+  });
+
+  it('the syntax directive is an image the build runs: gated like FROM', () => {
+    const r = parseDockerfile(['# syntax=docker/dockerfile:1', '# check=skip=all', `FROM node@${D}`].join('\n'));
+    expect(r.froms[0]).toMatchObject({ line: 1, kind: 'image', syntax: true, ref: { name: 'docker.io/docker/dockerfile', tag: '1' } });
+    expect(r.froms[0]!.ref!.digest).toBeUndefined();
+    expect(parseDockerfile([`#syntax=docker/dockerfile:1@${E}`, `FROM node@${D}`].join('\n')).froms[0]).toMatchObject({ syntax: true, ref: { digest: E } });
+    expect(parseDockerfile(['# syntax=not a ref', `FROM node@${D}`].join('\n')).errors[0]).toMatch(/^line 1: syntax/);
+  });
+
+  it('stage names follow Docker; a reference with / : or @ is never a stage', () => {
+    expect(parseDockerfile('FROM node AS 1bad').errors[0]).toMatch(/invalid stage name/);
+    expect(parseDockerfile('FROM node AS a/b').errors[0]).toMatch(/invalid stage name/);
+    const r = parseDockerfile([`FROM node@${D} AS app.v2`, 'FROM app.v2', `FROM ghcr.io/x/app@${E} AS ok_1`].join('\n'));
+    expect(r.errors).toEqual([]);
+    expect(r.froms.map((f) => f.kind)).toEqual(['image', 'stage', 'image']);
   });
 });
 

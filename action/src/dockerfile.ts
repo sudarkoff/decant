@@ -54,13 +54,37 @@ export type FromLine = {
   /** This stage's name (lowercase), from `AS name`. */
   stage?: string;
   ref?: ImageRef;
+  /** The `# syntax=` frontend image (code BuildKit runs), not a FROM. */
+  syntax?: true;
 };
 
 export type ParsedDockerfile = { froms: FromLine[]; errors: string[] };
 
 type Arg = { value: string | undefined };
 
-const DIRECTIVE_RE = /^#\s*([A-Za-z]+)\s*=\s*(.*?)\s*$/;
+const DIRECTIVE_RE = /^#\s*([A-Za-z][A-Za-z0-9]*)\s*=\s*(.+?)\s*$/;
+/** The parser directives BuildKit knows; any other `# key=value` is a comment. */
+const DIRECTIVES = new Set(['syntax', 'escape', 'check']);
+const HEREDOC_INSTRUCTIONS = new Set(['RUN', 'COPY', 'ADD']);
+const HEREDOC_RE = /<<(-?)(["']?)([A-Za-z0-9_]+)\2/g;
+/** Docker's stage name rule (checked on the lowercased name). */
+const STAGE_RE = /^[a-z][a-z0-9_.-]*$/;
+
+/**
+ * The heredocs an instruction opens, in order; a string when a `<<WORD` sits inside quotes, where decant
+ * cannot tell whether BuildKit reads it as a heredoc (it fails closed rather than guess).
+ */
+function heredocs(ins: string): { word: string; strip: boolean }[] | string {
+  const out: { word: string; strip: boolean }[] = [];
+  for (const m of ins.matchAll(HEREDOC_RE)) {
+    const before = ins.slice(0, m.index);
+    const dq = (before.match(/"/g) ?? []).length;
+    const sq = (before.match(/'/g) ?? []).length;
+    if (dq % 2 === 1 || sq % 2 === 1) return `ambiguous heredoc <<${m[3]} inside quotes; decant cannot tell how BuildKit reads the rest of the file`;
+    out.push({ word: m[3]!, strip: m[1] === '-' });
+  }
+  return out;
+}
 const VAR_RE = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-+])([^}]*))?\}|([A-Za-z_][A-Za-z0-9_]*))/g;
 
 function unquote(v: string): string {
@@ -102,38 +126,75 @@ function substitute(s: string, args: Map<string, Arg>): { text: string; missing:
  * reference decant cannot resolve statically (ARG without a default) is an error, never a guess.
  */
 export function parseDockerfile(text: string): ParsedDockerfile {
-  const lines = text.split(/\r?\n/);
-  let escape = '\\';
+  const lines = text.replace(/^﻿/, '').split(/\r?\n/);
+  const froms: FromLine[] = [];
+  const errors: string[] = [];
+
+  // Parser directives, as BuildKit reads them: only at the very top, one per line, known keys only. The
+  // first blank line, comment, unknown directive or instruction ends the block; later ones are comments.
+  const directives = new Map<string, { value: string; line: number }>();
   let i = 0;
-  // Parser directives: only at the very top.
   for (; i < lines.length; i++) {
     const m = DIRECTIVE_RE.exec(lines[i]!.trim());
-    if (!m) break;
-    if (m[1]!.toLowerCase() === 'escape' && (m[2] === '`' || m[2] === '\\')) escape = m[2]!;
+    if (!m || !DIRECTIVES.has(m[1]!.toLowerCase())) break;
+    const k = m[1]!.toLowerCase();
+    if (directives.has(k)) errors.push(`line ${i + 1}: parser directive ${k} is repeated`);
+    else directives.set(k, { value: m[2]!, line: i + 1 });
   }
+  let escape = '\\';
+  const esc = directives.get('escape');
+  if (esc) {
+    if (esc.value === '`' || esc.value === '\\') escape = esc.value;
+    else errors.push(`line ${esc.line}: invalid escape directive (BuildKit accepts \\ or \`)`);
+  }
+  // The syntax directive names the frontend image BuildKit runs to build this file: gated like a FROM.
+  const syn = directives.get('syntax');
+  if (syn) {
+    const ref = parseImageRef(syn.value);
+    if (ref) froms.push({ line: syn.line, kind: 'image', raw: syn.value, text: syn.value, ref, syntax: true });
+    else {
+      errors.push(`line ${syn.line}: syntax=${syn.value}: not a valid image reference`);
+      froms.push({ line: syn.line, kind: 'invalid', raw: syn.value, text: '', syntax: true });
+    }
+  }
+
   const instructions: { line: number; text: string }[] = [];
   let cur: { line: number; parts: string[] } | null = null;
   for (; i < lines.length; i++) {
     const physical = lines[i]!;
     const t = physical.trim();
-    if (cur === null && (t === '' || t.startsWith('#'))) continue;
-    if (cur !== null && (t === '' || t.startsWith('#'))) continue; // comment or blank inside a continuation
+    if (t === '' || t.startsWith('#')) continue; // outside, or a comment/blank inside a continuation
     const trimmedEnd = physical.replace(/\s+$/, '');
     const continued = trimmedEnd.endsWith(escape);
     const body = continued ? trimmedEnd.slice(0, -1) : trimmedEnd;
     if (cur === null) cur = { line: i + 1, parts: [] };
     cur.parts.push(body.trim());
-    if (!continued) {
-      instructions.push({ line: cur.line, text: cur.parts.join(' ').trim() });
-      cur = null;
+    if (continued) continue;
+    const ins = { line: cur.line, text: cur.parts.join(' ').trim() };
+    instructions.push(ins);
+    cur = null;
+    // Heredocs (RUN, COPY, ADD): their bodies are not instructions. Skip through each terminator in turn.
+    const word = /^\S+/.exec(ins.text)?.[0].toUpperCase() ?? '';
+    if (!HEREDOC_INSTRUCTIONS.has(word)) continue;
+    const docs = heredocs(ins.text);
+    if (typeof docs === 'string') {
+      errors.push(`line ${ins.line}: ${docs}`);
+      return { froms, errors }; // the rest of the file cannot be read with confidence
+    }
+    for (const d of docs) {
+      let j = i + 1;
+      while (j < lines.length && (d.strip ? lines[j]!.replace(/^\t+/, '') : lines[j]!) !== d.word) j++;
+      if (j >= lines.length) {
+        errors.push(`line ${ins.line}: heredoc <<${d.word} is never terminated`);
+        return { froms, errors };
+      }
+      i = j;
     }
   }
   if (cur !== null) instructions.push({ line: cur.line, text: cur.parts.join(' ').trim() });
 
   const globals = new Map<string, Arg>();
   const stages = new Set<string>();
-  const froms: FromLine[] = [];
-  const errors: string[] = [];
   let seenFrom = false;
   for (const ins of instructions) {
     const m = /^(\S+)\s*(.*)$/.exec(ins.text);
@@ -172,7 +233,13 @@ export function parseDockerfile(text: string): ParsedDockerfile {
       continue;
     }
     let stage: string | undefined;
-    if (toks.length === 3 && toks[1]!.toLowerCase() === 'as') stage = toks[2]!.toLowerCase();
+    if (toks.length === 3 && toks[1]!.toLowerCase() === 'as') {
+      stage = toks[2]!.toLowerCase();
+      if (!STAGE_RE.test(stage)) {
+        bad(`invalid stage name ${toks[2]}`);
+        continue;
+      }
+    }
     else if (toks.length !== 1) {
       bad('expected FROM [--platform=…] <image> [AS <name>]');
       continue;
@@ -186,7 +253,7 @@ export function parseDockerfile(text: string): ParsedDockerfile {
     const image = sub.text;
     const base = { line: ins.line, raw: rest, text: image, ...(platform ? { platform } : {}), ...(stage ? { stage } : {}) };
     if (image.toLowerCase() === 'scratch') froms.push({ ...base, kind: 'scratch' });
-    else if (stages.has(image.toLowerCase())) froms.push({ ...base, kind: 'stage' });
+    else if (!/[/:@]/.test(image) && stages.has(image.toLowerCase())) froms.push({ ...base, kind: 'stage' });
     else {
       const ref = parseImageRef(image);
       if (!ref) {
