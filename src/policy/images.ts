@@ -85,7 +85,10 @@ export async function recordImages(
   const toShare: string[][] = [];
   const toOwn: string[][] = [];
   const oci = ociClient({ fetch: deps.fetch, timeoutMs: deps.timeoutMs });
-  const pending = uniq.filter((i) => !shared.has(key(i.name, i.digest)));
+  // Digests with no clock at all go first, so re-checking per-project ones can never starve new ones under the cap.
+  const pending = uniq
+    .filter((i) => !shared.has(key(i.name, i.digest)))
+    .sort((a, b) => Number(own.has(key(a.name, a.digest))) - Number(own.has(key(b.name, b.digest))));
   await Promise.all(
     pending.map(async (i, n) => {
       const k = key(i.name, i.digest);

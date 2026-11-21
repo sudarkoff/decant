@@ -52,34 +52,68 @@ export type OciOpts = { fetch: typeof fetch; timeoutMs?: number };
 
 const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 
+/** A manifest larger than this is not one decant hashes (an index or manifest is a few KB). */
+export const MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
+
+/** The body, or null when it is larger than `max` (stops reading at the cap). */
+async function readCapped(res: Response, max: number): Promise<ArrayBuffer | null> {
+  if (Number(res.headers.get('content-length') ?? '0') > max) {
+    await res.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!res.body) return new ArrayBuffer(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out.buffer;
+}
+
 async function sha256(bytes: ArrayBuffer): Promise<string> {
   const h = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
   return `sha256:${[...h].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
-/** One OCI client; anonymous pull tokens are cached per repository for its lifetime (one request or run). */
+/** One OCI client; anonymous pull tokens are cached per registry and repository for its lifetime (one request or run). */
 export function ociClient(o: OciOpts) {
   const timeoutMs = o.timeoutMs ?? 10_000;
   const tokens = new Map<string, Promise<string | 'denied'>>();
 
   async function get(url: string, init: RequestInit = {}): Promise<Response> {
-    return o.fetch(url, { ...init, redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) });
+    // No redirects: a 3xx is an error (decant talks only to the registry hosts it knows).
+    return o.fetch(url, { ...init, redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
   }
 
-  async function token(reg: Registry, path: string): Promise<string | 'denied'> {
-    let t = tokens.get(path);
+  async function token(registry: string, reg: Registry, path: string): Promise<string | 'denied'> {
+    const key = `${registry}/${path}`;
+    let t = tokens.get(key);
     if (!t) {
       t = (async () => {
         const res = await get(reg.token(path));
         if (res.status === 401 || res.status === 403) return 'denied';
-        if (!res.ok) throw new Error(`token endpoint HTTP ${res.status}`);
+        if (!res.ok || res.status >= 300) throw new Error(`token endpoint HTTP ${res.status}`);
         const body = (await res.json()) as { token?: unknown; access_token?: unknown };
         const v = typeof body.token === 'string' ? body.token : typeof body.access_token === 'string' ? body.access_token : '';
         if (!v) throw new Error('token endpoint returned no token');
         return v;
       })();
-      tokens.set(path, t);
-      t.catch(() => tokens.delete(path));
+      tokens.set(key, t);
+      t.catch(() => tokens.delete(key));
     }
     return t;
   }
@@ -96,20 +130,23 @@ export function ociClient(o: OciOpts) {
     const byDigest = DIGEST_RE.test(reference);
     if (!byDigest && !TAG_RE.test(reference)) return { status: 'error', message: 'invalid tag' };
     try {
-      const t = await token(reg, path);
+      const t = await token(registry, reg, path);
       if (t === 'denied') return { status: 'denied' };
       const url = `${reg.api}/v2/${path}/manifests/${reference}`;
       const headers = { accept: MANIFEST_ACCEPT, authorization: `Bearer ${t}` };
       let res = await get(url, { method: 'HEAD', headers });
       if (res.status === 404) return { status: 'not-found' };
-      if (res.status === 401 || res.status === 403) return { status: 'denied' };
-      if (!res.ok) return { status: 'error', message: `HTTP ${res.status}` };
+      // Refused with the token the registry just issued: not evidence of a private image; try again later.
+      if (res.status === 401 || res.status === 403) return { status: 'error', message: `HTTP ${res.status} with an anonymous token` };
+      if (!res.ok || res.status >= 300) return { status: 'error', message: `HTTP ${res.status}` };
       let digest = res.headers.get('docker-content-digest');
       if (digest === null) {
         res = await get(url, { headers });
         if (res.status === 404) return { status: 'not-found' };
-        if (!res.ok) return { status: 'error', message: `HTTP ${res.status}` };
-        digest = await sha256(await res.arrayBuffer());
+        if (!res.ok || res.status >= 300) return { status: 'error', message: `HTTP ${res.status}` };
+        const body = await readCapped(res, MAX_MANIFEST_BYTES);
+        if (body === null) return { status: 'error', message: 'manifest larger than 4 MB' };
+        digest = await sha256(body);
       }
       if (!DIGEST_RE.test(digest)) return { status: 'error', message: 'registry returned a malformed digest' };
       if (byDigest && digest !== reference) return { status: 'error', message: 'registry returned a different digest' };

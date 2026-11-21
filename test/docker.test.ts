@@ -210,6 +210,16 @@ describe('POST /api/images', () => {
     expect(await e.DB.prepare("SELECT 1 FROM versions WHERE eco = 'docker' AND name = ?").bind(quay).first()).toBeNull();
   });
 
+  it('digests with no clock are verified before per-project ones, so the cap cannot starve them', async () => {
+    clock = new Date('2026-11-19T12:00:00Z');
+    const priv = Array.from({ length: 10 }, (_, i) => ({ name: 'quay.io/acme/p', digest: `sha256:${(i + 300).toString(16).padStart(64, 'a')}` }));
+    await images(A.ci, 'pr-9', priv); // per-project clocks for all ten
+    const fresh = { name: 'docker.io/library/redis', digest: `sha256:${'7'.repeat(64)}` };
+    pushed.add(`${fresh.name}@${fresh.digest}`);
+    const r = await images(A.ci, 'pr-9', [...priv, fresh]);
+    expect(r.body.images.find((i) => i.digest === fresh.digest)!.clock).toBe('shared');
+  });
+
   it('verifies at most MAX_VERIFY new digests per call; the rest stay unverified', async () => {
     const many = Array.from({ length: 12 }, (_, i) => ({ name: 'docker.io/library/busybox', digest: `sha256:${(i + 100).toString(16).padStart(64, 'e')}` }));
     for (const m of many) pushed.add(`${m.name}@${m.digest}`);

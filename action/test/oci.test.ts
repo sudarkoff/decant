@@ -73,6 +73,34 @@ describe('oci client', () => {
     expect(f.calls.filter((c) => c.url === HUB_TOKEN)).toHaveLength(1);
   });
 
+  it('tokens are cached per registry and repository: docker.io/acme/app and ghcr.io/acme/app do not share one', async () => {
+    const f = fakeFetch((c) => {
+      const u = new URL(c.url);
+      if (u.pathname === '/token') return jsonRes({ token: u.host === 'ghcr.io' ? 'gh' : 'hub' });
+      const want = u.host === 'ghcr.io' ? 'Bearer gh' : 'Bearer hub';
+      return c.headers.get('authorization') === want ? new Response(null, { headers: { 'docker-content-digest': D } }) : new Response('', { status: 401 });
+    });
+    const oci = ociClient({ fetch: f });
+    expect(await oci.verifyDigest('docker.io/acme/app', D)).toEqual({ status: 'ok', digest: D });
+    expect(await oci.verifyDigest('ghcr.io/acme/app', D)).toEqual({ status: 'ok', digest: D });
+    expect(f.calls.filter((c) => new URL(c.url).pathname === '/token')).toHaveLength(2);
+  });
+
+  it('a 401/403 on the manifest after a fresh anonymous token is an error (unverified), never denied', async () => {
+    for (const status of [401, 403]) {
+      const f = registry(() => new Response('', { status }));
+      expect(await ociClient({ fetch: f }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: `HTTP ${status} with an anonymous token` });
+    }
+  });
+
+  it('never follows redirects (3xx is an error); a manifest over 4 MB is not hashed', async () => {
+    const r = registry((c) => (c.method === 'HEAD' ? new Response(null, { status: 307, headers: { location: 'https://elsewhere.example/x' } }) : undefined));
+    expect(await ociClient({ fetch: r }).resolveTag('docker.io/library/node', '22')).toEqual({ status: 'error', message: 'HTTP 307' });
+    expect(r.calls.some((c) => c.url.includes('elsewhere'))).toBe(false);
+    const big = registry((c) => (c.method === 'HEAD' ? new Response(null) : new Response(new Uint8Array(4 * 1024 * 1024 + 1))));
+    expect(await ociClient({ fetch: big }).resolveTag('docker.io/library/node', '22')).toEqual({ status: 'error', message: 'manifest larger than 4 MB' });
+  });
+
   it('rejects an invalid tag without a request', async () => {
     const f = fakeFetch(() => undefined);
     expect((await ociClient({ fetch: f }).resolveTag('docker.io/library/node', '../x')).status).toBe('error');
