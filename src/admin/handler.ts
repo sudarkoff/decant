@@ -3,8 +3,9 @@ import { json } from '../http';
 import { verifyAdvisoryFix } from '../osv';
 import { clearDecisionCaches, forgetDenied } from '../policy/decider';
 import { parsePolicy, type Policy } from '../policy/schema';
+import { recordImages, type ImageIn } from '../policy/images';
 import { globalBlockStmt } from '../policy/store';
-import { PROJECT_ID_RE as ID_RE } from '../ids';
+import { DIGEST_RE, isImageRepo, PROJECT_ID_RE as ID_RE } from '../ids';
 import { formatPackageId, parsePackageId, type Deps, type Env, type PackageRef } from '../types';
 
 const MAX_BODY = 1024 * 1024;
@@ -100,6 +101,11 @@ async function route(req: Request, env: Env, deps: Deps, auth: AuthCtx, path: st
     if (!isCi(auth)) return forbidden();
     return m === 'PUT' ? putVerdict(req, env, deps, auth.projectId) : getVerdicts(req, env);
   }
+  if (segs.length === 1 && segs[0] === 'images') {
+    if (m !== 'POST') return methodNotAllowed();
+    if (auth.kind !== 'ci' && auth.kind !== 'sync') return forbidden();
+    return postImages(req, env, deps, auth.projectId, auth.kind === 'sync');
+  }
   if (segs.length === 1 && segs[0] === 'blocks') {
     if (m !== 'GET') return methodNotAllowed();
     if (!isCi(auth)) return forbidden();
@@ -194,8 +200,9 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
     }
   }
 
-  // Verify every advisory allow before writing anything.
-  const advisories = policy.allow.filter((a) => a.advisory !== undefined);
+  // Verify every advisory allow before writing anything. OSV has no docker ecosystem: an image allow's
+  // advisory is recorded as cited (the allow itself is what a reviewer approved), never checked.
+  const advisories = policy.allow.filter((a) => a.advisory !== undefined && parsePackageId(a.package)!.eco !== 'docker');
   const checks = await Promise.all(
     advisories.map((a) => verifyAdvisoryFix(deps, a.advisory!, parsePackageId(a.package)!)),
   );
@@ -262,6 +269,47 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
   await db.batch(stmts);
   clearDecisionCaches(); // this isolate at once; others within POLICY_TTL_MS
   return reply({ ref, allows: policy.allow.length, blocks: policy.block.length });
+}
+
+const MAX_IMAGES = 200;
+const MAX_IMAGE_FILES = 20;
+const MAX_FILE_PATH = 512;
+
+/** Validates one image entry: a normalized repository, a sha256 digest, and (optionally) the Dockerfiles using it. */
+function imageRow(v: unknown, i: number): ImageIn | string {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return `images[${i}] must be an object`;
+  const d = v as Record<string, unknown>;
+  if (typeof d.name !== 'string' || !isImageRepo(d.name)) return `images[${i}].name must be a fully qualified repository like docker.io/library/node`;
+  if (typeof d.digest !== 'string' || !DIGEST_RE.test(d.digest)) return `images[${i}].digest must be sha256:<64 lowercase hex>`;
+  const files = d.files ?? [];
+  if (!Array.isArray(files) || files.length > MAX_IMAGE_FILES || !files.every((f) => shortString(f, MAX_FILE_PATH))) {
+    return `images[${i}].files must be at most ${MAX_IMAGE_FILES} paths`;
+  }
+  return { name: d.name, digest: d.digest, files: files as string[] };
+}
+
+/**
+ * Records when decant first saw each image digest and returns each one's cooldown / allow / block decision.
+ * The project is the token's. A sync token reports main (and replaces the images in use there); a ci token
+ * any other ref (PR scans, the audit's candidate digests).
+ */
+async function postImages(req: Request, env: Env, deps: Deps, projectId: string, isSyncToken: boolean): Promise<Response> {
+  const body = await readJsonObject(req);
+  if (typeof body.ref !== 'string' || !REF_RE.test(body.ref)) return err(400, 'ref must match ' + REF_RE.source);
+  if (!Array.isArray(body.images)) return err(400, 'images must be an array');
+  if (body.images.length > MAX_IMAGES) return err(400, `at most ${MAX_IMAGES} images per call`);
+  const list: ImageIn[] = [];
+  for (const [i, v] of body.images.entries()) {
+    const r = imageRow(v, i);
+    if (typeof r === 'string') return err(400, r);
+    list.push(r);
+  }
+  const project = await env.DB.prepare('SELECT main_ref FROM projects WHERE id = ?').bind(projectId).first<{ main_ref: string }>();
+  if (!project) return notFound();
+  const isMain = body.ref === project.main_ref;
+  if (isMain && !isSyncToken) return err(403, `use the sync token for ${project.main_ref}`);
+  if (!isMain && isSyncToken) return err(403, `sync tokens may only report ${project.main_ref}`);
+  return reply(await recordImages(env, projectId, body.ref, isMain, list, deps.now()));
 }
 
 const DEP_ECOS = new Set(['npm', 'go']);

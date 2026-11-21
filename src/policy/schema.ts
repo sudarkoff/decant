@@ -50,7 +50,7 @@ function entry(raw: unknown, path: string, withAdded: boolean, errors: string[])
   for (const k of Object.keys(raw)) if (!allowed.has(k)) errors.push(`${path}.${k} is not allowed`);
   const n = errors.length;
   const out: { package: string; reason: string; advisory?: string; added?: string } = { package: '', reason: '' };
-  if (typeof raw.package !== 'string' || parsePackageId(raw.package) === null) errors.push(`${path}.package must be a package ID like npm:name@1.0.0`);
+  if (typeof raw.package !== 'string' || parsePackageId(raw.package) === null) errors.push(`${path}.package must be a package ID like npm:name@1.0.0 (images: docker:docker.io/library/node@sha256:<64 hex>)`);
   else out.package = raw.package;
   if (typeof raw.reason !== 'string' || raw.reason === '') errors.push(`${path}.reason must be a non-empty string`);
   else out.reason = raw.reason;

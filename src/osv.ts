@@ -4,7 +4,12 @@ import { upstreamTimeout } from './upstream';
 import { severityOf } from './vuln-severity';
 
 const OSV = 'https://api.osv.dev';
-const OSV_ECO: Record<Ecosystem, string> = { npm: 'npm', go: 'Go' };
+/** OSV ecosystems decant queries. Docker images have no OSV ecosystem: Grype scans them in CI. */
+const OSV_ECO: Record<'npm' | 'go', string> = { npm: 'npm', go: 'Go' };
+const osvEco = (eco: Ecosystem): string => {
+  if (eco === 'docker') throw new Error('OSV has no docker ecosystem');
+  return OSV_ECO[eco];
+};
 const MAX_PAGES = 10;
 const BATCH_SIZE = 1000; // OSV querybatch limit
 
@@ -31,7 +36,7 @@ const MAX_FIXED = 50;
 function fixedVersions(v: OsvVuln): Record<string, string[]> {
   const out: Record<string, string[]> = {};
   for (const a of Array.isArray(v.affected) ? v.affected : []) {
-    const eco = (Object.keys(OSV_ECO) as Ecosystem[]).find((k) => OSV_ECO[k] === a?.package?.ecosystem);
+    const eco = (Object.keys(OSV_ECO) as ('npm' | 'go')[]).find((k) => OSV_ECO[k] === a?.package?.ecosystem);
     const name = a?.package?.name;
     if (!eco || typeof name !== 'string') continue;
     const list = (out[`${eco}:${name}`] ??= []);
@@ -50,7 +55,7 @@ function fixedVersions(v: OsvVuln): Record<string, string[]> {
 function osvQuery(ref: PackageRef): { package: { name: string; ecosystem: string }; version: string } {
   // OSV's Go ecosystem uses versions without the leading 'v'.
   const version = ref.eco === 'go' ? ref.version.replace(/^v/, '') : ref.version;
-  return { package: { name: ref.name, ecosystem: OSV_ECO[ref.eco] }, version };
+  return { package: { name: ref.name, ecosystem: osvEco(ref.eco) }, version };
 }
 
 /**
@@ -99,7 +104,8 @@ export async function verifyAdvisoryFix(
     if (res.status >= 400 && res.status < 500) return done('unknown-advisory');
     const vuln = await okJson<OsvVuln>(res);
     published = typeof vuln.published === 'string' ? vuln.published : null;
-    const eco = OSV_ECO[ref.eco];
+    if (ref.eco === 'docker') return done('unknown-advisory');
+    const eco = osvEco(ref.eco);
     const lists = (vuln.affected ?? []).some((a) => a.package?.ecosystem === eco && a.package?.name === ref.name);
     if (!lists) return done('unknown-advisory');
 
