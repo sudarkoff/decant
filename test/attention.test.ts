@@ -25,7 +25,7 @@ const policy = (id: string, block: { package: string; reason: string }[], ref = 
 const keys = (items: { key: string }[]) => items.map((i) => i.key);
 
 beforeEach(async () => {
-  for (const t of ['projects', 'serve_log', 'request_counts', 'global_blocks', 'policies', 'vulns', 'verdicts', 'versions', 'alerts_state']) {
+  for (const t of ['project_images', 'projects', 'serve_log', 'request_counts', 'global_blocks', 'policies', 'vulns', 'verdicts', 'versions', 'alerts_state']) {
     await e.DB.prepare(`DELETE FROM ${t}`).run();
   }
 });
@@ -158,6 +158,68 @@ describe('attention items', () => {
       { label: 'Advisory', url: 'https://osv.dev/vulnerability/MAL-2026-2211' },
       { label: 'View on npm', url: 'https://www.npmjs.com/package/color-strng/v/1.0.4' },
     ]);
+  });
+
+  it('docker: images in use on main get vuln items from the Grype verdict, titled and linked', async () => {
+    const D = `sha256:${'0123456789abcdef'.repeat(4)}`;
+    const NODE = 'docker.io/library/node';
+    await project('web');
+    await e.DB.prepare("UPDATE projects SET repo = 'acme/web-app' WHERE id = 'web'").run();
+    await exec(
+      "INSERT INTO project_images (project_id, name, digest, files, synced_at) VALUES (?, ?, ?, ?, '2026-11-18T00:00:00Z')",
+      ['web', NODE, D, '["Dockerfile"]'],
+    );
+    const details = [
+      { id: 'CVE-2026-1111', severity: 'critical', package: 'openssl', version: '3.0.11-1', fixed: ['3.0.15-1'] },
+      { id: 'CVE-2026-2222', severity: 'high', package: 'zlib', version: '1.2.13', fixed: [] },
+      { id: 'CVE-2026-3333', severity: 'moderate', package: 'curl', version: '8.0', fixed: ['8.1'] },
+    ];
+    await exec(
+      "INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, details, scanned_at) VALUES ('docker', ?, ?, 'grype', '0.121.3', 'flagged', ?, '2026-11-18T00:00:00Z')",
+      [NODE, D, JSON.stringify(details)],
+    );
+    await gblock(['docker', NODE, D, 'operator', 'pulled']);
+    const r = await attention(e, 'web', 30, NOW);
+    const by = Object.fromEntries(r.open.map((i) => [i.key, i]));
+    expect(Object.keys(by).sort()).toEqual([
+      `blocked:docker:${NODE}@${D}:web`,
+      `vuln:CVE-2026-1111:docker:${NODE}@${D}:web`,
+      `vuln:CVE-2026-2222:docker:${NODE}@${D}:web`,
+    ]);
+    const crit = by[`vuln:CVE-2026-1111:docker:${NODE}@${D}:web`]!;
+    expect(crit.title).toBe('node@sha256:0123456789ab has CVE-2026-1111');
+    expect(crit.detail).toBe('critical: openssl 3.0.11-1 (fixed in 3.0.15-1)');
+    expect(crit.links.map((l) => l.url)).toContain('https://hub.docker.com/_/node');
+    expect(by[`vuln:CVE-2026-2222:docker:${NODE}@${D}:web`]!.todo).toMatch(/^No fixed package yet/);
+    expect(by[`blocked:docker:${NODE}@${D}:web`]!.title).toBe('node@sha256:0123456789ab is blocked');
+
+    // Removed from main: the items resolve, and the resolved titles read the same.
+    await e.DB.prepare('DELETE FROM project_images').run();
+    const after = await attention(e, 'web', 30, NOW);
+    expect(after.open).toEqual([]);
+    expect(after.resolved.map((i) => i.title).sort()).toEqual([
+      'node@sha256:0123456789ab has CVE-2026-1111',
+      'node@sha256:0123456789ab has CVE-2026-2222',
+      'node@sha256:0123456789ab is blocked',
+    ]);
+  });
+
+  it('docker: a flagged Grype verdict with no usable findings is still listed (flagged); severities match in any case', async () => {
+    const D = `sha256:${'f'.repeat(64)}`;
+    const D2 = `sha256:${'e'.repeat(64)}`;
+    await project('web');
+    await exec(
+      "INSERT INTO project_images (project_id, name, digest, files, synced_at) VALUES ('web', 'docker.io/library/node', ?, '[]', '2026-11-18T00:00:00Z')",
+      [D],
+      [D2],
+    );
+    await exec(
+      "INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, details, scanned_at) VALUES ('docker', 'docker.io/library/node', ?, 'grype', '0.121.3', 'flagged', ?, '2026-11-18T00:00:00Z')",
+      [D, '{"garbage": true}'],
+      [D2, JSON.stringify([{ id: 'CVE-2026-4444', severity: 'Critical', package: 'glibc', version: '2.36', fixed: ['2.36-9'] }])],
+    );
+    const keysNow = keys((await attention(e, 'web', 30, NOW)).open).sort();
+    expect(keysNow).toEqual([`flagged:docker:docker.io/library/node@${D}:web`, `vuln:CVE-2026-4444:docker:docker.io/library/node@${D2}:web`]);
   });
 
   it('a malicious verdict is malicious, and its verdict block does not also emit blocked', async () => {

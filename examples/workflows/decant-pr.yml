@@ -1,5 +1,5 @@
 # Pull requests: sync the PR overlay policy, then scan changed dependencies.
-# No paths filter: a required check must run on every PR, and scan exits fast when no lockfile changed.
+# No paths filter: a required check must run on every PR, and scan exits fast when no lockfile or Dockerfile changed.
 # labeled/unlabeled re-run the check when a writer adds (or removes) decant:reviewed.
 # Replace <release-sha> with the commit SHA of the decant release you pin.
 name: decant

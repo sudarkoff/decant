@@ -8,6 +8,9 @@ import { fakeDeps, fakeExec, fakeFetch, jsonRes, memFs, type ExecCall, type Fetc
 
 afterEach(() => vi.restoreAllMocks());
 
+// The pinned tarball's checksum cannot be reproduced in a test: installing is covered in grype.test.ts.
+vi.mock('../src/grype', async (orig) => ({ ...(await orig<typeof import('../src/grype')>()), installGrype: async () => ({ bin: '/rt/decant-grype/grype' }) }));
+
 const D = 'https://decant.example';
 const R = 'https://api.github.com/repos/o/r';
 const HEAD = 'c'.repeat(40);
@@ -72,6 +75,8 @@ type World = {
   mainHead?: string;
   env?: Record<string, string | undefined>;
   exec?: (c: ExecCall, fs: ReturnType<typeof memFs>) => { code?: number; stdout?: string; stderr?: string } | void;
+  /** Answers checked before the built-in routes (registries, /api/images, verdicts). */
+  extraFetch?: (c: FetchCall) => Response | undefined;
 };
 
 const BASE_POLICY = { project: 'app', cooldownDays: 7, allow: [], block: [] };
@@ -100,6 +105,8 @@ function harness(w: World) {
   const f = fakeFetch((c: FetchCall) => {
     const u = new URL(c.url);
     const key = `${c.method} ${c.url}`;
+    const extra = w.extraFetch?.(c);
+    if (extra) return extra;
     if (u.origin === 'https://api.osv.dev') {
       if (w.osvDown) return new Response('down', { status: 503 });
       if (key === 'POST https://api.osv.dev/v1/querybatch') {
@@ -239,6 +246,7 @@ function harness(w: World) {
     INPUT_MODE: 'audit',
     INPUT_DECANT_URL: `${D}/`,
     INPUT_TOKEN: 'ci-secret',
+    INPUT_SYNC_TOKEN: 'sync-secret',
     INPUT_GITHUB_TOKEN: 'ghs_secret',
     INPUT_WORKING_DIRECTORY: '/w',
     INPUT_POLICY_PATH: 'decant.json',
@@ -249,6 +257,8 @@ function harness(w: World) {
     GITHUB_OUTPUT: output,
     GITHUB_STEP_SUMMARY: summary,
     RUNNER_TEMP: '/rt',
+    DECANT_GRYPE_PLATFORM: 'linux',
+    DECANT_GRYPE_ARCH: 'x64',
     HOME: '/home/u',
     PATH: '/usr/bin',
   };
@@ -424,9 +434,9 @@ describe('audit: one security PR per run', () => {
     });
     expect(await h.run()).toBe(0);
 
-    // overlay sync with the ci token: main policy plus one verified allow entry, ref "audit"
+    // overlay sync with the sync token (the ref is reserved for it): main policy plus one verified allow entry, ref "audit"
     expect(h.syncs).toHaveLength(1);
-    expect(h.syncs[0]!.auth).toBe('Bearer ci-secret');
+    expect(h.syncs[0]!.auth).toBe('Bearer sync-secret');
     expect(h.syncs[0]!.body.ref).toBe(REF);
     expect(h.syncs[0]!.body.policy.allow).toEqual([{ package: 'npm:lodash@4.17.21', advisory: GHSA, reason: 'security fix', added: '2026-11-19' }]);
     expect(h.syncs[0]!.body.policy.cooldownDays).toBe(7);
@@ -729,6 +739,16 @@ describe('audit: one security PR per run', () => {
   it('decant rejects the ci token (403) on overlay sync → exit 1', async () => {
     const h = harness({ ...DIRECT, syncStatus: 403, exec: npmFake() });
     expect(await h.run()).toBe(1);
+  });
+
+  it('no sync-token → fails at the start, before any work', async () => {
+    const h = harness({ ...DIRECT, exec: npmFake(), env: { INPUT_SYNC_TOKEN: undefined } });
+    expect(await h.run()).toBe(1);
+    expect(h.syncs).toEqual([]);
+    expect(h.prs).toEqual([]);
+    expect(h.f.calls).toEqual([]);
+    expect(h.exec.calls).toEqual([]);
+    expect(h.log()).toContain('sync-token is required: decant reserves the audit overlay ref for the sync token');
   });
 
   it('GHSA + CVE aliases merge into one advisory', async () => {
@@ -1249,5 +1269,140 @@ describe('audit: systemic failures', () => {
     const fs = memFs({ '/w/decant.json': JSON.stringify(BASE_POLICY) });
     const r = await run(fakeDeps({ env: { INPUT_MODE: 'audit', INPUT_DECANT_URL: D, INPUT_TOKEN: 'x', INPUT_WORKING_DIRECTORY: '/w' }, fs }));
     expect(r).toBe(1);
+  });
+});
+
+describe('audit: base images', () => {
+  const OLD = `sha256:${'1'.repeat(64)}`;
+  const NEW = `sha256:${'2'.repeat(64)}`;
+  const NODE = 'docker.io/library/node';
+  const match = (id: string, severity: string, fixed: string[]) => ({
+    vulnerability: { id, severity, fix: fixed.length ? { state: 'fixed', versions: fixed } : { state: 'not-fixed', versions: [] } },
+    artifact: { name: 'openssl', version: '3.0', type: 'deb' },
+  });
+  type ImgWorld = { decision?: Record<string, unknown>; grype?: Record<string, unknown[]>; tag?: string | null };
+  function world(o: ImgWorld = {}, extra: Partial<World> = {}): { w: World; posts: unknown[]; verdicts: { package: string; result: string }[] } {
+    const posts: unknown[] = [];
+    const verdicts: { package: string; result: string }[] = [];
+    const w: World = {
+      files: { '/w/Dockerfile': `# a comment\nFROM node:22@${OLD} AS build\nRUN true\nFROM build\n`, '/w/package-lock.json': lock([]) },
+      extraFetch: (c) => {
+        const u = new URL(c.url);
+        if (c.url === `${D}/api/images`) {
+          const b = JSON.parse(c.body!);
+          posts.push(b);
+          return jsonRes({
+            cooldownDays: 7,
+            images: b.images.map((i: { name: string; digest: string }) => ({
+              name: i.name, digest: i.digest, clock: 'shared', firstSeen: '2026-11-01T00:00:00.000Z', eligibleAt: '2026-11-08T00:00:00.000Z',
+              decision: 'allow', allowed: false, blocks: [], ...o.decision,
+            })),
+          });
+        }
+        if (c.url === `${D}/api/verdicts` && c.method === 'PUT') {
+          verdicts.push(JSON.parse(c.body!));
+          return new Response(null, { status: 204 });
+        }
+        if (u.host === 'auth.docker.io') return jsonRes({ token: 't' });
+        if (u.host === 'registry-1.docker.io') {
+          return o.tag === null ? new Response('', { status: 404 }) : new Response(null, { headers: { 'docker-content-digest': o.tag ?? NEW } });
+        }
+        return undefined;
+      },
+      exec: (c) => {
+        if (c.cmd === '/rt/decant-grype/grype') {
+          const target = c.args[0]!.replace(/^registry:docker\.io\/library\/node@/, '');
+          return { stdout: JSON.stringify({ matches: o.grype?.[target] ?? [] }) };
+        }
+      },
+      ...extra,
+    };
+    return { w, posts, verdicts };
+  }
+
+  it('a newer digest past cooldown that fixes a Critical → bumped in the one security PR, verdicts stored', async () => {
+    const { w, posts, verdicts } = world({ grype: { [OLD]: [match('CVE-2026-1', 'Critical', ['3.1']), match('CVE-2026-2', 'High', [])], [NEW]: [match('CVE-2026-2', 'High', [])] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    expect(posts).toEqual([{ ref: 'audit-images', images: [{ name: NODE, digest: NEW }], mainOnly: true }]);
+    expect(verdicts.map((v) => [v.package, v.result])).toEqual([
+      [`docker:${NODE}@${OLD}`, 'flagged'],
+      [`docker:${NODE}@${NEW}`, 'flagged'],
+    ]);
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]).toMatchObject({ head: BRANCH, title: 'decant: security fixes (1 image, 1 advisory)' });
+    const body = h.prs[0]!.body as string;
+    expect(body).toContain('| `docker.io/library/node:22` | sha256:111111111111 → sha256:222222222222 | [CVE-2026-1](https://osv.dev/vulnerability/CVE-2026-1) | critical |');
+    expect(body).toContain(marker([`docker:${NODE}@${NEW}`]));
+    expect(h.written()).toEqual({ Dockerfile: `# a comment\nFROM node:22@${NEW} AS build\nRUN true\nFROM build\n` });
+    expect(h.labels).toEqual([{ n: 10, labels: ['decant:security', 'decant:critical'] }]);
+    expect(h.syncs).toEqual([]); // no overlay: image bumps need no allow entry
+    expect(h.summary()).toContain('bump fixes CVE-2026-1');
+  });
+
+  it('a bump that would introduce a new High/Critical is refused, and the summary says why', async () => {
+    const { w } = world({ grype: { [OLD]: [match('CVE-2026-1', 'Critical', ['3.1'])], [NEW]: [match('CVE-2026-5', 'High', ['9'])] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toEqual([]);
+    expect(h.summary()).toContain('would introduce CVE-2026-5 (high); not bumped');
+  });
+
+  it('introduced findings are keyed on id + package: the same advisory on a new package counts as new', async () => {
+    const onPkg = (id: string, sev: string, pkg: string) => ({ ...match(id, sev, ['9']), artifact: { name: pkg, version: '1', type: 'deb' } });
+    const { w } = world({ grype: { [OLD]: [onPkg('CVE-2026-1', 'Critical', 'openssl'), onPkg('CVE-2026-3', 'High', 'zlib')], [NEW]: [onPkg('CVE-2026-3', 'High', 'libxml2')] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toEqual([]);
+    expect(h.summary()).toContain('would introduce CVE-2026-3 (high); not bumped');
+  });
+
+  it('lower-severity findings a bump introduces are listed in the PR and count toward approval', async () => {
+    const { w } = world({ grype: { [OLD]: [match('CVE-2026-1', 'High', ['3.1'])], [NEW]: [match('CVE-2026-6', 'Medium', [])] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    const body = h.prs[0]!.body as string;
+    expect(body).toContain('**Introduced by the new digests**');
+    expect(body).toContain('[CVE-2026-6](https://osv.dev/vulnerability/CVE-2026-6) (moderate) in `openssl` 3.0');
+    expect(body).toContain('autoShip.moderate is `approve`');
+    expect(h.autoMerges).toEqual([]);
+  });
+
+  it('the newer digest is still in cooldown → no PR, summary says when', async () => {
+    const { w } = world({ decision: { decision: 'cooldown', eligibleAt: '2026-11-25T00:00:00.000Z' }, grype: { [OLD]: [match('CVE-2026-1', 'Critical', ['3.1'])] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toEqual([]);
+    expect(h.summary()).toContain('newer digest waiting (cooldown until 2026-11-25)');
+  });
+
+  it('a newer digest that fixes nothing High/Critical is not proposed; an up-to-date tag is just re-scanned', async () => {
+    const { w } = world({ grype: { [OLD]: [match('CVE-2026-9', 'Medium', ['1'])] } });
+    const h = harness(w);
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toEqual([]);
+    expect(h.summary()).toContain('fixes no High/Critical finding; not bumped');
+    const same = world({ tag: OLD });
+    const h2 = harness(same.w);
+    expect(await h2.run()).toBe(0);
+    expect(same.posts).toEqual([]);
+    expect(same.verdicts).toHaveLength(1);
+    expect(h2.summary()).toContain('clean; up to date');
+  });
+
+  it('npm fixes and image bumps share the one security PR and its set marker', async () => {
+    const { w } = world({ grype: { [OLD]: [match('CVE-2026-1', 'High', ['3.1'])] } });
+    const merged: World = {
+      ...DIRECT,
+      files: { ...DIRECT.files, '/w/Dockerfile': `FROM node:22@${OLD}\n` },
+      exec: (c, fs) => (c.cmd === '/rt/decant-grype/grype' ? w.exec!(c, fs) : npmFake()(c, fs)),
+      extraFetch: w.extraFetch,
+    };
+    const h = harness(merged);
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (1 package, 1 image, 2 advisories)');
+    expect(h.prs[0]!.body).toContain(marker(['npm:lodash@4.17.21', `docker:${NODE}@${NEW}`]));
+    expect(Object.keys(h.written()).sort()).toEqual(['Dockerfile', 'decant.json', 'package-lock.json', 'package.json']);
   });
 });

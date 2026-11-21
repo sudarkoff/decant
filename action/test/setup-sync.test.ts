@@ -463,6 +463,7 @@ describe('sync sends a dependency summary on the default branch', () => {
     expect(f.calls.map((c) => `${c.method} ${c.url}`)).toEqual([
       'PUT https://decant.example/api/projects/proj/policy',
       'PUT https://decant.example/api/projects/proj/deps',
+      'POST https://decant.example/api/images',
     ]);
     expect(f.calls[1].headers.get('authorization')).toBe('Bearer sync-tok');
     expect(JSON.parse(f.calls[1].body!)).toEqual({
@@ -472,6 +473,31 @@ describe('sync sends a dependency summary on the default branch', () => {
         { eco: 'npm', name: 'b', version: '1.0.0', direct: false, via: ['a'] },
       ],
     });
+  });
+
+  it('reports the pinned base images (repo, digest, Dockerfiles) for main with the sync token; warns on unpinned', async () => {
+    const dg = `sha256:${'c'.repeat(64)}`;
+    const dockerfiles = {
+      '/w/Dockerfile': `FROM node:22@${dg} AS b\nFROM b\nFROM alpine:3\n`,
+      '/w/api/Dockerfile.prod': `FROM node@${dg}\n`,
+    };
+    const f = fakeFetch((c) => (c.url.endsWith('/api/images') ? jsonRes({ cooldownDays: 7, images: [{ name: 'docker.io/library/node', digest: dg, clock: 'unverified' }] }) : jsonRes({ ok: true })));
+    const { deps } = syncDeps({ event: 'push', payload: dispatch, files: { ...files, ...dockerfiles }, env, fetch: f });
+    const { out } = cap();
+    expect(await run(deps)).toBe(0);
+    const post = f.calls.find((c) => c.url.endsWith('/api/images'))!;
+    expect(post.headers.get('authorization')).toBe('Bearer sync-tok');
+    expect(JSON.parse(post.body!)).toEqual({ ref: 'main', images: [{ name: 'docker.io/library/node', digest: dg, files: ['Dockerfile', 'api/Dockerfile.prod'] }] });
+    expect(out.join('')).toContain('1 base image(s) on the default branch are not pinned by digest');
+    expect(out.join('')).toContain('decant could not verify 1 image digest(s) in the registry yet');
+  });
+
+  it('a failed image report is a warning, not a failed sync', async () => {
+    const f = fakeFetch((c) => (c.url.endsWith('/api/images') ? jsonRes({ error: 'boom' }, 500) : jsonRes({ ok: true })));
+    const { deps } = syncDeps({ event: 'push', payload: dispatch, files: { ...files, '/w/Dockerfile': `FROM node@sha256:${'c'.repeat(64)}\n` }, env, fetch: f });
+    const { out } = cap();
+    expect(await run(deps)).toBe(0);
+    expect(out.join('')).toContain('base images not reported: decant POST /api/images: HTTP 500');
   });
 
   it('sends the repo from GITHUB_REPOSITORY when it is owner/name; omits it otherwise', async () => {

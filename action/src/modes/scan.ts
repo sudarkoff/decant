@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { formatPackageId } from '../../../src/ids';
 import { parsePolicy, SEVERITIES, type Severity } from '../../../src/policy/schema';
 import { decant, type DecantClient, type Verdict, type VerdictResult } from '../decant-client';
+import { changedDockerfiles, dockerGate, otherImageFiles, renderImages, type ImageRow } from '../docker-gate';
 import type { ActionDeps } from '../deps';
 import { isForkPr, readPayload, type Payload } from '../event';
 import { fileAtCommit as baseFile, SHA_RE } from '../git';
@@ -113,7 +114,9 @@ async function cooldownNote(deps: ActionDeps, dep: Dep, cooldownDays: number): P
   return 'waiting for cooldown (publish time unknown)';
 }
 
-function render(rows: Row[], pass: boolean, failOn: string, ref: string, limit = Infinity, note = ''): string {
+function render(rows: Row[], pass: boolean, failOn: string, ref: string, limit = Infinity, note = '', images: ImageRow[] = []): string {
+  const imageText = renderImages(images, limit === Infinity ? Infinity : Math.floor(limit / 3)).join('\n');
+  if (limit !== Infinity) limit -= imageText.length;
   const head = [
     MARKER,
     `## decant scan: ${pass ? '✅ pass' : '❌ fail'}`,
@@ -160,7 +163,7 @@ function render(rows: Row[], pass: boolean, failOn: string, ref: string, limit =
       size += line.length + 1;
     }
   }
-  return `${head}\n${lines.join('\n')}\n`;
+  return `${head}\n${lines.join('\n')}\n${imageText ? `${imageText}\n` : ''}`;
 }
 
 /** Lockfiles (relative to wd) that differ from base; symlinked ones count as changed (never followed). */
@@ -201,10 +204,13 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     try {
       const changed = await changedLockfiles(deps, wd, baseSha);
       if (changed.length) return stop(`fork changes lockfiles (${changed.join(', ')}); push the branch to this repo to scan it`);
+      const df = await changedDockerfiles(deps, wd, baseSha);
+      const touched = [...df.changed, ...df.symlinks].map(safe);
+      if (touched.length) return stop(`fork changes Dockerfiles (${touched.join(', ')}); push the branch to this repo to scan it`);
     } catch (e) {
       return stop(`decant scan: ${(e as Error).message}`);
     }
-    notice('fork PR changes no lockfile; nothing to scan');
+    notice('fork PR changes no lockfile or Dockerfile; nothing to scan');
     setOutput('result', 'pass', env);
     return 0;
   }
@@ -389,6 +395,16 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
       if (gdResult === 'flagged') r.flagged = true;
     }
 
+    // 3b. Base images in changed Dockerfiles.
+    const gate = await dockerGate({ deps, wd, baseSha, ref, client });
+    if (gate.fatal) return stop(gate.fatal);
+    const imageRows = gate.rows;
+    let imageNote = '';
+    if (imageRows.length) {
+      const others = await otherImageFiles(deps, wd);
+      if (others.length) imageNote = `Images referenced in ${others.slice(0, 5).map((f) => `\`${safe(f)}\``).join(', ')}${others.length > 5 ? ', …' : ''} are not gated (Dockerfiles only).`;
+    }
+
     // 4. Flagged needs a writer's decant:reviewed.
     const anyFlagged = regRows.some((r) => r.flagged);
     const reviewed = anyFlagged ? await gh.labelAddedByWriter(n, REVIEWED) : false;
@@ -412,19 +428,24 @@ export async function run({ deps, inputs }: ModeCtx): Promise<number> {
     }
 
     const all = [...regRows, ...rows];
-    const pass = all.every((r) => r.problems.length === 0);
+    const pass = all.every((r) => r.problems.length === 0) && imageRows.every((r) => r.problems.length === 0);
     setOutput('result', pass ? 'pass' : 'fail', env);
     setOutput('flagged', anyFlagged ? 'true' : 'false', env);
-    if (all.length === 0) {
+    if (all.length === 0 && imageRows.length === 0) {
       const body = `${MARKER}\n## decant scan: ✅ pass\n\nNo new dependency versions.`;
       appendSummary(body, env);
       // Replace an earlier report (e.g. the deps were since removed), but never start a new comment.
       await gh.updateComment(n, MARKER, body);
       return 0;
     }
-    appendSummary(render(all, pass, failOn, ref, Infinity, securityNote), env);
-    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT, securityNote));
-    if (!pass) return fail(`decant scan failed: ${all.filter((r) => r.problems.length).length} dependency version(s) need attention`);
+    const note = [securityNote, imageNote].filter(Boolean).join('\n\n');
+    appendSummary(render(all, pass, failOn, ref, Infinity, note, imageRows), env);
+    await gh.upsertComment(n, MARKER, render(all, pass, failOn, ref, COMMENT_LIMIT, note, imageRows));
+    if (!pass) {
+      const deps = all.filter((r) => r.problems.length).length;
+      const imgs = imageRows.filter((r) => r.problems.length).length;
+      return fail(`decant scan failed: ${[deps ? `${deps} dependency version(s)` : '', imgs ? `${imgs} base image(s)` : ''].filter(Boolean).join(' and ')} need attention`);
+    }
     return 0;
   } catch (e) {
     return stop(`decant scan: ${(e as Error).message}`);

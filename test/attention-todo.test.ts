@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findingsOf, lowestFixed, packageUrl, todoFor } from '../src/dashboard/attention';
+import { findingsOf, imageLabel, imageUrl, lowestFixed, packageUrl, todoFor } from '../src/dashboard/attention';
 
 const SEC_PRS = 'https://github.com/acme/web-app/pulls?q=is%3Apr+is%3Aopen+label%3Adecant%3Asecurity';
 const FAILING_PRS = 'https://github.com/acme/web-app/pulls?q=is%3Apr+is%3Aopen+status%3Afailure';
@@ -157,5 +157,46 @@ describe('todoFor', () => {
 
   it('encodes advisory ids', () => {
     expect(todoFor({ kind: 'vuln', ...pkg, advisory: 'A/B?c', fixed: null, repo: null }).links[0]!.url).toBe('https://osv.dev/vulnerability/A%2FB%3Fc');
+  });
+});
+
+describe('docker images', () => {
+  const D = `sha256:${'0123456789abcdef'.repeat(4)}`;
+
+  it('imageUrl: Docker Hub library and namespaced images, unambiguous ghcr.io, else none', () => {
+    expect(imageUrl('docker.io/library/node')).toBe('https://hub.docker.com/_/node');
+    expect(imageUrl('docker.io/bitnami/redis')).toBe('https://hub.docker.com/r/bitnami/redis');
+    expect(imageUrl('ghcr.io/acme/api')).toBe('https://github.com/acme/api/pkgs/container/api');
+    expect(imageUrl('ghcr.io/acme/api/worker')).toBeNull(); // which repo? ambiguous
+    expect(imageUrl('quay.io/acme/api')).toBeNull();
+    expect(imageUrl('registry.example.com:5000/x/y')).toBeNull();
+  });
+
+  it('imageLabel: short Docker Hub names and a 12-hex digest', () => {
+    expect(imageLabel('docker.io/library/node', D)).toBe('node@sha256:0123456789ab');
+    expect(imageLabel('docker.io/bitnami/redis', D)).toBe('bitnami/redis@sha256:0123456789ab');
+    expect(imageLabel('ghcr.io/acme/api', D)).toBe('ghcr.io/acme/api@sha256:0123456789ab');
+  });
+
+  it('docker vuln with a fixed OS package: security PR, advisory, image page', () => {
+    const t = todoFor({ kind: 'vuln', eco: 'docker', name: 'docker.io/library/node', version: D, advisory: 'CVE-2026-1111', fixed: '3.0.15-1', fixedPackage: 'openssl', repo: 'acme/web-app' });
+    expect(t.todo).toBe(
+      'Fixed in `openssl` `3.0.15-1`. The daily security PR bumps the image digest once a newer one with the fix has cleared the cooldown; if the tag has none yet, move to a newer tag.',
+    );
+    expect(t.links).toEqual([
+      { label: 'Open security PRs', url: SEC_PRS },
+      { label: 'Advisory', url: 'https://osv.dev/vulnerability/CVE-2026-1111' },
+      { label: 'View on Docker Hub', url: 'https://hub.docker.com/_/node' },
+    ]);
+  });
+
+  it('docker vuln without a fix, and docker items on an unknown registry get no image link', () => {
+    const t = todoFor({ kind: 'vuln', eco: 'docker', name: 'quay.io/acme/api', version: D, advisory: 'CVE-2026-2222', fixed: null, repo: null });
+    expect(t.todo).toBe('No fixed package yet. Nothing to do now: decant re-scans the image daily and this card updates when a fix ships.');
+    expect(t.links).toEqual([{ label: 'Advisory', url: 'https://osv.dev/vulnerability/CVE-2026-2222' }]);
+    expect(todoFor({ kind: 'blocked', eco: 'docker', name: 'quay.io/acme/api', version: D }).links).toEqual([]);
+    expect(todoFor({ kind: 'blocked', eco: 'docker', name: 'ghcr.io/acme/api', version: D }).links).toEqual([
+      { label: 'View on GitHub', url: 'https://github.com/acme/api/pkgs/container/api' },
+    ]);
   });
 });

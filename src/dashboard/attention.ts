@@ -1,10 +1,11 @@
 import type { Ecosystem, Env } from '../types';
 import { parsePolicy } from '../policy/schema';
+import { verdictDetails } from '../verdict-details';
 import { compareVersions, parseVersion } from '../semver';
 import { INSTALLED_CHUNK, SCOPE, windowDays } from './queries';
 
 export type Kind = 'malicious' | 'blocked' | 'vuln' | 'flagged' | 'conflict' | 'silent';
-/** A link the page may render: built here, only to osv.dev, www.npmjs.com, pkg.go.dev or github.com. */
+/** A link the page may render: built here, only to osv.dev, www.npmjs.com, pkg.go.dev, hub.docker.com or github.com. */
 export interface Link { label: string; url: string }
 /** One scanner rule that fired, with what the scanner said about it (untrusted package text). */
 export interface Finding { rule: string; note: string }
@@ -38,10 +39,38 @@ export function packageUrl(eco: Ecosystem, name: string, version: string): strin
   if (eco === 'go') return `https://pkg.go.dev/${segments(name)}@${encodeURIComponent(version)}`;
   return `https://www.npmjs.com/package/${segments(name).replace(/^%40/, '@')}/v/${encodeURIComponent(version)}`;
 }
-const packageLink = (eco: Ecosystem, name: string, version: string): Link => ({
-  label: eco === 'go' ? 'View on pkg.go.dev' : 'View on npm',
-  url: packageUrl(eco, name, version),
-});
+
+/** A path component of an image repository as decant stores it (lowercase, distribution-spec separators). */
+const IMAGE_PART = /^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*$/;
+
+/**
+ * The page of an image repository, when its host is known: Docker Hub (`/_/x` for official images,
+ * `/r/ns/x` otherwise) or ghcr.io when the path is exactly owner/name (taken as the package of the
+ * same-named repo). Anything else, including deeper ghcr.io paths, has no link.
+ */
+export function imageUrl(name: string): string | null {
+  const parts = name.split('/');
+  if (parts.slice(1).some((p) => !IMAGE_PART.test(p))) return null;
+  if (parts[0] === 'docker.io' && parts.length === 3) {
+    return parts[1] === 'library' ? `https://hub.docker.com/_/${parts[2]}` : `https://hub.docker.com/r/${parts[1]}/${parts[2]}`;
+  }
+  if (parts[0] === 'ghcr.io' && parts.length === 3) return `https://github.com/${parts[1]}/${parts[2]}/pkgs/container/${parts[2]}`;
+  return null;
+}
+
+/** `node@sha256:0123456789ab`: Docker Hub names as people write them, the digest cut to 12 hex. */
+export function imageLabel(name: string, digest: string): string {
+  const short = name.replace(/^docker\.io\/library\//, '').replace(/^docker\.io\//, '');
+  return `${short}@${digest.slice(0, 'sha256:'.length + 12)}`;
+}
+
+const packageLink = (eco: Ecosystem, name: string, version: string): Link | null => {
+  if (eco === 'docker') {
+    const url = imageUrl(name);
+    return url === null ? null : { label: name.startsWith('docker.io/') ? 'View on Docker Hub' : 'View on GitHub', url };
+  }
+  return { label: eco === 'go' ? 'View on pkg.go.dev' : 'View on npm', url: packageUrl(eco, name, version) };
+};
 const advisoryLink = (id: string): Link => ({ label: 'Advisory', url: `https://osv.dev/vulnerability/${encodeURIComponent(id)}` });
 /** An open-PR search in the project's repo; null when the repo is unknown or not owner/name. */
 const prLink = (repo: string | null, label: string, query: string): Link | null =>
@@ -100,8 +129,11 @@ export function findingsOf(details: unknown): Finding[] {
 
 type Pkg = { eco: Ecosystem; name: string; version: string };
 export type TodoInput =
-  /** fixedKnown false: the advisory's fixed versions were not looked up yet (rows stored before 0007). */
-  | ({ kind: 'vuln'; advisory: string; fixed: string | null; fixedKnown?: boolean; repo: string | null } & Pkg)
+  /**
+   * fixedKnown false: the advisory's fixed versions were not looked up yet (rows stored before 0007).
+   * fixedPackage: docker only, the OS package in the image that `fixed` is a version of.
+   */
+  | ({ kind: 'vuln'; advisory: string; fixed: string | null; fixedKnown?: boolean; fixedPackage?: string; repo: string | null } & Pkg)
   /** noFindings: the verdict recorded no rule details (older action, or another writer). */
   | ({ kind: 'flagged'; notScanned: boolean; noFindings?: boolean; repo: string | null } & Pkg)
   | ({ kind: 'malicious'; advisories: string[] } & Pkg)
@@ -114,6 +146,19 @@ export function todoFor(i: TodoInput): { todo: string; links: Link[] } {
   const some = (...l: (Link | null)[]) => l.filter((x): x is Link => x !== null);
   switch (i.kind) {
     case 'vuln':
+      if (i.eco === 'docker') {
+        const image = packageLink(i.eco, i.name, i.version);
+        if (i.fixed === null) {
+          return {
+            todo: 'No fixed package yet. Nothing to do now: decant re-scans the image daily and this card updates when a fix ships.',
+            links: some(advisoryLink(i.advisory), image),
+          };
+        }
+        return {
+          todo: `Fixed in \`${i.fixedPackage ?? '?'}\` \`${i.fixed}\`. The daily security PR bumps the image digest once a newer one with the fix has cleared the cooldown; if the tag has none yet, move to a newer tag.`,
+          links: some(prLink(i.repo, 'Open security PRs', 'is%3Apr+is%3Aopen+label%3Adecant%3Asecurity'), advisoryLink(i.advisory), image),
+        };
+      }
       if (i.fixed === null && i.fixedKnown === false) {
         return {
           todo: 'decant has not looked up a fixed version yet (it will within a day). The advisory lists the fixed versions.',
@@ -158,12 +203,12 @@ export function todoFor(i: TodoInput): { todo: string; links: Link[] } {
     case 'blocked':
       return {
         todo: 'Blocked by your policy. Remove or replace it, or lift the block in `decant.json`.',
-        links: [packageLink(i.eco, i.name, i.version)],
+        links: some(packageLink(i.eco, i.name, i.version)),
       };
     case 'conflict':
       return {
         todo: "decant keeps serving the copy it verified, so builds are unaffected. Check the package's repo for a re-publish notice; if you can't explain it, block the version.",
-        links: [packageLink(i.eco, i.name, i.version)],
+        links: some(packageLink(i.eco, i.name, i.version)),
       };
     case 'silent':
       return {
@@ -187,7 +232,13 @@ type Current = { key: string; project: string | null; kind: Kind; detail: string
 const clip = (s: string) => (s.length > DETAIL_MAX ? `${s.slice(0, DETAIL_MAX - 1)}…` : s);
 /** A malicious-package block, which the malicious rule reports instead of the blocked rule. */
 const isMaliciousSource = (source: string) => source === 'osv' || source.startsWith('verdict:');
-const shortPkg = (pkgId: string) => pkgId.slice(pkgId.indexOf(':') + 1);
+/** `name@version` of a package id; docker ids read as imageLabel. */
+const shortPkg = (pkgId: string) => {
+  const rest = pkgId.slice(pkgId.indexOf(':') + 1);
+  if (!pkgId.startsWith('docker:')) return rest;
+  const at = rest.lastIndexOf('@');
+  return imageLabel(rest.slice(0, at), rest.slice(at + 1));
+};
 
 /** The title is derived from the key alone, so open and resolved items read the same. */
 function titleFor(key: string): { kind: Kind; title: string } {
@@ -214,13 +265,39 @@ function titleFor(key: string): { kind: Kind; title: string } {
   }
 }
 
+const GRYPE = 'grype';
+const ADVISORY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
+type ImageVuln = { id: string; severity: 'critical' | 'high'; package: string; version: string; fixed: string[] };
+
+/**
+ * The High and Critical findings in a Grype verdict's `details` (the action's {id, severity, package,
+ * version, fixed} objects; written by any project's CI, so untrusted). Anything malformed is dropped.
+ */
+export function grypeFindings(details: unknown): ImageVuln[] {
+  if (!Array.isArray(details)) return [];
+  const out: ImageVuln[] = [];
+  const seen = new Set<string>();
+  for (const d of details) {
+    if (!d || typeof d !== 'object') continue;
+    const o = d as Record<string, unknown>;
+    if (typeof o.id !== 'string' || !ADVISORY_ID.test(o.id) || seen.has(o.id)) continue;
+    const severity = typeof o.severity === 'string' ? o.severity.toLowerCase() : '';
+    if (severity !== 'critical' && severity !== 'high') continue;
+    const str = (v: unknown) => (typeof v === 'string' ? clipTo(v, 100) : '?');
+    const fixed = Array.isArray(o.fixed) ? o.fixed.filter((f): f is string => typeof f === 'string' && f.trim() !== '').map((f) => clipTo(f, 100)) : [];
+    seen.add(o.id);
+    out.push({ id: o.id, severity, package: str(o.package), version: str(o.version), fixed });
+  }
+  return out;
+}
+
 type LookupRow = { eco: Ecosystem; name: string; version: string; blocks: string; vulns: string; verdicts: string };
 
 async function currentItems(env: Env, project: string, now: Date): Promise<Current[]> {
   const db = env.DB;
   const from = windowDays(now, INSTALLED_DAYS)[0]!;
   const silentFrom = windowDays(now, SILENT_DAYS)[0]!;
-  const [installed, pols, activity, conflicts] = await db.batch([
+  const [installed, pols, activity, conflicts, images] = await db.batch([
     db.prepare(`SELECT DISTINCT project_id, eco, name, version FROM serve_log WHERE ${SCOPE} AND day >= ?2`).bind(project, from),
     db
       .prepare(
@@ -237,11 +314,13 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
       )
       .bind(project),
     db.prepare(`SELECT eco, name, version FROM versions WHERE conflict = 1 AND ?1 = 'all'`).bind(project),
+    // Base images in use on each project's default branch count as installed (they are never served by decant).
+    db.prepare(`SELECT project_id, 'docker' AS eco, name, digest AS version FROM project_images WHERE ${SCOPE}`).bind(project),
   ]);
   const projectRows = activity!.results as { id: string; repo: string | null; s: string | null; r: string | null }[];
   const repoOf = new Map(projectRows.map((r) => [r.id, r.repo]));
 
-  const inst = installed!.results as { project_id: string; eco: string; name: string; version: string }[];
+  const inst = [...installed!.results, ...images!.results] as { project_id: string; eco: string; name: string; version: string }[];
   const versions = new Map<string, [string, string, string]>();
   const projectsOf = new Map<string, string[]>();
   for (const r of inst) {
@@ -261,8 +340,11 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
        (SELECT json_group_array(json_array(x.source, x.reason)) FROM global_blocks x WHERE ${onInst}) AS blocks,
        (SELECT json_group_array(json_array(x.id, x.severity, x.summary, x.fixed_versions)) FROM vulns x
          WHERE ${onInst} AND (x.id LIKE 'MAL-%' OR x.severity IN ('critical', 'high'))) AS vulns,
-       (SELECT json_group_array(json_array(x.scanner, x.result, x.details)) FROM verdicts x
-         WHERE ${onInst} AND x.result IN ('flagged', 'malicious')) AS verdicts
+       (SELECT json_group_array(json_array(x.scanner, x.result, x.details,
+          (SELECT json_group_array(json(d.details)) FROM (
+             SELECT details FROM verdict_details d
+             WHERE d.eco = x.eco AND d.name = x.name AND d.version = x.version AND d.scanner = x.scanner ORDER BY d.at DESC, d.project_id) d)))
+         FROM verdicts x WHERE ${onInst} AND x.result IN ('flagged', 'malicious')) AS verdicts
      FROM i`,
   );
   const all = [...versions.values()];
@@ -293,7 +375,13 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
       const id = `${r.eco}:${r.name}@${r.version}`;
       const blocks = JSON.parse(r.blocks) as [string, string][];
       const vulns = JSON.parse(r.vulns) as [string, string, string | null, string | null][];
-      const verdicts = JSON.parse(r.verdicts) as [string, string, string | null][];
+      // details: every writer's list merged (verdict_details), or the row's own for rows written before 0008.
+      const verdicts = (JSON.parse(r.verdicts) as [string, string, string | null, string | null][]).map(
+        ([sc, res, row, writers]): [string, string, string | null] => {
+          const d = verdictDetails(sc, row, writers === null ? null : JSON.stringify(writers));
+          return [sc, res, d === undefined ? null : JSON.stringify(d)];
+        },
+      );
       const pkg = { eco: r.eco, name: r.name, version: r.version };
       const mal = vulns.filter(([vid]) => vid.startsWith('MAL-')).map(([vid]) => vid);
       const malSources = blocks.filter(([s]) => isMaliciousSource(s));
@@ -305,7 +393,17 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
         ...(malScanners.length ? [`malicious verdict from ${malScanners.join(', ')}`] : []),
       ].join('; ');
       const otherBlocks = blocks.filter(([s]) => !isMaliciousSource(s)).map(([s, why]) => `${s}: ${why}`);
-      const flaggedRows = verdicts.filter(([, res]) => res === 'flagged');
+      // An image's Grype verdict lists its OS-package vulnerabilities: those become vuln items, not a flag.
+      // Fail closed: a flagged Grype verdict whose details yield no usable finding stays a flag.
+      const isGrype = (scanner: string) => r.eco === 'docker' && scanner === GRYPE;
+      const imageVulns: ImageVuln[] = [];
+      const flaggedRows = verdicts.filter(([sc, res, details]) => {
+        if (res !== 'flagged') return false;
+        if (!isGrype(sc)) return true;
+        const found = grypeFindings(parseJson(details));
+        imageVulns.push(...found);
+        return found.length === 0;
+      });
       const flaggedBy = flaggedRows.map(([s]) => s);
       const findings = flaggedRows.flatMap(([, , details]) => findingsOf(parseJson(details))).slice(0, MAX_FINDINGS);
       const notScanned = findings.some((f) => f.rule === ARCHIVE_ANOMALY);
@@ -329,6 +427,12 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
             fixed: known ? lowestFixed(list as string[], r.version, r.eco) : null,
           });
           add({ key: `vuln:${vid}:${id}:${p}`, project: p, kind: 'vuln', detail: clip(summary ? `${s}: ${summary}` : s), rank: RANK[s], ...todo });
+        }
+        for (const v of imageVulns) {
+          const fixed = v.fixed[0] ?? null;
+          const todo = todoFor({ kind: 'vuln', ...pkg, advisory: v.id, fixed, fixedPackage: v.package, repo });
+          const detail = `${v.severity}: ${v.package} ${v.version}${fixed !== null ? ` (fixed in ${fixed})` : ' (no fix yet)'}`;
+          add({ key: `vuln:${v.id}:${id}:${p}`, project: p, kind: 'vuln', detail: clip(detail), rank: RANK[v.severity], ...todo });
         }
         if (flaggedBy.length) {
           const todo = todoFor({ kind: 'flagged', ...pkg, notScanned, noFindings: findings.length === 0, repo });

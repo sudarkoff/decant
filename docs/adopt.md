@@ -10,7 +10,7 @@ Every example pins `sudarkoff/decant/action@<release-sha> # v0.1.0`. Replace `<r
 | --- | --- | --- |
 | `read` | installs: `setup` mode, developers, Docker builds | repo secret `DECANT_READ_TOKEN` |
 | `ci` | PR policy sync, scan, audit, adopt | repo secret `DECANT_CI_TOKEN` |
-| `sync` | main-branch policy sync only | **environment** secret `DECANT_SYNC_TOKEN` in `decant-sync` |
+| `sync` | main-branch policy sync, and the audit's reserved overlay refs (`audit`, `audit-images`) | **environment** secret `DECANT_SYNC_TOKEN` in `decant-sync` |
 
 ```sh
 npm run decant -- token create <project> read
@@ -50,7 +50,7 @@ Copy these to `.github/workflows/`:
   Runner cost: every decant check run takes a runner, and a busy PR (pushes, label changes, edits) starts several. The example sets `concurrency` with `cancel-in-progress`, so a newer run cancels the superseded one. Each audit PR also runs your repo's full CI; audit opens at most one PR per run.
 - `decant-main.yml`: on pushes to the default branch that change `decant.json`, weekly (Mondays 06:41 UTC), and on demand (`workflow_dispatch`), syncs the main policy using the environment's sync token. PR overlays are rejected until main has been synced once, so add this workflow first (see [step 5](#5-sync-main-then-run-adopt)). The same run also sends a dependency summary of the lockfiles (package names and versions, whether each is a direct dependency, and which direct dependencies pull it in; no URLs, hashes or secrets) so the dashboard's Freshness card can split direct dependencies from transitive ones. The summary refreshes whenever this workflow runs: a `decant.json` change, the weekly run, or a manual run. If sending it fails, the run warns and still passes. PR syncs never send it.
 - `decant-audit.yml`: daily at 05:23 UTC and on demand. **It runs on the default branch only**, and the job is guarded to refuse any other ref. It needs Node and Go on the runner (the example installs both) because it runs `npm` and `go` to prepare fixes. For an npm-only repo, delete the setup-go step (or use `go-version: stable` instead of `go-version-file`).
-  Each run opens **at most one security PR**, on branch `decant/security-fixes`, titled `decant: security fixes (N packages, M advisories)`. It groups advisories by package and raises each package to the highest fixed version its advisories need (per major line; direct dependencies are bumped, transitive ones get `overrides`), resolved through the overlay ref `audit`. The PR body lists every package, its advisories and severity, and anything left out. `decant.json` gains one advisory-cited `allow` entry per fixed version, so the fixes skip the cooldown.
+  Each run opens **at most one security PR**, on branch `decant/security-fixes`, titled `decant: security fixes (N packages, M advisories)`. It groups advisories by package and raises each package to the highest fixed version its advisories need (per major line; direct dependencies are bumped, transitive ones get `overrides`), resolved through the overlay ref `audit`. decant reserves `audit` (and `audit-images`) for the **sync token**, so no PR workflow's ci token can put allow entries there: give the audit step `sync-token` as well as `token` (the example does). The PR body lists every package, its advisories and severity, and anything left out. `decant.json` gains one advisory-cited `allow` entry per fixed version, so the fixes skip the cooldown.
   - If that PR is still open, the next run rebuilds its branch on the default head and refreshes it; it never opens a second one.
   - If you close it without merging, decant does not reopen the same set of fixes. A new advisory (a different set) opens a new PR. Only the most recently closed unmerged PR is compared: if you decline set A, then decline set B, a later run that finds set A again opens a PR for it.
   - decant reuses an open PR's branch only if it is still exactly decant's own single commit on the current default branch; anything else (a pushed commit, a moved default branch) is force-reset and recommitted. Auto-merge is turned off before that push when the batch doesn't qualify, and is only turned on for content the run itself just wrote.
@@ -172,6 +172,42 @@ docker build --secret id=npmrc,src=$HOME/.npmrc --secret id=netrc,src=$HOME/.net
 
 In CI, run the `setup` step first, then the same command; it reads the files `setup` wrote. Set `GOPROXY` in the Dockerfile with `ENV GOPROXY=https://<your-domain>/go`.
 
+### Pin base images by digest
+
+The PR scan gates base images too. Every `FROM`, every image pulled by `COPY --from=` or `RUN --mount=…,from=` (an earlier stage name or index is exempt), and a `# syntax=` frontend (code BuildKit runs) in a changed `Dockerfile`, `*.Dockerfile` or `Dockerfile.*` must be `scratch`, an earlier stage, or pinned by digest, and goes through the same checks. The tag stays as documentation:
+
+```dockerfile
+# syntax=docker/dockerfile:1@sha256:<digest>
+FROM node:22-alpine@sha256:<digest> AS build
+FROM build AS test
+FROM scratch
+```
+
+Find a tag's current digest with `docker buildx imagetools inspect node:22-alpine` (the `Digest:` line), or let the scan tell you: an unpinned `FROM` fails with a fix-it naming the digest the tag resolves to now. Use the index (multi-arch) digest, the one `imagetools inspect` prints first.
+
+What the scan checks for each digest that is new in the PR:
+
+- **Cooldown.** A digest's age counts from when decant first verified it in the registry (never the image's own `created` time, which the publisher controls). Main-branch sync reports the digests in use, so adopting decant does not block images you already build from. An `allow` entry skips the cooldown, as for npm and Go: `{ "package": "docker:docker.io/library/node@sha256:<digest>", "reason": "…", "added": "2026-11-20" }`. Names are fully qualified (`docker.io/library/node`, `ghcr.io/org/app`).
+- **Blocks.** `block` entries with `docker:` ids work like any other.
+- **Vulnerabilities.** Grype (pinned) scans the image straight from the registry. High or Critical findings with a fixed version fail the PR; findings with no fix are reported and pass. The daily audit re-scans every image in use and, once the tag points at a newer digest that has cleared the cooldown and removes a High or Critical finding, bumps the digest in the same security PR as npm and Go fixes.
+- **Registries.** decant resolves and scans public images on Docker Hub and ghcr.io. A private image there cannot be verified anonymously (the registry refuses the manifest), so it never starts a cooldown clock; an image on any other registry gets a cooldown clock for this project only and cannot be scanned. Either way it fails unless an `allow` entry names the digest.
+- **What fails closed.** An `ARG` in `FROM` without a default, a line decant cannot parse (it accepts only Dockerfile instructions, `#` comments and `RUN`/`COPY`/`ADD` heredocs it can read unambiguously), a digest the registry does not have, or a Grype or Grype database error.
+
+Images referenced outside Dockerfiles (compose files, `fly.toml`) are noted in the report but not gated.
+
+Limits to know:
+
+- **Quoted flags.** A `COPY` or `RUN` flag with quotes or escapes, such as `--chown="app:app"`, fails closed: write flag values unquoted (`--chown=app:app`).
+- **Build args.** decant resolves `ARG` values from their defaults in the Dockerfile. `docker build --build-arg BASE=…` replaces them at build time and bypasses this check. The scan adds a warning on every `FROM` whose image comes from an `ARG`; prefer a literal, pinned `FROM`, or never pass that build arg.
+- **Platforms.** For a multi-arch (index) digest, Grype scans the one platform it selects: the `FROM --platform=` value when it is a literal `linux/…`, otherwise the runner's. Other platforms in the index are not scanned, and a multi-platform build is checked for that one platform only.
+- **ENV from base images.** An `ENV` set by an external base image is trusted when decant evaluates `--mount` values (that image is itself pinned, cooled down and scanned); an `ENV` set in one of your own stages makes any `--mount` that uses it fail, including in stages built `FROM` that stage.
+- **ONBUILD in base images.** `ONBUILD` instructions inside a base image run in your build but are not inspected; only the Dockerfiles in your repo are.
+- **File names.** decant finds `Dockerfile`, `Dockerfile.*`, `*.Dockerfile`, `*.dockerfile`, `Containerfile`, `Containerfile.*` and `*.containerfile`. Other names (for example `Dockerfile-prod`) are not checked, and neither is a file passed with `docker build -f` under another name.
+
+### Upgrading: audit needs the sync token
+
+decant reserves the overlay refs the audit uses (`audit`, `audit-images`) for the `sync` token, so no PR workflow's `ci` token can put allow entries there. If your `decant-audit.yml` predates this, add `environment: decant-sync` to the job and `sync-token: ${{ secrets.DECANT_SYNC_TOKEN }}` to the audit step, as in the example; the audit fails at the start without it. Add the Dockerfile globs to `decant-main.yml`'s push `paths:` too (see the example).
+
 ## 8. Renovate and Dependabot
 
 Set their minimum release age equal to your `cooldownDays` so they stop proposing versions decant would still hide.
@@ -202,7 +238,8 @@ updates:
 - A flagged dependency on a `decant:security` PR (an audit fix) turns auto-merge off and says so in the report. `decant:reviewed` can still make the check green, but a person must merge it.
 - Lockfiles or directories that are symlinks fail the scan. decant does not follow them.
 - GuardDog runs in its sandbox. A runner that cannot run it fails closed: the scan fails instead of passing unchecked.
-- Fork PRs have no secrets: one that changes no lockfile passes; one that changes a lockfile fails until the branch is pushed to this repo.
+- Fork PRs have no secrets: one that changes no lockfile or Dockerfile passes; one that changes either fails until the branch is pushed to this repo.
+- Base images: see [Pin base images by digest](#pin-base-images-by-digest). The report has a **Base images** table with each new digest's cooldown and Grype result.
 
 ## Emergency bypass
 

@@ -8,6 +8,9 @@ import { fakeDeps, fakeExec, fakeFetch, jsonRes, memFs, type ExecCall, type Fetc
 
 afterEach(() => vi.restoreAllMocks());
 
+// The pinned tarball's checksum cannot be reproduced in a test: installing is covered in grype.test.ts.
+vi.mock('../src/grype', async (orig) => ({ ...(await orig<typeof import('../src/grype')>()), installGrype: async () => ({ bin: '/rt/decant-grype/grype' }) }));
+
 const TOKEN = 'ci-secret-tok';
 const GH = 'ghs_secret';
 const D = 'https://decant.example';
@@ -56,6 +59,14 @@ type World = {
   python?: string;
   gdExit?: { code: number; stderr: string; stdout?: string };
   dropVerdictGets?: number;
+  /** Dockerfiles at base, by path relative to /w (absent: did not exist). */
+  dockerBase?: Record<string, string>;
+  /** decant's /api/images decisions by name@digest (default: cleared, shared clock). */
+  decisions?: Record<string, Partial<{ clock: string; note: string; decision: string; allowed: boolean; firstSeen: string; eligibleAt: string; blocks: unknown[] }>>;
+  /** Registry tag → digest (name:tag). */
+  tags?: Record<string, string>;
+  /** Grype JSON (or an exit) per name@digest; default no matches. */
+  grypeOut?: Record<string, unknown | { code: number; stderr: string }>;
 };
 
 function harness(w: World) {
@@ -87,6 +98,7 @@ function harness(w: World) {
   const patched: string[] = [];
   const graphql: { query: string; variables: Record<string, unknown> }[] = [];
   let drops = w.dropVerdictGets ?? 0;
+  const imagePosts: { ref: string; images: { name: string; digest: string }[] }[] = [];
   const f = fakeFetch((c: FetchCall) => {
     const u = new URL(c.url);
     const key = `${c.method} ${c.url}`;
@@ -99,6 +111,23 @@ function harness(w: World) {
       return jsonRes({ verdicts: (w.verdicts?.[pkg] ?? []).map((v) => ({ package: pkg, scannerVersion: 'x', ...v })) });
     }
     if (key === `GET ${D}/api/blocks`) return jsonRes({ blocks: w.blocks ?? [] });
+    if (key === `POST ${D}/api/images`) {
+      const b = JSON.parse(c.body!) as { ref: string; images: { name: string; digest: string }[] };
+      imagePosts.push(b);
+      return jsonRes({
+        cooldownDays: 7,
+        images: b.images.map((i) => ({
+          name: i.name, digest: i.digest, clock: 'shared', firstSeen: '2026-11-01T00:00:00.000Z', eligibleAt: '2026-11-08T00:00:00.000Z',
+          decision: 'allow', allowed: false, blocks: [], ...w.decisions?.[`${i.name}@${i.digest}`],
+        })),
+      });
+    }
+    if (u.host === 'auth.docker.io') return jsonRes({ token: 't' });
+    if (u.host === 'registry-1.docker.io' && c.method === 'HEAD') {
+      const m = /^\/v2\/(.+)\/manifests\/(.+)$/.exec(u.pathname)!;
+      const dg = w.tags?.[`docker.io/${m[1]}:${m[2]}`];
+      return dg ? new Response(null, { headers: { 'docker-content-digest': dg } }) : new Response('', { status: 404 });
+    }
     if (key === `PUT ${D}/api/verdicts`) {
       puts.push(JSON.parse(c.body!));
       return new Response(null, { status: 204 });
@@ -165,6 +194,16 @@ function harness(w: World) {
   });
   const gdOut = w.guarddog ?? { package: 'x', results: { 'threat-npm-preinstall-script': {} }, errors: {}, issues: 0, risks: [] };
   const exec = fakeExec((c: ExecCall) => {
+    if (c.cmd === 'git' && w.dockerBase !== undefined && /:\.\/(.*Dockerfile.*)$/.test(c.args[1]!)) {
+      const rel = /:\.\/(.*)$/.exec(c.args[1]!)![1]!;
+      const t = w.dockerBase[rel];
+      return t === undefined ? { code: 128, stderr: `fatal: path '${rel}' exists on disk, but not in '${BASE}'` } : { stdout: t };
+    }
+    if (c.cmd === '/rt/decant-grype/grype') {
+      const target = c.args[0]!.replace(/^registry:/, '');
+      const out = w.grypeOut?.[target] ?? { matches: [] };
+      return out && typeof out === 'object' && 'code' in (out as object) ? (out as { code: number; stderr: string }) : { stdout: JSON.stringify(out) };
+    }
     if (c.cmd === 'git') {
       return w.base === null ? { code: 128, stderr: `fatal: path 'package-lock.json' exists on disk, but not in '${BASE}'` } : { stdout: w.base };
     }
@@ -187,6 +226,8 @@ function harness(w: World) {
     GITHUB_OUTPUT: output,
     RUNNER_TEMP: '/rt',
     GITHUB_ACTION_PATH: '/act',
+    DECANT_GRYPE_PLATFORM: 'linux',
+    DECANT_GRYPE_ARCH: 'x64',
   };
   const out: string[] = [];
   vi.spyOn(process.stdout, 'write').mockImplementation(((s: string) => (out.push(String(s)), true)) as typeof process.stdout.write);
@@ -199,6 +240,7 @@ function harness(w: World) {
     exec,
     fs,
     puts,
+    imagePosts,
     comments,
     removed,
     patched,
@@ -221,7 +263,7 @@ describe('scan', () => {
   it('fork PR with an empty token and no lockfile change: notice, exit 0, no network calls', async () => {
     const h = harness({ head: lock([LP]), base: lock([LP]), token: '', fork: true });
     expect(await h.run()).toBe(0);
-    expect(h.log()).toContain('::notice::fork PR changes no lockfile; nothing to scan');
+    expect(h.log()).toContain('::notice::fork PR changes no lockfile or Dockerfile; nothing to scan');
     expect(h.f.calls).toEqual([]);
     expect(h.exec.calls.map((c) => c.cmd)).toEqual(['git']);
     expect(h.outputs()).toMatch(/result<<\S+\npass\n/);
@@ -727,5 +769,145 @@ describe('scan review fixes', () => {
     expect(h.comments).toEqual([]);
     expect(h.patched).toHaveLength(1);
     expect(h.patched[0]).toContain('decant scan: ✅ pass');
+  });
+});
+
+describe('scan: base images', () => {
+  const DG = `sha256:${'1'.repeat(64)}`;
+  const DG2 = `sha256:${'2'.repeat(64)}`;
+  const NODE = 'docker.io/library/node';
+  const same = lock([LP]);
+  const docker = (head: string, base?: string, more: Partial<World> = {}) =>
+    harness({ head: same, base: same, extraFiles: { '/w/Dockerfile': head }, dockerBase: base === undefined ? {} : { Dockerfile: base }, ...more });
+  const vuln = (id: string, severity: string, pkg: string, fixed: string[]) => ({
+    vulnerability: { id, severity, fix: fixed.length ? { state: 'fixed', versions: fixed } : { state: 'not-fixed', versions: [] } },
+    artifact: { name: pkg, version: '1.0', type: 'deb' },
+  });
+
+  it('an unpinned FROM fails with a fix-it naming the digest the tag resolves to (sample: failing summary)', async () => {
+    const h = docker('FROM node:22 AS build\nFROM build\nFROM scratch\n', undefined, { tags: { [`${NODE}:22`]: DG } });
+    expect(await h.run()).toBe(1);
+    expect(h.summary()).toContain('decant scan: ❌ fail');
+    expect(h.summary()).toContain(`| \`node:22\` | Dockerfile:1 | — | — | ❌ not pinned by digest; pin it: \`FROM node:22@${DG}\` |`);
+    expect(h.log()).toContain('decant scan failed: 1 base image(s) need attention');
+    expect(h.imagePosts).toEqual([]); // nothing pinned to report
+  });
+
+  it('a new pinned digest that cleared cooldown and scans clean passes; the Grype verdict is stored (sample: passing summary)', async () => {
+    const h = docker(`FROM node:22@${DG}\n`, `FROM node:22@${DG2}\n`);
+    expect(await h.run()).toBe(0);
+    expect(h.imagePosts).toEqual([{ ref: 'pr-7', images: [{ name: NODE, digest: DG }] }]);
+    expect(h.summary()).toContain(`| \`${NODE}@${DG}\` | Dockerfile:1 | cleared (first seen 2026-11-01 00:00 UTC) | clean | ✅ ok |`);
+    expect(h.puts).toContainEqual({ package: `docker:${NODE}@${DG}`, scanner: 'grype', scannerVersion: '0.121.3', result: 'clean', details: [] });
+    const grype = h.exec.calls.find((c) => c.cmd === '/rt/decant-grype/grype')!;
+    expect(grype.args).toEqual([`registry:${NODE}@${DG}`, '-o', 'json', '-q']);
+    expect(grype.opts?.env).toMatchObject({ GRYPE_DB_CACHE_DIR: '/rt/decant-grype-db', GRYPE_DB_REQUIRE_UPDATE_CHECK: 'true' });
+  });
+
+  it('a digest already used at base is not gated again', async () => {
+    const h = docker(`FROM node:22@${DG}\nRUN true\n`, `FROM node:22@${DG}\n`);
+    expect(await h.run()).toBe(0);
+    expect(h.imagePosts).toEqual([]);
+  });
+
+  it('cooldown and unverified digests fail, with when and why', async () => {
+    const h = docker(`FROM node@${DG}\nFROM ghcr.io/acme/base@${DG2}\n`, undefined, {
+      decisions: {
+        [`${NODE}@${DG}`]: { decision: 'cooldown', firstSeen: '2026-11-18T00:00:00.000Z', eligibleAt: '2026-11-25T00:00:00.000Z' },
+        [`ghcr.io/acme/base@${DG2}`]: { decision: 'cooldown', clock: 'unverified', note: 'registry does not have this digest' },
+      },
+    });
+    expect(await h.run()).toBe(1);
+    expect(h.summary()).toContain('waiting for cooldown until 2026-11-25 00:00 UTC (first seen by decant 2026-11-18 00:00 UTC)');
+    expect(h.summary()).toContain('decant could not verify this digest in the registry (registry does not have this digest)');
+  });
+
+  it('High/Critical with a fix fails; without a fix it is reported and passes', async () => {
+    const h = docker(`FROM node@${DG}\nFROM node:20@${DG2}\n`, undefined, {
+      grypeOut: {
+        [`${NODE}@${DG}`]: { matches: [vuln('CVE-2026-1', 'Critical', 'openssl', ['3.0.15'])] },
+        [`${NODE}@${DG2}`]: { matches: [vuln('CVE-2026-2', 'High', 'zlib', [])] },
+      },
+    });
+    expect(await h.run()).toBe(1);
+    expect(h.summary()).toContain('❌ vulnerable: CVE-2026-1 (openssl 1.0 → 3.0.15)');
+    expect(h.summary()).toContain('✅ no fix yet: CVE-2026-2 (zlib 1.0)');
+    expect(h.puts.find((p) => (p as { package: string }).package === `docker:${NODE}@${DG}`)).toMatchObject({ result: 'flagged' });
+  });
+
+  it('COPY --from and RUN --mount from= images are gated like FROM; stage references are not', async () => {
+    const h = docker(
+      [`FROM node@${DG} AS build`, 'COPY --from=build /a /b', 'COPY --from=nginx:1.27 /etc/nginx /etc/nginx', `RUN --mount=type=bind,from=node:20@${DG2},target=/t true`].join('\n'),
+      undefined,
+      {
+        tags: { 'docker.io/library/nginx:1.27': DG2 },
+        decisions: { [`${NODE}@${DG2}`]: { decision: 'cooldown', firstSeen: '2026-11-18T00:00:00.000Z', eligibleAt: '2026-11-25T00:00:00.000Z' } },
+      },
+    );
+    expect(await h.run()).toBe(1);
+    const s = h.summary();
+    expect(s).toContain(`COPY --from image is not pinned by digest; pin it: \`COPY --from=nginx:1.27@${DG2}\``);
+    expect(h.imagePosts[0]!.images).toEqual([{ name: NODE, digest: DG }, { name: NODE, digest: DG2 }]);
+    expect(s).toContain(`| \`${NODE}@${DG2}\` | Dockerfile:4 | until 2026-11-25 00:00 UTC |`);
+    expect(h.exec.calls.filter((c) => c.cmd === '/rt/decant-grype/grype').map((c) => c.args[0])).toEqual([`registry:${NODE}@${DG}`, `registry:${NODE}@${DG2}`]);
+  });
+
+  it('a FROM built from an ARG gets a warning: a --build-arg bypasses the check', async () => {
+    const h = docker(['ARG BASE=node', `FROM \${BASE}@${DG}`].join('\n'));
+    expect(await h.run()).toBe(0);
+    expect(h.log()).toContain('::warning file=/w/Dockerfile::Dockerfile:2: value comes from ARG BASE; a --build-arg at build time bypasses this check');
+  });
+
+  it('a --mount built from an ARG warns; one with a platform ARG passes quietly', async () => {
+    const h = docker([`FROM node@${DG}`, 'ARG C=/c', 'RUN --mount=type=cache,id=npm-$TARGETPLATFORM,target=$C true'].join('\n'));
+    expect(await h.run()).toBe(0);
+    expect(h.log()).toContain('::warning file=/w/Dockerfile::Dockerfile:3: --mount value comes from ARG C; a --build-arg at build time bypasses this check');
+  });
+
+  it('a Grype failure (e.g. the DB check) is a scan error: fail closed', async () => {
+    const h = docker(`FROM node@${DG}\n`, undefined, { grypeOut: { [`${NODE}@${DG}`]: { code: 1, stderr: 'db update check failed' } } });
+    expect(await h.run()).toBe(1);
+    expect(h.summary()).toContain('scan error (see log)');
+    expect(h.log()).toContain('grype exited 1: db update check failed');
+  });
+
+  it('an unsupported registry is not scannable: fails unless an allow entry names the digest', async () => {
+    const img = `quay.io/acme/app@${DG}`;
+    const h = docker(`FROM ${img}\n`);
+    expect(await h.run()).toBe(1);
+    expect(h.summary()).toContain(`not scannable: decant scans Docker Hub and ghcr.io images only; add an allow entry for docker:${img} to accept it`);
+    const ok = docker(`FROM ${img}\n`, undefined, { decisions: { [img]: { allowed: true, clock: 'project' } } });
+    expect(await ok.run()).toBe(0);
+    expect(ok.summary()).toContain('accepted by an allow entry');
+  });
+
+  it('blocked, unreadable lines and an unpinned syntax frontend all fail', async () => {
+    const h = docker(['# syntax=docker/dockerfile:1', 'ARG BASE', `FROM node@${DG}`, 'FROM $BASE'].join('\n'), undefined, {
+      tags: { 'docker.io/docker/dockerfile:1': DG2 },
+      decisions: { [`${NODE}@${DG}`]: { decision: 'blocked', blocks: [{ source: 'policy:p', reason: 'bad | <b>build</b>' }] } },
+    });
+    expect(await h.run()).toBe(1);
+    const s = h.summary();
+    expect(s).toContain(`syntax frontend image is not pinned by digest; pin it: \`# syntax=docker/dockerfile:1@${DG2}\``);
+    expect(s).toContain('blocked by decant (policy:p: bad    b build /b )');
+    expect(s).toContain('| — | Dockerfile:4 | — | — | ❌ cannot read this line (see log) |');
+    expect(s).not.toContain('<b>');
+  });
+
+  it('registry- and image-derived text is escaped in the report', async () => {
+    const h = docker(`FROM node@${DG}\n`, undefined, {
+      grypeOut: { [`${NODE}@${DG}`]: { matches: [vuln('CVE-2026-3', 'High', '<img src=x>|`pkg`', ['1.1 | x'])] } },
+    });
+    expect(await h.run()).toBe(1);
+    const s = h.summary();
+    expect(s).not.toMatch(/<img|`pkg`/);
+    expect(s).toContain('CVE-2026-3 (?img?src?x???pkg? 1.0 → 1.1???x)');
+  });
+
+  it('a fork PR that changes a Dockerfile fails without network calls', async () => {
+    const h = docker(`FROM node@${DG}\n`, undefined, { token: '', fork: true });
+    expect(await h.run()).toBe(1);
+    expect(h.log()).toContain('fork changes Dockerfiles (Dockerfile); push the branch to this repo to scan it');
+    expect(h.f.calls).toEqual([]);
   });
 });

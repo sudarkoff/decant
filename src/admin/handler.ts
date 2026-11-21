@@ -3,12 +3,16 @@ import { json } from '../http';
 import { verifyAdvisoryFix } from '../osv';
 import { clearDecisionCaches, forgetDenied } from '../policy/decider';
 import { parsePolicy, type Policy } from '../policy/schema';
+import { recordImages, type ImageIn } from '../policy/images';
+import { hasKnownShape, sanitizeDetails, verdictDetails } from '../verdict-details';
 import { globalBlockStmt } from '../policy/store';
-import { PROJECT_ID_RE as ID_RE } from '../ids';
+import { DIGEST_RE, isImageRepo, PROJECT_ID_RE as ID_RE } from '../ids';
 import { formatPackageId, parsePackageId, type Deps, type Env, type PackageRef } from '../types';
 
 const MAX_BODY = 1024 * 1024;
 const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
+/** Overlay refs only the audit writes, with the sync token. */
+const RESERVED_REFS = new Set(['audit', 'audit-images']);
 const SCANNER_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const RESULTS = new Set(['clean', 'flagged', 'malicious']);
 const SEVERITY_SQL = (col: string) => `(CASE ${col} WHEN 'malicious' THEN 2 WHEN 'flagged' THEN 1 ELSE 0 END)`;
@@ -100,6 +104,11 @@ async function route(req: Request, env: Env, deps: Deps, auth: AuthCtx, path: st
     if (!isCi(auth)) return forbidden();
     return m === 'PUT' ? putVerdict(req, env, deps, auth.projectId) : getVerdicts(req, env);
   }
+  if (segs.length === 1 && segs[0] === 'images') {
+    if (m !== 'POST') return methodNotAllowed();
+    if (auth.kind !== 'ci' && auth.kind !== 'sync') return forbidden();
+    return postImages(req, env, deps, auth.projectId, auth.kind === 'sync');
+  }
   if (segs.length === 1 && segs[0] === 'blocks') {
     if (m !== 'GET') return methodNotAllowed();
     if (!isCi(auth)) return forbidden();
@@ -175,8 +184,12 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
   const project = await env.DB.prepare('SELECT main_ref FROM projects WHERE id = ?').bind(projectId).first<{ main_ref: string }>();
   if (!project) return notFound();
   const isMain = ref === project.main_ref;
+  // The audit's overlay refs: only the sync token may write them, so no ci token (any PR workflow) can put
+  // allow entries where the audit resolves its fixes and candidates.
+  const reserved = RESERVED_REFS.has(ref);
   if (isMain && !isSyncToken) return err(403, `use the sync token for ${project.main_ref}`);
-  if (!isMain && isSyncToken) return err(403, `sync tokens may only sync ${project.main_ref}`);
+  if (reserved && !isSyncToken) return err(403, `ref ${ref} is reserved for the audit (sync token)`);
+  if (!isMain && !reserved && isSyncToken) return err(403, `sync tokens may only sync ${project.main_ref}`);
 
   if (!isMain) {
     const main = await env.DB.prepare('SELECT json FROM policies WHERE project_id = ? AND ref = ?')
@@ -194,8 +207,9 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
     }
   }
 
-  // Verify every advisory allow before writing anything.
-  const advisories = policy.allow.filter((a) => a.advisory !== undefined);
+  // Verify every advisory allow before writing anything. OSV has no docker ecosystem: an image allow's
+  // advisory is recorded as cited (the allow itself is what a reviewer approved), never checked.
+  const advisories = policy.allow.filter((a) => a.advisory !== undefined && parsePackageId(a.package)!.eco !== 'docker');
   const checks = await Promise.all(
     advisories.map((a) => verifyAdvisoryFix(deps, a.advisory!, parsePackageId(a.package)!)),
   );
@@ -264,6 +278,48 @@ async function syncPolicy(req: Request, env: Env, deps: Deps, projectId: string,
   return reply({ ref, allows: policy.allow.length, blocks: policy.block.length });
 }
 
+const MAX_IMAGES = 200;
+const MAX_IMAGE_FILES = 20;
+const MAX_FILE_PATH = 512;
+
+/** Validates one image entry: a normalized repository, a sha256 digest, and (optionally) the Dockerfiles using it. */
+function imageRow(v: unknown, i: number): ImageIn | string {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return `images[${i}] must be an object`;
+  const d = v as Record<string, unknown>;
+  if (typeof d.name !== 'string' || !isImageRepo(d.name)) return `images[${i}].name must be a fully qualified repository like docker.io/library/node`;
+  if (typeof d.digest !== 'string' || !DIGEST_RE.test(d.digest)) return `images[${i}].digest must be sha256:<64 lowercase hex>`;
+  const files = d.files ?? [];
+  if (!Array.isArray(files) || files.length > MAX_IMAGE_FILES || !files.every((f) => shortString(f, MAX_FILE_PATH))) {
+    return `images[${i}].files must be at most ${MAX_IMAGE_FILES} paths`;
+  }
+  return { name: d.name, digest: d.digest, files: files as string[] };
+}
+
+/**
+ * Records when decant first saw each image digest and returns each one's cooldown / allow / block decision.
+ * The project is the token's. A sync token reports main (and replaces the images in use there); a ci token
+ * any other ref (PR scans, the audit's candidate digests).
+ */
+async function postImages(req: Request, env: Env, deps: Deps, projectId: string, isSyncToken: boolean): Promise<Response> {
+  const body = await readJsonObject(req);
+  if (typeof body.ref !== 'string' || !REF_RE.test(body.ref)) return err(400, 'ref must match ' + REF_RE.source);
+  if (!Array.isArray(body.images)) return err(400, 'images must be an array');
+  if (body.images.length > MAX_IMAGES) return err(400, `at most ${MAX_IMAGES} images per call`);
+  const list: ImageIn[] = [];
+  for (const [i, v] of body.images.entries()) {
+    const r = imageRow(v, i);
+    if (typeof r === 'string') return err(400, r);
+    list.push(r);
+  }
+  const project = await env.DB.prepare('SELECT main_ref FROM projects WHERE id = ?').bind(projectId).first<{ main_ref: string }>();
+  if (!project) return notFound();
+  const isMain = body.ref === project.main_ref;
+  if (isMain && !isSyncToken) return err(403, `use the sync token for ${project.main_ref}`);
+  if (!isMain && isSyncToken) return err(403, `sync tokens may only report ${project.main_ref}`);
+  // mainOnly: decide with main's allows only (the audit's candidates), whatever overlay exists under `ref`.
+  return reply(await recordImages(env, deps, projectId, body.ref, isMain, list, body.mainOnly === true));
+}
+
 const DEP_ECOS = new Set(['npm', 'go']);
 const MAX_DEP_NAME = 214;
 const MAX_DEP_VERSION = 128;
@@ -327,7 +383,8 @@ async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): P
   }
   if (typeof body.result !== 'string' || !RESULTS.has(body.result)) return err(400, 'result must be clean, flagged or malicious');
   const { scanner, scannerVersion, result } = body as { scanner: string; scannerVersion: string; result: string };
-  const details = body.details === undefined ? null : JSON.stringify(body.details);
+  const clean = sanitizeDetails(scanner, body.details);
+  const details = clean === undefined ? null : JSON.stringify(clean);
   const now = deps.now();
 
   const stmts: D1PreparedStatement[] = [
@@ -342,6 +399,19 @@ async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): P
        WHERE ${SEVERITY_SQL('excluded.result')} >= ${SEVERITY_SQL('verdicts.result')}`,
     ).bind(ref.eco, ref.name, ref.version, scanner, scannerVersion, result, details, now.toISOString(), writer),
   ];
+  // This writer's own details (known scanner shapes only; others live on the verdict row alone), and only
+  // when the write was accepted at the stored severity: the upsert above ran first in this batch, so the
+  // row's result equals this one exactly when this write was not a downgrade.
+  if (hasKnownShape(scanner) && Array.isArray(clean)) {
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO verdict_details (eco, name, version, scanner, project_id, details, at)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE EXISTS (
+           SELECT 1 FROM verdicts WHERE eco = ?1 AND name = ?2 AND version = ?3 AND scanner = ?4 AND result = ?8)
+         ON CONFLICT (eco, name, version, scanner, project_id) DO UPDATE SET details = excluded.details, at = excluded.at`,
+      ).bind(ref.eco, ref.name, ref.version, scanner, writer, details, now.toISOString(), result),
+    );
+  }
   if (result === 'malicious') {
     stmts.push(globalBlockStmt(env, ref, `verdict:${scanner}`, `malicious verdict from ${scanner} ${scannerVersion}`, now));
   }
@@ -355,21 +425,27 @@ async function getVerdicts(req: Request, env: Env): Promise<Response> {
   const ref: PackageRef | null = id ? parsePackageId(id) : null;
   if (!ref) return err(400, 'package query parameter must be a package ID');
   const r = await env.DB.prepare(
-    `SELECT scanner, scanner_version, result, details, scanned_at FROM verdicts
-     WHERE eco = ? AND name = ? AND version = ? ORDER BY scanner`,
+    `SELECT scanner, scanner_version, result, details, scanned_at,
+       (SELECT json_group_array(json(d.details)) FROM (
+          SELECT details FROM verdict_details d
+          WHERE d.eco = v.eco AND d.name = v.name AND d.version = v.version AND d.scanner = v.scanner ORDER BY d.at DESC, d.project_id) d) AS writers
+     FROM verdicts v WHERE eco = ? AND name = ? AND version = ? ORDER BY scanner`,
   )
     .bind(ref.eco, ref.name, ref.version)
-    .all<{ scanner: string; scanner_version: string; result: string; details: string | null; scanned_at: string }>();
+    .all<{ scanner: string; scanner_version: string; result: string; details: string | null; scanned_at: string; writers: string }>();
   const pkg = formatPackageId(ref);
   return reply({
-    verdicts: r.results.map((v) => ({
-      package: pkg,
-      scanner: v.scanner,
-      scannerVersion: v.scanner_version,
-      result: v.result,
-      ...(v.details !== null ? { details: JSON.parse(v.details) } : {}),
-      scannedAt: v.scanned_at,
-    })),
+    verdicts: r.results.map((v) => {
+      const details = verdictDetails(v.scanner, v.details, v.writers);
+      return {
+        package: pkg,
+        scanner: v.scanner,
+        scannerVersion: v.scanner_version,
+        result: v.result,
+        ...(details !== undefined ? { details } : {}),
+        scannedAt: v.scanned_at,
+      };
+    }),
   });
 }
 

@@ -277,7 +277,7 @@ const SCRIPT = String.raw`
   }
 
   // ---- Needs attention / Recently resolved ----
-  var LINK_HOSTS = ['osv.dev', 'www.npmjs.com', 'pkg.go.dev', 'github.com'];
+  var LINK_HOSTS = ['osv.dev', 'www.npmjs.com', 'pkg.go.dev', 'hub.docker.com', 'github.com'];
   var TICK = String.fromCharCode(96);
   var UrlParser = window.URL; // named so the page never contains the CSS url-function token
   function notScanned(item) {

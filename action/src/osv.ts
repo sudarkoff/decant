@@ -8,7 +8,7 @@ import type { Dep } from './lockfiles';
 export { cvss31BaseScore };
 
 const OSV = 'https://api.osv.dev';
-const OSV_ECO: Record<Ecosystem, string> = { npm: 'npm', go: 'Go' };
+const OSV_ECO: Record<Ecosystem, string> = { npm: 'npm', go: 'Go', docker: '' }; // docker: never queried (Grype scans images)
 const BATCH = 1000; // OSV querybatch limit
 const MAX_PAGES = 10;
 const DETAIL_CONCURRENCY = 8;

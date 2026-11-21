@@ -8,6 +8,14 @@ on:
     branches: [main]
     paths:
       - decant.json
+      # Base images in use: main sync reports their digests (starts their cooldown clocks, feeds the dashboard).
+      - '**/Dockerfile'
+      - '**/*.Dockerfile'
+      - '**/Dockerfile.*'
+      - '**/*.dockerfile'
+      - '**/Containerfile'
+      - '**/Containerfile.*'
+      - '**/*.containerfile'
   # Weekly: refreshes the dependency summary the dashboard uses (direct vs transitive).
   schedule:
     - cron: '41 6 * * 1'

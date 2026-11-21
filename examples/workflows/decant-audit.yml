@@ -11,6 +11,8 @@ jobs:
   audit:
     # Default branch only: audit opens fix PRs and issues against it.
     if: github.ref_name == github.event.repository.default_branch
+    # The sync token (overlay ref `audit` is reserved for it) lives in this default-branch-only environment.
+    environment: decant-sync
     runs-on: ubuntu-latest
     steps:
       - id: app
@@ -33,4 +35,6 @@ jobs:
           mode: audit
           decant-url: ${{ vars.DECANT_URL }}
           token: ${{ secrets.DECANT_CI_TOKEN }}
+          # The overlay ref the audit resolves fixes through is reserved for the sync token.
+          sync-token: ${{ secrets.DECANT_SYNC_TOKEN }}
           github-token: ${{ steps.app.outputs.token }}
