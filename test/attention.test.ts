@@ -204,6 +204,24 @@ describe('attention items', () => {
     ]);
   });
 
+  it('docker: a flagged Grype verdict with no usable findings is still listed (flagged); severities match in any case', async () => {
+    const D = `sha256:${'f'.repeat(64)}`;
+    const D2 = `sha256:${'e'.repeat(64)}`;
+    await project('web');
+    await exec(
+      "INSERT INTO project_images (project_id, name, digest, files, synced_at) VALUES ('web', 'docker.io/library/node', ?, '[]', '2026-11-18T00:00:00Z')",
+      [D],
+      [D2],
+    );
+    await exec(
+      "INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, details, scanned_at) VALUES ('docker', 'docker.io/library/node', ?, 'grype', '0.121.3', 'flagged', ?, '2026-11-18T00:00:00Z')",
+      [D, '{"garbage": true}'],
+      [D2, JSON.stringify([{ id: 'CVE-2026-4444', severity: 'Critical', package: 'glibc', version: '2.36', fixed: ['2.36-9'] }])],
+    );
+    const keysNow = keys((await attention(e, 'web', 30, NOW)).open).sort();
+    expect(keysNow).toEqual([`flagged:docker:docker.io/library/node@${D}:web`, `vuln:CVE-2026-4444:docker:docker.io/library/node@${D2}:web`]);
+  });
+
   it('a malicious verdict is malicious, and its verdict block does not also emit blocked', async () => {
     await project('p');
     await serve(['p', 'npm', 'z', '2.0.0', '2026-11-19']);

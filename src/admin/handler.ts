@@ -12,6 +12,8 @@ const MAX_BODY = 1024 * 1024;
 const REF_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SCANNER_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const RESULTS = new Set(['clean', 'flagged', 'malicious']);
+/** Findings kept when same-severity verdicts from different writers are merged. */
+const MAX_MERGED_DETAILS = 200;
 const SEVERITY_SQL = (col: string) => `(CASE ${col} WHEN 'malicious' THEN 2 WHEN 'flagged' THEN 1 ELSE 0 END)`;
 
 const NO_STORE = { 'cache-control': 'no-store' };
@@ -309,7 +311,7 @@ async function postImages(req: Request, env: Env, deps: Deps, projectId: string,
   const isMain = body.ref === project.main_ref;
   if (isMain && !isSyncToken) return err(403, `use the sync token for ${project.main_ref}`);
   if (!isMain && isSyncToken) return err(403, `sync tokens may only report ${project.main_ref}`);
-  return reply(await recordImages(env, projectId, body.ref, isMain, list, deps.now()));
+  return reply(await recordImages(env, deps, projectId, body.ref, isMain, list));
 }
 
 const DEP_ECOS = new Set(['npm', 'go']);
@@ -384,8 +386,19 @@ async function putVerdict(req: Request, env: Env, deps: Deps, writer: string): P
       // (malicious > flagged > clean), so one project's CI cannot clear another's finding.
       `INSERT INTO verdicts (eco, name, version, scanner, scanner_version, result, details, scanned_at, project_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+       -- At the same severity the stored findings are kept: details become the union (stored ones first,
+       -- capped), so a less complete write from another project never erases them.
        ON CONFLICT (eco, name, version, scanner) DO UPDATE SET
-         scanner_version = excluded.scanner_version, result = excluded.result, details = excluded.details,
+         scanner_version = excluded.scanner_version, result = excluded.result,
+         details = CASE
+           WHEN ${SEVERITY_SQL('excluded.result')} > ${SEVERITY_SQL('verdicts.result')} OR json_type(verdicts.details) IS NOT 'array' THEN excluded.details
+           WHEN json_type(excluded.details) IS NOT 'array' THEN verdicts.details
+           ELSE (SELECT json_group_array(CASE WHEN t IN ('object', 'array') THEN json(value) ELSE value END) FROM (
+                   SELECT value, t FROM (
+                     SELECT value, type AS t, 0 AS src, key AS k FROM json_each(verdicts.details)
+                     UNION ALL SELECT value, type, 1, key FROM json_each(excluded.details))
+                   GROUP BY value, t ORDER BY MIN(src * 1000000 + k) LIMIT ${MAX_MERGED_DETAILS}))
+         END,
          scanned_at = excluded.scanned_at, project_id = excluded.project_id
        WHERE ${SEVERITY_SQL('excluded.result')} >= ${SEVERITY_SQL('verdicts.result')}`,
     ).bind(ref.eco, ref.name, ref.version, scanner, scannerVersion, result, details, now.toISOString(), writer),

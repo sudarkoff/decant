@@ -280,11 +280,12 @@ export function grypeFindings(details: unknown): ImageVuln[] {
     if (!d || typeof d !== 'object') continue;
     const o = d as Record<string, unknown>;
     if (typeof o.id !== 'string' || !ADVISORY_ID.test(o.id) || seen.has(o.id)) continue;
-    if (o.severity !== 'critical' && o.severity !== 'high') continue;
+    const severity = typeof o.severity === 'string' ? o.severity.toLowerCase() : '';
+    if (severity !== 'critical' && severity !== 'high') continue;
     const str = (v: unknown) => (typeof v === 'string' ? clipTo(v, 100) : '?');
     const fixed = Array.isArray(o.fixed) ? o.fixed.filter((f): f is string => typeof f === 'string' && f.trim() !== '').map((f) => clipTo(f, 100)) : [];
     seen.add(o.id);
-    out.push({ id: o.id, severity: o.severity, package: str(o.package), version: str(o.version), fixed });
+    out.push({ id: o.id, severity, package: str(o.package), version: str(o.version), fixed });
   }
   return out;
 }
@@ -383,9 +384,16 @@ async function currentItems(env: Env, project: string, now: Date): Promise<Curre
       ].join('; ');
       const otherBlocks = blocks.filter(([s]) => !isMaliciousSource(s)).map(([s, why]) => `${s}: ${why}`);
       // An image's Grype verdict lists its OS-package vulnerabilities: those become vuln items, not a flag.
+      // Fail closed: a flagged Grype verdict whose details yield no usable finding stays a flag.
       const isGrype = (scanner: string) => r.eco === 'docker' && scanner === GRYPE;
-      const imageVulns = verdicts.filter(([sc, res]) => isGrype(sc) && res === 'flagged').flatMap(([, , details]) => grypeFindings(parseJson(details)));
-      const flaggedRows = verdicts.filter(([sc, res]) => res === 'flagged' && !isGrype(sc));
+      const imageVulns: ImageVuln[] = [];
+      const flaggedRows = verdicts.filter(([sc, res, details]) => {
+        if (res !== 'flagged') return false;
+        if (!isGrype(sc)) return true;
+        const found = grypeFindings(parseJson(details));
+        imageVulns.push(...found);
+        return found.length === 0;
+      });
       const flaggedBy = flaggedRows.map(([s]) => s);
       const findings = flaggedRows.flatMap(([, , details]) => findingsOf(parseJson(details))).slice(0, MAX_FINDINGS);
       const notScanned = findings.some((f) => f.rule === ARCHIVE_ANOMALY);
