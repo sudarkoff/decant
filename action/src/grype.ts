@@ -105,6 +105,8 @@ export function parseGrypeJson(stdout: string): GrypeResult {
     throw new Error('grype: invalid JSON output');
   }
   if (!doc || !Array.isArray(doc.matches)) throw new Error('grype: no matches in output');
+  // Keyed on the unclipped id, package, version, type and location (purl when present). Colliding matches
+  // merge: the highest severity and the union of fixes, so one no-fix duplicate never hides a fixable one.
   const seen = new Map<string, GrypeFinding>();
   for (const m of doc.matches as unknown[]) {
     const v = (m as { vulnerability?: Record<string, unknown> })?.vulnerability;
@@ -113,15 +115,24 @@ export function parseGrypeJson(stdout: string): GrypeResult {
     const sev = typeof v.severity === 'string' ? (SEV[v.severity.toLowerCase()] ?? 'unknown') : 'unknown';
     const fix = v.fix as { state?: unknown; versions?: unknown } | undefined;
     const fixed =
-      fix?.state === 'fixed' && Array.isArray(fix.versions) ? fix.versions.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map(clip) : [];
-    const f: GrypeFinding = {
-      id: clip(v.id),
-      severity: sev,
-      package: typeof a?.name === 'string' ? clip(a.name) : '?',
-      version: typeof a?.version === 'string' ? clip(a.version) : '?',
-      fixed,
-    };
-    seen.set(`${f.id}\u0000${f.package}\u0000${f.version}`, f);
+      fix?.state === 'fixed' && Array.isArray(fix.versions) ? fix.versions.filter((x): x is string => typeof x === 'string' && x.trim() !== '') : [];
+    const name = typeof a?.name === 'string' ? a.name : '?';
+    const version = typeof a?.version === 'string' ? a.version : '?';
+    const where = typeof a?.purl === 'string' && a.purl ? a.purl : JSON.stringify(a?.locations ?? null);
+    const k = JSON.stringify([v.id, name, version, typeof a?.type === 'string' ? a.type : '', where]);
+    const prev = seen.get(k);
+    if (!prev) {
+      seen.set(k, { id: v.id, severity: sev, package: name, version, fixed: [...new Set(fixed)] });
+      continue;
+    }
+    if (RANK[sev] < RANK[prev.severity]) prev.severity = sev;
+    prev.fixed = [...new Set([...prev.fixed, ...fixed])];
+  }
+  for (const f of seen.values()) {
+    f.id = clip(f.id);
+    f.package = clip(f.package);
+    f.version = clip(f.version);
+    f.fixed = f.fixed.map(clip);
   }
   const findings = [...seen.values()].sort((x, y) => RANK[x.severity] - RANK[y.severity] || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
   return { findings, failing: findings.filter((f) => isSerious(f) && f.fixed.length > 0), unfixed: findings.filter((f) => isSerious(f) && f.fixed.length === 0) };

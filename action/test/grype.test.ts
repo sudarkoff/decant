@@ -98,6 +98,34 @@ describe('grype scan', () => {
     expect(grypeVerdict(parseGrypeJson('{"matches":[]}'))).toEqual({ result: 'clean', details: [] });
   });
 
+  it('duplicate matches merge: highest severity, union of fixes (a fixable High plus a no-fix duplicate still fails)', () => {
+    const r = parseGrypeJson(
+      JSON.stringify({
+        matches: [
+          match('CVE-2026-9', 'High', 'openssl', '3.0', { state: 'fixed', versions: ['3.1'] }),
+          match('CVE-2026-9', 'Medium', 'openssl', '3.0', { state: 'not-fixed', versions: [] }),
+          match('CVE-2026-8', 'Low', 'zlib', '1', { state: 'not-fixed', versions: [] }),
+          match('CVE-2026-8', 'Critical', 'zlib', '1', { state: 'fixed', versions: ['2'] }),
+        ],
+      }),
+    );
+    expect(r.findings).toEqual([
+      { id: 'CVE-2026-8', severity: 'critical', package: 'zlib', version: '1', fixed: ['2'] },
+      { id: 'CVE-2026-9', severity: 'high', package: 'openssl', version: '3.0', fixed: ['3.1'] },
+    ]);
+    expect(r.failing.map((f) => f.id)).toEqual(['CVE-2026-8', 'CVE-2026-9']);
+  });
+
+  it('the same id and package at different locations stay separate', () => {
+    const at = (path: string, fix: boolean) => ({
+      vulnerability: { id: 'CVE-2026-7', severity: 'High', fix: fix ? { state: 'fixed', versions: ['2'] } : { state: 'not-fixed', versions: [] } },
+      artifact: { name: 'lib', version: '1', type: 'java-archive', locations: [{ path }] },
+    });
+    const r = parseGrypeJson(JSON.stringify({ matches: [at('/a.jar', true), at('/b.jar', false)] }));
+    expect(r.failing).toHaveLength(1);
+    expect(r.unfixed).toHaveLength(1);
+  });
+
   it('an incomplete report is never clean', () => {
     expect(() => parseGrypeJson('not json')).toThrow(/invalid JSON/);
     expect(() => parseGrypeJson('{}')).toThrow(/no matches/);
