@@ -170,7 +170,7 @@ describe('POST /api/images', () => {
     const allowedOnly = `sha256:${'9'.repeat(64)}`;
     await syncPolicy(A.sync, 'dka', { project: 'dka', allow: [{ package: `docker:${NODE}@${allowedOnly}`, reason: 'vendor hotfix', added: '2026-11-18' }] });
     const r = await images(A.ci, 'pr-6', [{ name: NODE, digest: allowedOnly }]);
-    expect(r.body.images[0]).toMatchObject({ clock: 'unverified', decision: 'allow' });
+    expect(r.body.images[0]).toMatchObject({ clock: 'unverified', decision: 'allow', allowed: true });
   });
 
   it('a private or unsupported-registry digest gets a per-project clock that never affects other projects', async () => {

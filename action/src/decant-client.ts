@@ -19,6 +19,20 @@ export type ProjectStatus = {
 };
 export type Download = { status: 'ok'; bytes: Uint8Array } | { status: 'cooldown' | 'blocked' | 'missing' };
 
+export type ImageDecision = {
+  name: string;
+  digest: string;
+  /** shared: decant verified it in the registry; project: private/unsupported registry, this project's clock; unverified: no clock yet. */
+  clock: 'shared' | 'project' | 'unverified';
+  note?: string;
+  firstSeen: string | null;
+  eligibleAt: string | null;
+  decision: 'allow' | 'cooldown' | 'blocked';
+  allowed: boolean;
+  blocks: { source: string; reason: string }[];
+};
+export type ImagesReply = { cooldownDays: number; images: ImageDecision[] };
+
 export type DecantClient = ReturnType<typeof decant>;
 
 /** Maps a 404 body from the npm/go handlers to a download status. */
@@ -152,6 +166,16 @@ export function decant(
         // keep text
       }
       return { status: res.status, body };
+    },
+
+    /**
+     * Reports image digests for `ref` and returns each one's decision. decant verifies new digests in the
+     * registry itself before starting any cooldown clock. A main report (sync token) replaces the images in
+     * use, so it is not retried on a gateway error (a late retry could overwrite a newer report).
+     */
+    async images(ref: string, images: { name: string; digest: string; files?: string[] }[], opts: { main?: boolean } = {}): Promise<ImagesReply> {
+      const res = await call('POST', '/api/images', { body: { ref, images }, retryStatuses: !opts.main });
+      return ok<ImagesReply>(res, 'decant POST /api/images');
     },
 
     async getVerdicts(pkgId: string): Promise<Verdict[]> {

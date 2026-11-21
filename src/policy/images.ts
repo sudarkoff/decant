@@ -37,6 +37,8 @@ export interface ImageDecision {
   eligibleAt: string | null;
   /** allow: past cooldown or allowed by policy; cooldown: wait (or not yet verified); blocked: global or policy block. */
   decision: 'allow' | 'cooldown' | 'blocked';
+  /** An allow entry (main or the ref's) names this digest. */
+  allowed: boolean;
   blocks: { source: string; reason: string }[];
 }
 
@@ -188,6 +190,7 @@ export async function recordImages(
         firstSeen: fs?.toISOString() ?? null,
         eligibleAt: fs ? new Date(fs.getTime() + cooldownDays * DAY_MS).toISOString() : null,
         decision: d === 'hidden' ? 'cooldown' : d,
+        allowed: allowed.has(k),
         blocks: b,
       };
     }),
