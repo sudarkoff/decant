@@ -5,6 +5,7 @@
  *
  * Only registries whose anonymous token flow decant knows are contacted: Docker Hub and ghcr.io.
  * Anything else is 'unsupported': decant never sends a request to a registry host taken from a Dockerfile.
+ * Optional Docker Hub credentials (a read-only PAT) go only to auth.docker.io, to lift the anonymous rate limit.
  */
 import { DIGEST_RE } from './ids';
 
@@ -45,10 +46,28 @@ export type ManifestResult =
   | { status: 'denied' }
   /** A registry decant does not query. */
   | { status: 'unsupported' }
-  /** Network error, timeout, 429 or 5xx, or a malformed answer: try again later. */
+  /** Network error, timeout, 429 ('rate limited') or 5xx, or a malformed answer: try again later. */
   | { status: 'error'; message: string };
 
-export type OciOpts = { fetch: typeof fetch; timeoutMs?: number };
+/** A pull token shared across clients (e.g. per isolate) until `expires` (ms since epoch). */
+export type TokenCache = Map<string, { token: string; expires: number }>;
+
+export type OciOpts = {
+  fetch: typeof fetch;
+  timeoutMs?: number;
+  /** Docker Hub username and read-only access token: sent as HTTP Basic to auth.docker.io only. */
+  dockerHub?: { username: string; token: string };
+  /** Shares tokens beyond this client, honouring expires_in. Without it, tokens live as long as the client. */
+  tokenCache?: TokenCache;
+  /** Clock for tokenCache expiry (ms). Default Date.now. */
+  now?: () => number;
+};
+
+/** Seconds a cached token is dropped before the registry's expires_in; expires_in defaults to 60 (distribution spec). */
+const TOKEN_MARGIN_S = 30;
+const MAX_CACHED_TOKENS = 1000;
+
+class RateLimited extends Error {}
 
 const TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 
@@ -89,9 +108,13 @@ async function sha256(bytes: ArrayBuffer): Promise<string> {
   return `sha256:${[...h].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
-/** One OCI client; anonymous pull tokens are cached per registry and repository for its lifetime (one request or run). */
+/**
+ * One OCI client; pull tokens are cached per registry, repository and credentials for its lifetime (one request or
+ * run), and in `tokenCache` (if given) until they expire.
+ */
 export function ociClient(o: OciOpts) {
   const timeoutMs = o.timeoutMs ?? 10_000;
+  const now = o.now ?? Date.now;
   const tokens = new Map<string, Promise<string | 'denied'>>();
 
   async function get(url: string, init: RequestInit = {}): Promise<Response> {
@@ -100,16 +123,32 @@ export function ociClient(o: OciOpts) {
   }
 
   async function token(registry: string, reg: Registry, path: string): Promise<string | 'denied'> {
-    const key = `${registry}/${path}`;
+    // Credentials only ever for docker.io (auth.docker.io); every other registry stays anonymous.
+    const creds = registry === 'docker.io' ? o.dockerHub : undefined;
+    const key = `${creds ? `user:${creds.username}@` : ''}${registry}/${path}`;
     let t = tokens.get(key);
     if (!t) {
+      const hit = o.tokenCache?.get(key);
+      if (hit && hit.expires > now()) return hit.token;
       t = (async () => {
-        const res = await get(reg.token(path));
+        const init: RequestInit = creds ? { headers: { authorization: `Basic ${btoa(`${creds.username}:${creds.token}`)}` } } : {};
+        const res = await get(reg.token(path), init);
+        if (res.status === 429) throw new RateLimited();
+        if (creds && (res.status === 401 || res.status === 403)) throw new Error(`Docker Hub credentials rejected (HTTP ${res.status})`);
         if (res.status === 401 || res.status === 403) return 'denied';
         if (!res.ok || res.status >= 300) throw new Error(`token endpoint HTTP ${res.status}`);
-        const body = (await res.json()) as { token?: unknown; access_token?: unknown };
+        const body = (await res.json()) as { token?: unknown; access_token?: unknown; expires_in?: unknown };
         const v = typeof body.token === 'string' ? body.token : typeof body.access_token === 'string' ? body.access_token : '';
         if (!v) throw new Error('token endpoint returned no token');
+        const ttl = (typeof body.expires_in === 'number' && body.expires_in > 0 ? body.expires_in : 60) - TOKEN_MARGIN_S;
+        if (o.tokenCache && ttl > 0) {
+          const at = now();
+          if (o.tokenCache.size >= MAX_CACHED_TOKENS) {
+            for (const [k, e] of o.tokenCache) if (e.expires <= at) o.tokenCache.delete(k);
+            if (o.tokenCache.size >= MAX_CACHED_TOKENS) o.tokenCache.clear();
+          }
+          o.tokenCache.set(key, { token: v, expires: at + ttl * 1000 });
+        }
         return v;
       })();
       tokens.set(key, t);
@@ -136,13 +175,17 @@ export function ociClient(o: OciOpts) {
       const headers = { accept: MANIFEST_ACCEPT, authorization: `Bearer ${t}` };
       let res = await get(url, { method: 'HEAD', headers });
       if (res.status === 404) return { status: 'not-found' };
+      if (res.status === 429) return { status: 'error', message: 'rate limited' };
       // Refused with the token the registry just issued: not evidence of a private image; try again later.
-      if (res.status === 401 || res.status === 403) return { status: 'error', message: `HTTP ${res.status} with an anonymous token` };
+      if (res.status === 401 || res.status === 403) {
+        return { status: 'error', message: `HTTP ${res.status} with ${registry === 'docker.io' && o.dockerHub ? 'a Docker Hub token' : 'an anonymous token'}` };
+      }
       if (!res.ok || res.status >= 300) return { status: 'error', message: `HTTP ${res.status}` };
       let digest = res.headers.get('docker-content-digest');
       if (digest === null) {
         res = await get(url, { headers });
         if (res.status === 404) return { status: 'not-found' };
+        if (res.status === 429) return { status: 'error', message: 'rate limited' };
         if (!res.ok || res.status >= 300) return { status: 'error', message: `HTTP ${res.status}` };
         const body = await readCapped(res, MAX_MANIFEST_BYTES);
         if (body === null) return { status: 'error', message: 'manifest larger than 4 MB' };
@@ -153,6 +196,7 @@ export function ociClient(o: OciOpts) {
       return { status: 'ok', digest };
     } catch (e) {
       const err = e as Error;
+      if (err instanceof RateLimited) return { status: 'error', message: 'rate limited' };
       return { status: 'error', message: ['TimeoutError', 'AbortError'].includes(err?.name) ? 'timed out' : String(err?.message ?? e) };
     }
   }

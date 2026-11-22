@@ -62,6 +62,21 @@ This prints the token and its hash. Save the token somewhere safe (a password ma
 npx wrangler secret put OPERATOR_TOKEN_HASH
 ```
 
+### Docker Hub credentials (recommended)
+
+The Worker verifies Docker image digests against Docker Hub before starting their cooldown clock. From Cloudflare's shared egress, Docker Hub often answers anonymous requests with HTTP 429, so Docker Hub digests stay unverified (in cooldown, with the note "registry rate limited; retry later"). Give the Worker a read-only Docker Hub token to lift that limit:
+
+1. Sign in to Docker Hub (any account works; a dedicated one is best), open **Account settings → Personal access tokens → Generate new token**.
+2. Give it a description such as `decant`, and set **Access permissions** to **Public Repo Read-only**.
+3. Store your Docker Hub username and the token as Worker secrets:
+
+```sh
+npx wrangler secret put DOCKERHUB_USERNAME
+npx wrangler secret put DOCKERHUB_TOKEN
+```
+
+Both must be set; with either missing, decant stays anonymous. The credentials are sent only to `auth.docker.io` (as HTTP Basic, to obtain a pull token), never to ghcr.io or any other host, and are never logged. Manifest checks use `HEAD`, which does not count toward Docker Hub's pull limit. To rotate, generate a new token, `npx wrangler secret put DOCKERHUB_TOKEN` again, then delete the old token on Docker Hub.
+
 ## 4. Custom domain
 
 Add a route to `wrangler.jsonc` (top level, next to `triggers`):

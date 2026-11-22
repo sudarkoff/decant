@@ -1,5 +1,5 @@
 import { env } from 'cloudflare:workers';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { handle } from '../src/index';
 import { seedProject } from './helpers';
 import type { Deps, Env } from '../src/types';
@@ -162,7 +162,7 @@ describe('POST /api/images', () => {
     try {
       const r = await images(A.ci, 'pr-6', [{ name: NODE, digest: dg('8') }, { name: NODE, digest: dg('1') }]);
       const by = (d: string) => r.body.images.find((i) => i.digest === d)!;
-      expect(by(dg('8'))).toMatchObject({ clock: 'unverified', decision: 'cooldown', note: 'registry error: token endpoint HTTP 503' });
+      expect(by(dg('8'))).toMatchObject({ clock: 'unverified', decision: 'cooldown', note: expect.stringMatching(/^registry error: (token endpoint )?HTTP 503$/) }); // token may be cached on the isolate
       expect(by(dg('1'))).toMatchObject({ clock: 'shared', decision: 'allow' }); // verified earlier: no registry call needed
     } finally {
       registryDown = false;
@@ -322,5 +322,77 @@ describe('docker verdicts', () => {
     const merged = (await details(id)) as unknown[];
     expect(merged).toHaveLength(3); // rule-a once; the malformed rule dropped
     expect(merged).toEqual(expect.arrayContaining(['rule-a', 'rule-c', { rule: 'rule-b', count: 2 }]));
+  });
+});
+
+describe('Docker Hub credentials (DOCKERHUB_USERNAME / DOCKERHUB_TOKEN)', () => {
+  const BASIC = `Basic ${btoa('hubuser:dckr_pat_s3cret')}`;
+  /** Records every request with its Authorization header; answers like the fake registry, or 429 when `limited`. */
+  function hub(limited = false) {
+    const seen: { url: string; auth: string | null }[] = [];
+    const f: typeof globalThis.fetch = async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ url: req.url, auth: req.headers.get('authorization') });
+      if (limited) return new Response('', { status: 429 });
+      return registry(req);
+    };
+    return { f, seen };
+  }
+  const post = (envOver: Partial<Env>, f: typeof globalThis.fetch, list: { name: string; digest: string }[]) =>
+    handle(
+      new Request('https://h/api/images', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${A.ci}` },
+        body: JSON.stringify({ ref: 'pr-hub', sha: 'abc', images: list }),
+      }),
+      { ...e, ...envOver },
+      { fetch: f, now: () => clock },
+      ctx,
+    );
+
+  it('both secrets set: Basic auth goes to auth.docker.io only, never to ghcr.io or the registry', async () => {
+    pushed.add(`docker.io/hubauth/a@${dg('7')}`);
+    pushed.add(`ghcr.io/hubauth/b@${dg('7')}`);
+    const { f, seen } = hub();
+    const r = await post({ DOCKERHUB_USERNAME: 'hubuser', DOCKERHUB_TOKEN: 'dckr_pat_s3cret' }, f, [
+      { name: 'docker.io/hubauth/a', digest: dg('7') },
+      { name: 'ghcr.io/hubauth/b', digest: dg('7') },
+    ]);
+    const body = (await r.json()) as ImagesReply;
+    expect(body.images.map((i) => i.clock)).toEqual(['shared', 'shared']);
+    expect(seen.filter((s) => s.auth === BASIC).map((s) => new URL(s.url).host)).toEqual(['auth.docker.io']);
+    expect(seen.some((s) => s.url.includes('s3cret'))).toBe(false);
+  });
+
+  it('only one secret set (or none): the anonymous path is unchanged', async () => {
+    for (const [n, over] of [{}, { DOCKERHUB_USERNAME: 'hubuser' }, { DOCKERHUB_TOKEN: 'dckr_pat_s3cret' }].entries()) {
+      pushed.add(`docker.io/hubanon/a${n}@${dg('7')}`);
+      const { f, seen } = hub();
+      const r = await post(over, f, [{ name: `docker.io/hubanon/a${n}`, digest: dg('7') }]);
+      expect(((await r.json()) as ImagesReply).images[0]!.clock).toBe('shared');
+      expect(seen.some((s) => new URL(s.url).host === 'auth.docker.io')).toBe(true);
+      expect(seen.every((s) => !s.auth?.startsWith('Basic '))).toBe(true);
+    }
+  });
+
+  it('429 from Docker Hub: unverified with a "rate limited" note, no clock, logged once without secrets', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { f } = hub(true);
+      const r = await post({ DOCKERHUB_USERNAME: 'hubuser', DOCKERHUB_TOKEN: 'dckr_pat_s3cret' }, f, [
+        { name: 'docker.io/hub429/a', digest: dg('8') },
+        { name: 'docker.io/hub429/b', digest: dg('8') },
+      ]);
+      const body = (await r.json()) as ImagesReply;
+      for (const i of body.images) {
+        expect(i).toMatchObject({ clock: 'unverified', decision: 'cooldown', firstSeen: null, note: 'registry rate limited; retry later' });
+      }
+      const v = await e.DB.prepare("SELECT COUNT(*) AS n FROM versions WHERE eco = 'docker' AND name LIKE 'docker.io/hub429/%'").first<{ n: number }>();
+      expect(v!.n).toBe(0);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/s3cret|hubuser/);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
