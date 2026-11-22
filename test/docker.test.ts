@@ -178,12 +178,13 @@ describe('POST /api/images', () => {
     pushed.add(`${NODE}@${d}`);
     await syncPolicy(A.sync, 'dka', { project: 'dka' });
     const sneaky = { project: 'dka', allow: [{ package: `docker:${NODE}@${d}`, reason: 'sneaky', added: '2026-11-18' }] };
-    // A ci token cannot write the audit's reserved refs at all.
-    for (const ref of ['audit', 'audit-images']) {
-      const r = await syncPolicy(A.ci, 'dka', sneaky, ref);
-      expect(r.status).toBe(403);
-      expect(await r.text()).toContain(`ref ${ref} is reserved for the audit`);
-    }
+    // A ci token cannot write audit-images at all.
+    const r403 = await syncPolicy(A.ci, 'dka', sneaky, 'audit-images');
+    expect(r403.status).toBe(403);
+    expect(await r403.text()).toContain('ref audit-images is reserved for the audit');
+    // `audit` stays writable by both tokens, because Action v0.1.x audits write it with the ci token.
+    expect((await syncPolicy(A.ci, 'dka', { project: 'dka' }, 'audit')).status).toBe(200);
+    expect((await syncPolicy(A.sync, 'dka', { project: 'dka' }, 'audit')).status).toBe(200);
     // Even if such an overlay existed (the sync token can write it), mainOnly ignores it.
     expect((await syncPolicy(A.sync, 'dka', sneaky, 'audit-images')).status).toBe(200);
     const viaOverlay = await images(A.ci, 'audit-images', [{ name: NODE, digest: d }]);
