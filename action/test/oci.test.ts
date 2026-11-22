@@ -49,11 +49,11 @@ describe('oci client', () => {
     const denied = fakeFetch(() => new Response('', { status: 401 }));
     expect(await ociClient({ fetch: denied }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'denied' });
     const down = registry(() => new Response('', { status: 503 }));
-    expect(await ociClient({ fetch: down }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: 'HTTP 503' });
+    expect(await ociClient({ fetch: down }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: 'docker hub: HTTP 503 (manifest); mirror.gcr.io: HTTP 503; public.ecr.aws: HTTP 503 (token endpoint)' });
     const boom = fakeFetch(() => {
       throw new TypeError('fetch failed');
     });
-    expect(await ociClient({ fetch: boom }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: 'fetch failed' });
+    expect(await ociClient({ fetch: boom }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: 'docker hub: fetch failed (token endpoint); mirror.gcr.io: fetch failed; public.ecr.aws: fetch failed' });
   });
 
   it('never contacts a registry it does not know', async () => {
@@ -89,16 +89,16 @@ describe('oci client', () => {
   it('a 401/403 on the manifest after a fresh anonymous token is an error (unverified), never denied', async () => {
     for (const status of [401, 403]) {
       const f = registry(() => new Response('', { status }));
-      expect(await ociClient({ fetch: f }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: `HTTP ${status} with an anonymous token` });
+      expect(await ociClient({ fetch: f }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: `docker hub: HTTP ${status} with an anonymous token (manifest)` });
     }
   });
 
   it('never follows redirects (3xx is an error); a manifest over 4 MB is not hashed', async () => {
     const r = registry((c) => (c.method === 'HEAD' ? new Response(null, { status: 307, headers: { location: 'https://elsewhere.example/x' } }) : undefined));
-    expect(await ociClient({ fetch: r }).resolveTag('docker.io/library/node', '22')).toEqual({ status: 'error', message: 'HTTP 307' });
+    expect(await ociClient({ fetch: r }).resolveTag('docker.io/library/node', '22')).toEqual({ status: 'error', message: 'docker hub: HTTP 307 (manifest)' });
     expect(r.calls.some((c) => c.url.includes('elsewhere'))).toBe(false);
     const big = registry((c) => (c.method === 'HEAD' ? new Response(null) : new Response(new Uint8Array(4 * 1024 * 1024 + 1))));
-    expect(await ociClient({ fetch: big }).resolveTag('docker.io/library/node', '22')).toEqual({ status: 'error', message: 'manifest larger than 4 MB' });
+    expect(await ociClient({ fetch: big }).resolveTag('docker.io/library/node', '22')).toEqual({ status: 'error', message: 'docker hub: manifest larger than 4 MB (manifest)' });
   });
 
   it('anonymous by default: the token request carries no Authorization header', async () => {
@@ -137,11 +137,11 @@ describe('oci client', () => {
     });
   });
 
-  it('HTTP 429 from the token endpoint or the manifest is "rate limited"', async () => {
+  it('HTTP 429 from the token endpoint or the manifest is rateLimited, and says which call', async () => {
     const tok429 = fakeFetch(() => new Response('', { status: 429 }));
-    expect(await ociClient({ fetch: tok429 }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: 'rate limited' });
+    expect(await ociClient({ fetch: tok429 }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', rateLimited: true, message: 'docker hub: rate limited (token endpoint); mirror.gcr.io: rate limited; public.ecr.aws: rate limited (token endpoint)' });
     const head429 = registry(() => new Response('', { status: 429 }));
-    expect(await ociClient({ fetch: head429 }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', message: 'rate limited' });
+    expect(await ociClient({ fetch: head429 }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'error', rateLimited: true, message: 'docker hub: rate limited (manifest); mirror.gcr.io: rate limited; public.ecr.aws: rate limited (token endpoint)' });
   });
 
   it('a shared token cache reuses a token across clients until expires_in (minus a margin), keyed by credentials', async () => {
@@ -171,5 +171,104 @@ describe('oci client', () => {
     const f = fakeFetch(() => undefined);
     expect((await ociClient({ fetch: f }).resolveTag('docker.io/library/node', '../x')).status).toBe('error');
     expect(f.calls).toEqual([]);
+  });
+});
+
+describe('Docker Hub mirrors (digest verification fallback)', () => {
+  const GCR = (path: string) => `https://mirror.gcr.io/v2/${path}/manifests/${D}`;
+  const ECR_TOKEN = 'https://public.ecr.aws/token/?scope=repository%3Adocker%2Flibrary%2Fnode%3Apull';
+  const ECR = `https://public.ecr.aws/v2/docker/library/node/manifests/${D}`;
+  const ok = () => new Response(null, { headers: { 'docker-content-digest': D } });
+  const hubHost = (u: string) => ['auth.docker.io', 'registry-1.docker.io'].includes(new URL(u).host);
+  const creds = { username: 'hubuser', token: 'dckr_pat_secret' };
+
+  it('Hub 429 -> mirror.gcr.io 200: verified via mirror.gcr.io (anonymous HEAD by digest, same Accept)', async () => {
+    const f = registry((c) => (hubHost(c.url) ? new Response('', { status: 429 }) : c.url === GCR('library/node') && c.method === 'HEAD' ? ok() : undefined));
+    expect(await ociClient({ fetch: f }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'ok', digest: D, via: 'mirror.gcr.io' });
+    const head = f.calls.find((c) => c.url === GCR('library/node'))!;
+    expect(head.method).toBe('HEAD');
+    expect(head.headers.get('accept')).toBe(MANIFEST_ACCEPT);
+    expect(head.headers.get('authorization')).toBeNull();
+    expect(head.signal).toBeDefined();
+    expect(f.calls.some((c) => new URL(c.url).host === 'public.ecr.aws')).toBe(false);
+  });
+
+  it('Hub 429 -> gcr 429 -> public.ecr.aws 200 (library image): verified via public.ecr.aws', async () => {
+    const f = fakeFetch((c) => {
+      if (hubHost(c.url) || new URL(c.url).host === 'mirror.gcr.io') return new Response('', { status: 429 });
+      if (c.url === ECR_TOKEN) return jsonRes({ token: 'ecr-tok' });
+      if (c.url === ECR && c.headers.get('authorization') === 'Bearer ecr-tok') return ok();
+      return undefined;
+    });
+    expect(await ociClient({ fetch: f }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'ok', digest: D, via: 'public.ecr.aws' });
+  });
+
+  it('non-library image: Hub 429 + gcr 404 -> unverified (rate limited), never denied; public.ecr.aws not asked', async () => {
+    const f = fakeFetch((c) => (hubHost(c.url) ? new Response('', { status: 429 }) : c.url === GCR('acme/app') ? new Response('', { status: 404 }) : undefined));
+    expect(await ociClient({ fetch: f }).verifyDigest('docker.io/acme/app', D)).toEqual({
+      status: 'error',
+      rateLimited: true,
+      message: 'docker hub: rate limited (token endpoint); mirror.gcr.io: HTTP 404',
+    });
+    expect(f.calls.some((c) => new URL(c.url).host === 'public.ecr.aws')).toBe(false);
+  });
+
+  it('a library image no source has: every failure is in the message', async () => {
+    const f = registry((c) => (hubHost(c.url) ? new Response('', { status: 429 }) : new URL(c.url).host === 'mirror.gcr.io' ? new Response('', { status: 429 }) : c.url === ECR_TOKEN ? jsonRes({ token: 'e' }) : new Response('', { status: 404 })));
+    expect(await ociClient({ fetch: f }).verifyDigest('docker.io/library/node', D)).toEqual({
+      status: 'error',
+      rateLimited: true,
+      message: 'docker hub: rate limited (manifest); mirror.gcr.io: rate limited; public.ecr.aws: HTTP 404',
+    });
+  });
+
+  it('Hub 5xx or a network error also falls back', async () => {
+    const down = registry((c) => (hubHost(c.url) ? new Response('', { status: 503 }) : c.url === GCR('library/node') ? ok() : undefined));
+    expect(await ociClient({ fetch: down }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'ok', digest: D, via: 'mirror.gcr.io' });
+    const boom = fakeFetch((c) => {
+      if (hubHost(c.url)) throw new TypeError('fetch failed');
+      return c.url === GCR('library/node') ? ok() : undefined;
+    });
+    expect(await ociClient({ fetch: boom }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'ok', digest: D, via: 'mirror.gcr.io' });
+  });
+
+  it("Hub's own 404 is final: not-found, no mirror is asked", async () => {
+    const f = registry((c) => (hubHost(c.url) ? new Response('', { status: 404 }) : ok()));
+    expect(await ociClient({ fetch: f }).verifyDigest('docker.io/library/node', D)).toEqual({ status: 'not-found' });
+    expect(f.calls.every((c) => hubHost(c.url))).toBe(true);
+  });
+
+  it('a mirror serving a different digest does not verify', async () => {
+    const f = registry((c) => (hubHost(c.url) ? new Response('', { status: 429 }) : c.url === GCR('acme/app') ? new Response(null, { headers: { 'docker-content-digest': `sha256:${'b'.repeat(64)}` } }) : undefined));
+    expect(await ociClient({ fetch: f }).verifyDigest('docker.io/acme/app', D)).toMatchObject({ status: 'error', message: 'docker hub: rate limited (token endpoint); mirror.gcr.io: registry returned a different digest' });
+  });
+
+  it('a mirror redirect is not followed', async () => {
+    const f = fakeFetch((c) => (hubHost(c.url) ? new Response('', { status: 429 }) : c.url === GCR('acme/app') ? new Response(null, { status: 302, headers: { location: 'https://elsewhere.example/' } }) : undefined));
+    expect(await ociClient({ fetch: f }).verifyDigest('docker.io/acme/app', D)).toMatchObject({ status: 'error', message: expect.stringContaining('mirror.gcr.io: HTTP 302') });
+    expect(f.calls.some((c) => c.url.includes('elsewhere'))).toBe(false);
+  });
+
+  it('Docker Hub credentials are never sent to the mirrors', async () => {
+    const basic = `Basic ${btoa('hubuser:dckr_pat_secret')}`;
+    const f = fakeFetch((c) => {
+      if (hubHost(c.url) || new URL(c.url).host === 'mirror.gcr.io') return new Response('', { status: 429 });
+      if (c.url === ECR_TOKEN) return jsonRes({ token: 'ecr-tok' });
+      return c.url === ECR ? ok() : undefined;
+    });
+    expect(await ociClient({ fetch: f, dockerHub: creds }).verifyDigest('docker.io/library/node', D)).toMatchObject({ status: 'ok', via: 'public.ecr.aws' });
+    const mirrorCalls = f.calls.filter((c) => !hubHost(c.url));
+    expect(mirrorCalls.map((c) => new URL(c.url).host).sort()).toEqual(['mirror.gcr.io', 'public.ecr.aws', 'public.ecr.aws']);
+    for (const c of mirrorCalls) {
+      expect(c.url).not.toContain('dckr_pat_secret');
+      expect([...c.headers.values()].some((v) => v === basic || v.includes('dckr_pat_secret') || v.includes('hubuser'))).toBe(false);
+    }
+  });
+
+  it('tags and other registries never use the mirrors', async () => {
+    const f = registry((c) => (hubHost(c.url) || new URL(c.url).host === 'ghcr.io' ? new Response('', { status: 429 }) : ok()));
+    expect(await ociClient({ fetch: f }).resolveTag('docker.io/library/node', '22')).toEqual({ status: 'error', rateLimited: true, message: 'docker hub: rate limited (manifest)' });
+    expect(await ociClient({ fetch: f }).verifyDigest('ghcr.io/acme/api', D)).toEqual({ status: 'error', rateLimited: true, message: 'rate limited' });
+    expect(f.calls.every((c) => hubHost(c.url) || new URL(c.url).host === 'ghcr.io')).toBe(true);
   });
 });

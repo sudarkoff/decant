@@ -5,7 +5,7 @@ import type { Policy } from './schema';
 
 const DEFAULT_COOLDOWN_DAYS = 7;
 const DAY_MS = 86_400_000;
-/** Registry verifications per request (each is up to 2-3 subrequests). The rest stay unverified until a later call. */
+/** Registry verifications per request (each is 2-3 subrequests; up to 8 when Docker Hub fails and its mirrors are asked). The rest stay unverified until a later call. */
 export const MAX_VERIFY = 10;
 
 export interface ImageIn {
@@ -29,7 +29,7 @@ export interface ImageDecision {
   name: string;
   digest: string;
   clock: Clock;
-  /** Why the clock is not shared (registry answer), when it is not. */
+  /** Why the clock is not shared (registry answer), or which Docker Hub mirror verified the digest just now. */
   note?: string;
   /** When the clock started; null when unverified. */
   firstSeen: string | null;
@@ -104,17 +104,18 @@ export async function recordImages(
       const r = await oci.verifyDigest(i.name, i.digest);
       if (r.status === 'ok') {
         toShare.push([i.name, i.digest]);
-        clock.set(k, { clock: 'shared' });
+        clock.set(k, r.via ? { clock: 'shared', note: `verified via ${r.via}` } : { clock: 'shared' });
       } else if (r.status === 'denied' || r.status === 'unsupported') {
         if (!own.has(k)) toOwn.push([i.name, i.digest]);
         clock.set(k, { clock: 'project', note: r.status === 'denied' ? 'anonymous pull refused (private image?)' : 'registry not supported' });
-      } else if (r.status === 'error' && r.message === 'rate limited') {
-        // Transient (Docker Hub limits anonymous pulls from shared egress): no clock; logged once per call.
+      } else if (r.status === 'error' && r.rateLimited) {
+        // Transient (Docker Hub limits pulls from shared egress, and no mirror had it): no clock; logged once per call.
+        // The message names each source and call that failed (no credentials in it).
         if (!rateLimitLogged) {
           rateLimitLogged = true;
-          console.warn(`decant: registry rate limited digest verification (${i.name.split('/')[0]}, ${dockerHub ? 'authenticated' : 'anonymous'})`);
+          console.warn(`decant: registry rate limited digest verification (${i.name.split('/')[0]}, ${dockerHub ? 'authenticated' : 'anonymous'}): ${r.message}`);
         }
-        clock.set(k, { clock: 'unverified', note: 'registry rate limited; retry later' });
+        clock.set(k, { clock: 'unverified', note: `registry rate limited; retry later (${r.message})` });
       } else {
         // not-found (e.g. not pushed yet) or a registry error: no clock; fail closed until verified.
         clock.set(k, { clock: 'unverified', note: r.status === 'not-found' ? 'registry does not have this digest' : `registry error: ${r.message}` });
@@ -193,7 +194,8 @@ export async function recordImages(
     cooldownDays,
     images: uniq.map((i): ImageDecision => {
       const k = key(i.name, i.digest);
-      const c = shared.has(k) ? { clock: 'shared' as const } : (clock.get(k) ?? { clock: 'unverified' as const });
+      const mine = clock.get(k);
+      const c = shared.has(k) ? (mine?.clock === 'shared' ? mine : { clock: 'shared' as const }) : (mine ?? { clock: 'unverified' as const });
       const seen = c.clock === 'shared' ? shared.get(k)! : c.clock === 'project' ? (own.get(k) ?? null) : null;
       const fs = seen === null ? null : new Date(seen);
       const b = blockedBy.get(k) ?? [];

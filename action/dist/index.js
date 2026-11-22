@@ -1067,11 +1067,34 @@ var REGISTRIES = {
     token: (path) => `https://ghcr.io/token?${new URLSearchParams({ service: "ghcr.io", scope: `repository:${path}:pull` })}`
   }
 };
+var DOCKER_HUB_MIRRORS = [
+  { host: "mirror.gcr.io", api: "https://mirror.gcr.io", repo: (path) => path },
+  {
+    host: "public.ecr.aws",
+    api: "https://public.ecr.aws",
+    repo: (path) => /^library\/[a-z0-9][a-z0-9._-]*$/.test(path) ? `docker/${path}` : null,
+    token: (repo) => `https://public.ecr.aws/token/?${new URLSearchParams({ scope: `repository:${repo}:pull` })}`
+  }
+];
 var isKnownRegistry = (registry) => Object.hasOwn(REGISTRIES, registry);
 function splitRepo(name) {
   const i = name.indexOf("/");
   return { registry: name.slice(0, i), path: name.slice(i + 1) };
 }
+var TOKEN_MARGIN_S = 30;
+var MAX_CACHED_TOKENS = 1e3;
+var RateLimited = class extends Error {
+};
+var HttpError = class extends Error {
+  constructor(status) {
+    super(`HTTP ${status}`);
+    this.status = status;
+  }
+  status;
+};
+var Final = class extends Error {
+};
+var errText = (e) => ["TimeoutError", "AbortError"].includes(e?.name) ? "timed out" : String(e?.message ?? e);
 var TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/;
 var MAX_MANIFEST_BYTES = 4 * 1024 * 1024;
 async function readCapped(res, max) {
@@ -1109,21 +1132,37 @@ async function sha256(bytes) {
 }
 function ociClient(o) {
   const timeoutMs = o.timeoutMs ?? 1e4;
+  const now = o.now ?? Date.now;
   const tokens = /* @__PURE__ */ new Map();
   async function get(url, init = {}) {
     return o.fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
   }
-  async function token(registry, reg, path) {
-    const key2 = `${registry}/${path}`;
+  async function token(registry, tokenUrl, path) {
+    const creds = registry === "docker.io" ? o.dockerHub : void 0;
+    const key2 = `${creds ? `user:${creds.username}@` : ""}${registry}/${path}`;
     let t = tokens.get(key2);
     if (!t) {
+      const hit = o.tokenCache?.get(key2);
+      if (hit && hit.expires > now()) return hit.token;
       t = (async () => {
-        const res = await get(reg.token(path));
+        const init = creds ? { headers: { authorization: `Basic ${btoa(`${creds.username}:${creds.token}`)}` } } : {};
+        const res = await get(tokenUrl, init);
+        if (res.status === 429) throw new RateLimited();
+        if (creds && (res.status === 401 || res.status === 403)) throw new Final(`Docker Hub credentials rejected (HTTP ${res.status})`);
         if (res.status === 401 || res.status === 403) return "denied";
-        if (!res.ok || res.status >= 300) throw new Error(`token endpoint HTTP ${res.status}`);
+        if (!res.ok || res.status >= 300) throw new HttpError(res.status);
         const body = await res.json();
         const v = typeof body.token === "string" ? body.token : typeof body.access_token === "string" ? body.access_token : "";
-        if (!v) throw new Error("token endpoint returned no token");
+        if (!v) throw new Final("token endpoint returned no token");
+        const ttl = (typeof body.expires_in === "number" && body.expires_in > 0 ? body.expires_in : 60) - TOKEN_MARGIN_S;
+        if (o.tokenCache && ttl > 0) {
+          const at = now();
+          if (o.tokenCache.size >= MAX_CACHED_TOKENS) {
+            for (const [k, e] of o.tokenCache) if (e.expires <= at) o.tokenCache.delete(k);
+            if (o.tokenCache.size >= MAX_CACHED_TOKENS) o.tokenCache.clear();
+          }
+          o.tokenCache.set(key2, { token: v, expires: at + ttl * 1e3 });
+        }
         return v;
       })();
       tokens.set(key2, t);
@@ -1131,37 +1170,89 @@ function ociClient(o) {
     }
     return t;
   }
+  async function lookup(url, headers, reference, byDigest) {
+    let res = await get(url, { method: "HEAD", headers });
+    if (!res.ok || res.status >= 300) return { status: res.status };
+    let digest = res.headers.get("docker-content-digest");
+    if (digest === null) {
+      res = await get(url, { headers });
+      if (!res.ok || res.status >= 300) return { status: res.status };
+      const body = await readCapped(res, MAX_MANIFEST_BYTES);
+      if (body === null) return { message: "manifest larger than 4 MB" };
+      digest = await sha256(body);
+    }
+    if (!DIGEST_RE.test(digest)) return { message: "registry returned a malformed digest" };
+    if (byDigest && digest !== reference) return { message: "registry returned a different digest" };
+    return { digest };
+  }
+  async function fromRegistry(registry, reg, path, reference, byDigest) {
+    const hub = registry === "docker.io";
+    const err = (message, where, extra = {}) => ({
+      status: "error",
+      message: hub ? `docker hub: ${message} (${where})` : message,
+      ...extra
+    });
+    let t;
+    try {
+      t = await token(registry, reg.token(path), path);
+    } catch (e) {
+      if (e instanceof RateLimited) return err("rate limited", "token endpoint", { rateLimited: true, retry: true });
+      if (e instanceof HttpError) return err(e.message, "token endpoint", { retry: e.status >= 500 });
+      if (e instanceof Final) return { status: "error", message: e.message };
+      return err(errText(e), "token endpoint", { retry: true });
+    }
+    if (t === "denied") return { status: "denied" };
+    let r;
+    try {
+      r = await lookup(`${reg.api}/v2/${path}/manifests/${reference}`, { accept: MANIFEST_ACCEPT, authorization: `Bearer ${t}` }, reference, byDigest);
+    } catch (e) {
+      return err(errText(e), "manifest", { retry: true });
+    }
+    if ("digest" in r) return { status: "ok", digest: r.digest };
+    if ("message" in r) return err(r.message, "manifest");
+    if (r.status === 404) return { status: "not-found" };
+    if (r.status === 429) return err("rate limited", "manifest", { rateLimited: true, retry: true });
+    if (r.status === 401 || r.status === 403) {
+      return err(`HTTP ${r.status} with ${hub && o.dockerHub ? "a Docker Hub token" : "an anonymous token"}`, "manifest");
+    }
+    return err(`HTTP ${r.status}`, "manifest", { retry: r.status >= 500 });
+  }
+  async function fromMirror(m, repo, digest) {
+    try {
+      const headers = { accept: MANIFEST_ACCEPT };
+      if (m.token) {
+        const t = await token(m.host, m.token(repo), repo);
+        if (t === "denied") return { message: "pull refused (token endpoint)" };
+        headers.authorization = `Bearer ${t}`;
+      }
+      const r = await lookup(`${m.api}/v2/${repo}/manifests/${digest}`, headers, digest, true);
+      if ("status" in r) return { message: r.status === 429 ? "rate limited" : `HTTP ${r.status}` };
+      return r;
+    } catch (e) {
+      if (e instanceof RateLimited) return { message: "rate limited (token endpoint)" };
+      if (e instanceof HttpError || e instanceof Final) return { message: `${e.message} (token endpoint)` };
+      return { message: errText(e) };
+    }
+  }
   async function manifest(name, reference) {
     const { registry, path } = splitRepo(name);
     const reg = REGISTRIES[registry];
     if (!reg) return { status: "unsupported" };
     const byDigest = DIGEST_RE.test(reference);
     if (!byDigest && !TAG_RE.test(reference)) return { status: "error", message: "invalid tag" };
-    try {
-      const t = await token(registry, reg, path);
-      if (t === "denied") return { status: "denied" };
-      const url = `${reg.api}/v2/${path}/manifests/${reference}`;
-      const headers = { accept: MANIFEST_ACCEPT, authorization: `Bearer ${t}` };
-      let res = await get(url, { method: "HEAD", headers });
-      if (res.status === 404) return { status: "not-found" };
-      if (res.status === 401 || res.status === 403) return { status: "error", message: `HTTP ${res.status} with an anonymous token` };
-      if (!res.ok || res.status >= 300) return { status: "error", message: `HTTP ${res.status}` };
-      let digest = res.headers.get("docker-content-digest");
-      if (digest === null) {
-        res = await get(url, { headers });
-        if (res.status === 404) return { status: "not-found" };
-        if (!res.ok || res.status >= 300) return { status: "error", message: `HTTP ${res.status}` };
-        const body = await readCapped(res, MAX_MANIFEST_BYTES);
-        if (body === null) return { status: "error", message: "manifest larger than 4 MB" };
-        digest = await sha256(body);
-      }
-      if (!DIGEST_RE.test(digest)) return { status: "error", message: "registry returned a malformed digest" };
-      if (byDigest && digest !== reference) return { status: "error", message: "registry returned a different digest" };
-      return { status: "ok", digest };
-    } catch (e) {
-      const err = e;
-      return { status: "error", message: ["TimeoutError", "AbortError"].includes(err?.name) ? "timed out" : String(err?.message ?? e) };
+    const r = await fromRegistry(registry, reg, path, reference, byDigest);
+    if (r.status !== "error") return r;
+    const { retry, ...res } = r;
+    if (registry !== "docker.io" || !byDigest || !retry) return res;
+    const failures = [res.message];
+    for (const m of DOCKER_HUB_MIRRORS) {
+      const repo = m.repo(path);
+      if (repo === null) continue;
+      const v = await fromMirror(m, repo, reference);
+      if ("digest" in v) return { status: "ok", digest: v.digest, via: m.host };
+      failures.push(`${m.host}: ${v.message}`);
     }
+    return { ...res, message: failures.join("; ") };
   }
   return {
     manifest,

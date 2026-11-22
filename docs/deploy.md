@@ -64,7 +64,7 @@ npx wrangler secret put OPERATOR_TOKEN_HASH
 
 ### Docker Hub credentials (recommended)
 
-The Worker verifies Docker image digests against Docker Hub before starting their cooldown clock. From Cloudflare's shared egress, Docker Hub often answers anonymous requests with HTTP 429, so Docker Hub digests stay unverified (in cooldown, with the note "registry rate limited; retry later"). Give the Worker a read-only Docker Hub token to lift that limit:
+The Worker verifies Docker image digests against Docker Hub before starting their cooldown clock. From Cloudflare's shared egress, Docker Hub often answers anonymous requests with HTTP 429, so Docker Hub digests could stay unverified (in cooldown, with a note starting "registry rate limited; retry later"). When Docker Hub answers 429, 5xx or not at all, the Worker asks two fixed mirrors anonymously: `mirror.gcr.io`, then (Docker Official Images only) `public.ecr.aws`. A mirror only serves manifests it fetched from Docker Hub, and a digest is the manifest's hash, so a mirror's 200 proves the digest was pushed; the image's note then says "verified via mirror.gcr.io" (or public.ecr.aws). A mirror's 404 proves nothing, so only Docker Hub's own 404 means "registry does not have this digest". The note names each source and call that failed, e.g. "docker hub: rate limited (token endpoint); mirror.gcr.io: HTTP 404". Credentials can still help lift the limit:
 
 1. Sign in to Docker Hub (any account works; a dedicated one is best), open **Account settings → Personal access tokens → Generate new token**.
 2. Give it a description such as `decant`, and set **Access permissions** to **Public Repo Read-only**.

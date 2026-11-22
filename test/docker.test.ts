@@ -162,7 +162,7 @@ describe('POST /api/images', () => {
     try {
       const r = await images(A.ci, 'pr-6', [{ name: NODE, digest: dg('8') }, { name: NODE, digest: dg('1') }]);
       const by = (d: string) => r.body.images.find((i) => i.digest === d)!;
-      expect(by(dg('8'))).toMatchObject({ clock: 'unverified', decision: 'cooldown', note: expect.stringMatching(/^registry error: (token endpoint )?HTTP 503$/) }); // token may be cached on the isolate
+      expect(by(dg('8'))).toMatchObject({ clock: 'unverified', decision: 'cooldown', note: expect.stringMatching(/^registry error: docker hub: HTTP 503 \((token endpoint|manifest)\); mirror\.gcr\.io: HTTP 503; public\.ecr\.aws: HTTP 503( \(token endpoint\))?$/) }); // tokens may be cached on the isolate
       expect(by(dg('1'))).toMatchObject({ clock: 'shared', decision: 'allow' }); // verified earlier: no registry call needed
     } finally {
       registryDown = false;
@@ -385,7 +385,12 @@ describe('Docker Hub credentials (DOCKERHUB_USERNAME / DOCKERHUB_TOKEN)', () => 
       ]);
       const body = (await r.json()) as ImagesReply;
       for (const i of body.images) {
-        expect(i).toMatchObject({ clock: 'unverified', decision: 'cooldown', firstSeen: null, note: 'registry rate limited; retry later' });
+        expect(i).toMatchObject({
+          clock: 'unverified',
+          decision: 'cooldown',
+          firstSeen: null,
+          note: expect.stringMatching(/^registry rate limited; retry later \(docker hub: rate limited \((token endpoint|manifest)\); mirror\.gcr\.io: rate limited\)$/),
+        });
       }
       const v = await e.DB.prepare("SELECT COUNT(*) AS n FROM versions WHERE eco = 'docker' AND name LIKE 'docker.io/hub429/%'").first<{ n: number }>();
       expect(v!.n).toBe(0);
@@ -394,5 +399,20 @@ describe('Docker Hub credentials (DOCKERHUB_USERNAME / DOCKERHUB_TOKEN)', () => 
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it('429 from Docker Hub, 200 from mirror.gcr.io: shared clock, "verified via mirror.gcr.io", no credentials to the mirror', async () => {
+    const d = dg('b');
+    const seen: { url: string; auth: string | null }[] = [];
+    const f: typeof globalThis.fetch = async (input, init) => {
+      const req = new Request(input, init);
+      const u = new URL(req.url);
+      seen.push({ url: req.url, auth: req.headers.get('authorization') });
+      if (u.host === 'mirror.gcr.io' && u.pathname === `/v2/hubmirror/a/manifests/${d}`) return new Response(null, { status: 200, headers: { 'docker-content-digest': d } });
+      return new Response('', { status: 429 });
+    };
+    const r = await post({ DOCKERHUB_USERNAME: 'hubuser', DOCKERHUB_TOKEN: 'dckr_pat_s3cret' }, f, [{ name: 'docker.io/hubmirror/a', digest: d }]);
+    expect(((await r.json()) as ImagesReply).images[0]).toMatchObject({ clock: 'shared', firstSeen: clock.toISOString(), note: 'verified via mirror.gcr.io' });
+    expect(seen.filter((s) => new URL(s.url).host === 'mirror.gcr.io').map((s) => s.auth)).toEqual([null]);
   });
 });
