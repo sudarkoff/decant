@@ -919,6 +919,58 @@ describe('audit: batch consistency', () => {
     expect(h.summary()).toMatch(/acorn.*failed/);
   });
 
+  it('a later package pulled past its target (not to it) → not skipped: its own fix runs, and no allow entry for an unlocked version', async () => {
+    const h = harness(
+      threeNpm((c, fs) => {
+        if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+        const spec = c.args.at(-1)!;
+        if (spec === 'acorn@1.0.1') bump(fs, '/w', 'acorn', '1.0.1');
+        if (spec === 'bpkg@2.0.1') {
+          bump(fs, '/w', 'bpkg', '2.0.1');
+          bump(fs, '/w', 'cpkg', '3.0.2'); // past cpkg's target 3.0.1: nothing remains, but 3.0.1 is not locked
+        }
+        if (spec === 'cpkg@3.0.1') bump(fs, '/w', 'cpkg', '3.0.1');
+      }),
+    );
+    expect(await h.run()).toBe(0);
+    // cpkg 3.0.2 is past the advisory, so npm update (a no-op here) runs instead of being skipped as fixed.
+    expect(h.exec.calls.filter((c) => c.cmd === 'npm' && c.args[0] === 'update' && c.args.at(-1) === 'cpkg')).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (2 packages, 2 advisories)');
+    const l = JSON.parse(h.written()['package-lock.json']!);
+    expect(l.packages['node_modules/cpkg'].version).toBe('3.0.2');
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:acorn@1.0.1', 'npm:bpkg@2.0.1']);
+    expect(h.summary()).toMatch(/cpkg.*unresolvable: no lockfile changes/);
+  });
+
+  it('a package unresolvable only because of a package dropped later → retried in the next round and ships', async () => {
+    const h = harness(
+      threeNpm((c, fs) => {
+        if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+        const spec = c.args.at(-1)!;
+        if (spec === 'acorn@1.0.1') {
+          bump(fs, '/w', 'acorn', '1.0.1');
+          bump(fs, '/w', 'cpkg', '3.0.1', 'node_modules/acorn/node_modules/cpkg'); // accepted: cpkg comes later
+        }
+        if (spec === 'bpkg@2.0.1') {
+          bump(fs, '/w', 'bpkg', '2.0.1');
+          bump(fs, '/w', 'acorn', '1.0.0'); // would regress acorn in round 1
+        }
+        if (spec === 'cpkg@3.0.1') return { code: 1, stderr: 'E500' };
+      }),
+    );
+    expect(await h.run()).toBe(0);
+    // Round 1: acorn done, bpkg unresolvable (would regress acorn), cpkg failed, so acorn is dropped. Round 2: bpkg alone ships.
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (1 package, 1 advisory)');
+    const l = JSON.parse(h.written()['package-lock.json']!);
+    expect(l.packages['node_modules/bpkg'].version).toBe('2.0.1');
+    expect(l.packages['node_modules/acorn/node_modules/cpkg']).toBeUndefined();
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:bpkg@2.0.1']);
+    expect(h.summary()).toMatch(/acorn.*unresolvable: pulls in overlay-only npm:cpkg@3\.0\.1, which did not ship/);
+    expect(h.summary()).toMatch(/cpkg.*failed/);
+    expect(h.exec.calls.filter((c) => c.cmd === 'npm' && c.args.at(-1) === 'cpkg@3.0.1')).toHaveLength(1); // failed: not retried
+  });
+
   it('pulling in the overlay-only version of a package that then fails → that package reverted, nothing ships', async () => {
     const AC = 'GHSA-acrn-0001-aaaa';
     const BP = 'GHSA-bpkg-0001-aaaa';

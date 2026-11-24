@@ -484,7 +484,8 @@ const pastCooldown = (ctx: FixCtx, at: Date, now: Date) => at.getTime() + ctx.po
  * released in lockstep, e.g. go.opentelemetry.io/otel and otel/trace): that is accepted, and the later
  * package is fixed without running anything if its copies already sit at their targets. If that later
  * package then does not ship, the run starts over from the checkout without it and without the
- * packages that pulled its version in (those become unresolvable). Packages that failed stay out.
+ * packages that pulled its version in (those become unresolvable). Packages that failed stay out;
+ * unresolvable ones are retried, since what blocked them may have been dropped.
  */
 async function applyAll(
   ctx: FixCtx,
@@ -499,12 +500,14 @@ async function applyAll(
   /** Packages out of the batch for good, with their outcome. */
   const dropped = new Map<Pkg, Outcome>();
   let done: { p: Pkg; dirs: string[] }[] = [];
+  /** This round's packages that did not ship. Only `failed` ones leave the batch; `unresolvable` ones retry next round. */
+  let failed = new Map<Pkg, Outcome>();
   const files: { path: string; contents: string }[] = [];
   try {
     for (;;) {
       for (const [abs, b] of orig) await put(abs, b); // every round starts from the checkout
       done = [];
-      const failed = new Map<Pkg, Outcome>();
+      failed = new Map<Pkg, Outcome>();
       /** Per done package: the overlay-only versions it pulled in, and the later package each is the target of. */
       const pulled = new Map<Pkg, Map<string, Pkg>>();
       const todo = pkgs.filter((p) => !dropped.has(p));
@@ -518,10 +521,11 @@ async function applyAll(
         };
         const dirs = [...new Set(p.copies.map((c) => dirname(join(ctx.wd, c.dep.file))))].sort();
         try {
-          // Already at its targets (pulled in by an earlier package's install): fixed as it stands.
+          // Already at its exact targets (pulled in by an earlier package's install): fixed as it stands.
+          // Only when the lockfiles hold the target versions themselves, so every allow entry the PR adds is locked.
           let left = 0;
           for (const dir of dirs) left += (await remaining(ctx, p, dir)).length;
-          if (left === 0) {
+          if (left === 0 && (await locksAll(ctx, dirs, p.eco, idsOf(p)))) {
             done.push({ p, dirs });
             continue;
           }
@@ -571,12 +575,12 @@ async function applyAll(
         const miss = [...(pulled.get(d.p) ?? [])].find(([, q]) => !shipped.has(q));
         return miss ? [{ p: d.p, id: miss[0] }] : [];
       });
-      for (const [p, o] of failed) dropped.set(p, o);
+      for (const [p, o] of failed) if (o.result === 'failed') dropped.set(p, o);
       if (!bad.length) break;
       for (const b of bad) dropped.set(b.p, { pkg: b.p, result: 'unresolvable', detail: `pulls in overlay-only ${safe(b.id)}, which did not ship` });
     }
     const shipped = new Set(done.map((d) => d.p));
-    for (const p of pkgs) outcomes.push(shipped.has(p) ? { pkg: p, result: 'fixed', detail: '' } : dropped.get(p)!);
+    for (const p of pkgs) outcomes.push(shipped.has(p) ? { pkg: p, result: 'fixed', detail: '' } : (dropped.get(p) ?? failed.get(p)!));
     for (const [abs, b] of orig) {
       const after = await read(abs);
       if (after !== null && after !== b) files.push({ path: ctx.repoPath(abs), contents: after });
@@ -585,6 +589,19 @@ async function applyAll(
     for (const [abs, b] of orig) await put(abs, b);
   }
   return { fixed: done.map((d) => d.p), files };
+}
+
+/** True if the lockfiles in `dirs` (package-lock.json or go.sum) together lock every id in `ids`. */
+async function locksAll(ctx: FixCtx, dirs: string[], eco: 'npm' | 'go', ids: string[]): Promise<boolean> {
+  const have = new Set<string>();
+  for (const dir of dirs) {
+    const abs = eco === 'npm' ? `${dir}/package-lock.json` : `${dir}/go.sum`;
+    if (!(await ctx.deps.fs.exists(abs))) continue;
+    const text = await ctx.deps.fs.readFile(abs);
+    const deps = eco === 'npm' ? parsePackageLock(text, abs, ctx.inputs.decantUrl) : parseGoSum(text, abs);
+    for (const d of deps) if (d.version) have.add(formatPackageId(d));
+  }
+  return ids.every((id) => have.has(id));
 }
 
 /**

@@ -2707,12 +2707,13 @@ async function applyAll(ctx, pkgs, outcomes, overlayOnly) {
   const orig = /* @__PURE__ */ new Map();
   const dropped = /* @__PURE__ */ new Map();
   let done = [];
+  let failed = /* @__PURE__ */ new Map();
   const files = [];
   try {
     for (; ; ) {
       for (const [abs, b] of orig) await put(abs, b);
       done = [];
-      const failed = /* @__PURE__ */ new Map();
+      failed = /* @__PURE__ */ new Map();
       const pulled = /* @__PURE__ */ new Map();
       const todo = pkgs.filter((p) => !dropped.has(p));
       const targetOf = new Map(todo.flatMap((p) => idsOf(p).map((id) => [id, p])));
@@ -2727,7 +2728,7 @@ async function applyAll(ctx, pkgs, outcomes, overlayOnly) {
         try {
           let left = 0;
           for (const dir of dirs) left += (await remaining(ctx, p, dir)).length;
-          if (left === 0) {
+          if (left === 0 && await locksAll(ctx, dirs, p.eco, idsOf(p))) {
             done.push({ p, dirs });
             continue;
           }
@@ -2774,12 +2775,12 @@ async function applyAll(ctx, pkgs, outcomes, overlayOnly) {
         const miss = [...pulled.get(d.p) ?? []].find(([, q]) => !shipped2.has(q));
         return miss ? [{ p: d.p, id: miss[0] }] : [];
       });
-      for (const [p, o] of failed) dropped.set(p, o);
+      for (const [p, o] of failed) if (o.result === "failed") dropped.set(p, o);
       if (!bad.length) break;
       for (const b of bad) dropped.set(b.p, { pkg: b.p, result: "unresolvable", detail: `pulls in overlay-only ${safe3(b.id)}, which did not ship` });
     }
     const shipped = new Set(done.map((d) => d.p));
-    for (const p of pkgs) outcomes.push(shipped.has(p) ? { pkg: p, result: "fixed", detail: "" } : dropped.get(p));
+    for (const p of pkgs) outcomes.push(shipped.has(p) ? { pkg: p, result: "fixed", detail: "" } : dropped.get(p) ?? failed.get(p));
     for (const [abs, b] of orig) {
       const after = await read(abs);
       if (after !== null && after !== b) files.push({ path: ctx.repoPath(abs), contents: after });
@@ -2788,6 +2789,17 @@ async function applyAll(ctx, pkgs, outcomes, overlayOnly) {
     for (const [abs, b] of orig) await put(abs, b);
   }
   return { fixed: done.map((d) => d.p), files };
+}
+async function locksAll(ctx, dirs, eco, ids) {
+  const have = /* @__PURE__ */ new Set();
+  for (const dir of dirs) {
+    const abs = eco === "npm" ? `${dir}/package-lock.json` : `${dir}/go.sum`;
+    if (!await ctx.deps.fs.exists(abs)) continue;
+    const text = await ctx.deps.fs.readFile(abs);
+    const deps = eco === "npm" ? parsePackageLock(text, abs, ctx.inputs.decantUrl) : parseGoSum(text, abs);
+    for (const d of deps) if (d.version) have.add(formatPackageId(d));
+  }
+  return ids.every((id) => have.has(id));
 }
 function strayOverlayVersions(ctx, fixed, files, overlayOnly) {
   const shipped = new Set(fixed.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package));
