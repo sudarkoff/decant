@@ -2568,11 +2568,12 @@ ${parsed.errors.map((m) => `- ${m}`).join("\n")}`);
         } else {
           const batch = pkgs.length ? await syncOverlay(ctx, pkgs, outcomes) : [];
           const locked = new Set(all.filter((d) => d.version).map(formatPackageId));
-          const { fixed, files } = batch.length ? await applyAll(ctx, batch, outcomes, locked) : { fixed: [], files: [] };
+          const overlayOnly = batch.length ? await overlayOnlyIds(ctx, batch, locked) : /* @__PURE__ */ new Set();
+          const { fixed, files } = batch.length ? await applyAll(ctx, batch, outcomes, overlayOnly) : { fixed: [], files: [] };
           if (!fixed.length && !bumps.length) prLine = "nothing to ship";
           else if (!open && declined(fixed)) prLine = `declined (#${closed.number} closed without merging the same fixes)`;
           else {
-            if (batch.length) strayOverlayVersions(ctx, batch, fixed, files, locked);
+            if (batch.length) strayOverlayVersions(ctx, fixed, files, overlayOnly);
             prLine = await publish(ctx, fixed, [...files, ...images.files], open, outcomes, unfixed, bumps);
           }
         }
@@ -2677,57 +2678,109 @@ async function syncOverlay(ctx, pkgs, outcomes) {
   }
   return batch;
 }
-async function applyAll(ctx, pkgs, outcomes, locked) {
-  const overlayOnly = new Set(pkgs.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package).filter((id) => !locked.has(id)));
+async function overlayOnlyIds(ctx, pkgs, locked) {
+  const now = ctx.deps.now();
+  const out = /* @__PURE__ */ new Set();
+  for (const id of new Set(pkgs.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package))) {
+    if (locked.has(id)) continue;
+    let at = null;
+    try {
+      at = await publishTime(ctx.deps, id);
+    } catch {
+    }
+    if (!at || !pastCooldown(ctx, at, now)) out.add(id);
+  }
+  return out;
+}
+async function publishTime(deps, id) {
+  const p = parsePackageId(id);
+  if (!p) return null;
+  if (p.eco === "npm") return npmPublishTime(deps.fetch, p.name, p.version);
+  if (p.eco === "go") return goPublishTime(deps.fetch, p.name, p.version);
+  return null;
+}
+var pastCooldown = (ctx, at, now) => at.getTime() + ctx.policy.cooldownDays * DAY2 <= now.getTime();
+async function applyAll(ctx, pkgs, outcomes, overlayOnly) {
   const { deps, inputs } = ctx;
   const read = async (abs) => await deps.fs.exists(abs) ? await deps.fs.readFile(abs) : null;
   const put = async (abs, v) => v === null ? deps.fs.rm(abs) : deps.fs.writeFile(abs, v);
   const orig = /* @__PURE__ */ new Map();
-  const done = [];
+  const dropped = /* @__PURE__ */ new Map();
+  let done = [];
+  let failed = /* @__PURE__ */ new Map();
   const files = [];
   try {
-    for (const p of pkgs) {
-      const before = /* @__PURE__ */ new Map();
-      const track = async (abs) => {
-        const cur = await read(abs);
-        if (!orig.has(abs)) orig.set(abs, cur);
-        if (!before.has(abs)) before.set(abs, cur);
-      };
-      const dirs = [...new Set(p.copies.map((c) => dirname(join3(ctx.wd, c.dep.file))))].sort();
-      try {
-        for (const dir of dirs) {
-          if (p.eco === "npm") await fixNpm(ctx, p, dir, track);
-          else await fixGo(ctx, p, dir, track);
+    for (; ; ) {
+      for (const [abs, b] of orig) await put(abs, b);
+      done = [];
+      failed = /* @__PURE__ */ new Map();
+      const pulled = /* @__PURE__ */ new Map();
+      const todo = pkgs.filter((p) => !dropped.has(p));
+      const targetOf = new Map(todo.flatMap((p) => idsOf(p).map((id) => [id, p])));
+      for (const [i, p] of todo.entries()) {
+        const before = /* @__PURE__ */ new Map();
+        const track = async (abs) => {
+          const cur = await read(abs);
+          if (!orig.has(abs)) orig.set(abs, cur);
+          if (!before.has(abs)) before.set(abs, cur);
+        };
+        const dirs = [...new Set(p.copies.map((c) => dirname(join3(ctx.wd, c.dep.file))))].sort();
+        try {
+          let left = 0;
+          for (const dir of dirs) left += (await remaining(ctx, p, dir)).length;
+          if (left === 0 && await locksAll(ctx, dirs, p.eco, idsOf(p))) {
+            done.push({ p, dirs });
+            continue;
+          }
+          for (const dir of dirs) {
+            if (p.eco === "npm") await fixNpm(ctx, p, dir, track);
+            else await fixGo(ctx, p, dir, track);
+          }
+          let changed = false;
+          for (const [abs, b] of before) if (await read(abs) !== b) changed = true;
+          if (!changed) throw new PkgError("unresolvable", "no lockfile changes");
+          for (const d of done) {
+            const left2 = [];
+            for (const dir of d.dirs) left2.push(...await remaining(ctx, d.p, dir));
+            if (left2.length) throw new PkgError("unresolvable", `would regress ${safe3(d.p.name)}: ${left2.join("; ")}`);
+          }
+          const ok = /* @__PURE__ */ new Set([...idsOf(p), ...done.flatMap((d) => idsOf(d.p))]);
+          const later = new Set(todo.slice(i + 1));
+          const mine = /* @__PURE__ */ new Map();
+          for (const abs of before.keys()) {
+            const text = await read(abs);
+            if (text === null) continue;
+            const rel = ctx.repoPath(abs);
+            const deps2 = isPackageLock(rel) ? parsePackageLock(text, rel, ctx.inputs.decantUrl) : rel === "go.sum" || rel.endsWith("/go.sum") ? parseGoSum(text, rel) : [];
+            for (const id of deps2.map((d) => formatPackageId(d))) {
+              if (!overlayOnly.has(id) || ok.has(id)) continue;
+              const q = targetOf.get(id);
+              if (!q || !later.has(q)) throw new PkgError("unresolvable", `pulls in overlay-only ${safe3(id)}`);
+              mine.set(id, q);
+            }
+          }
+          pulled.set(p, mine);
+          done.push({ p, dirs });
+        } catch (e) {
+          if (systemic(e)) throw e;
+          for (const [abs, b] of before) await put(abs, b);
+          const msg = redact(e.message, [inputs.token, inputs.githubToken]);
+          const result = e instanceof PkgError ? e.result : "failed";
+          if (result === "failed") warning(`${safe3(p.name)}: ${msg}`);
+          failed.set(p, { pkg: p, result, detail: msg });
         }
-        let changed = false;
-        for (const [abs, b] of before) if (await read(abs) !== b) changed = true;
-        if (!changed) throw new PkgError("unresolvable", "no lockfile changes");
-        for (const d of done) {
-          const left = [];
-          for (const dir of d.dirs) left.push(...await remaining(ctx, d.p, dir));
-          if (left.length) throw new PkgError("unresolvable", `would regress ${safe3(d.p.name)}: ${left.join("; ")}`);
-        }
-        const ok = /* @__PURE__ */ new Set([...idsOf(p), ...done.flatMap((d) => idsOf(d.p))]);
-        for (const abs of before.keys()) {
-          const text = await read(abs);
-          if (text === null) continue;
-          const rel = ctx.repoPath(abs);
-          const deps2 = isPackageLock(rel) ? parsePackageLock(text, rel, ctx.inputs.decantUrl) : rel === "go.sum" || rel.endsWith("/go.sum") ? parseGoSum(text, rel) : [];
-          const stray = deps2.map((d) => formatPackageId(d)).find((id) => overlayOnly.has(id) && !ok.has(id));
-          if (stray) throw new PkgError("unresolvable", `pulls in overlay-only ${safe3(stray)}`);
-        }
-        const o = { pkg: p, result: "fixed", detail: "" };
-        outcomes.push(o);
-        done.push({ p, o, dirs });
-      } catch (e) {
-        if (systemic(e)) throw e;
-        for (const [abs, b] of before) await put(abs, b);
-        const msg = redact(e.message, [inputs.token, inputs.githubToken]);
-        const result = e instanceof PkgError ? e.result : "failed";
-        if (result === "failed") warning(`${safe3(p.name)}: ${msg}`);
-        outcomes.push({ pkg: p, result, detail: msg });
       }
+      const shipped2 = new Set(done.map((d) => d.p));
+      const bad = done.flatMap((d) => {
+        const miss = [...pulled.get(d.p) ?? []].find(([, q]) => !shipped2.has(q));
+        return miss ? [{ p: d.p, id: miss[0] }] : [];
+      });
+      for (const [p, o] of failed) if (o.result === "failed") dropped.set(p, o);
+      if (!bad.length) break;
+      for (const b of bad) dropped.set(b.p, { pkg: b.p, result: "unresolvable", detail: `pulls in overlay-only ${safe3(b.id)}, which did not ship` });
     }
+    const shipped = new Set(done.map((d) => d.p));
+    for (const p of pkgs) outcomes.push(shipped.has(p) ? { pkg: p, result: "fixed", detail: "" } : dropped.get(p) ?? failed.get(p));
     for (const [abs, b] of orig) {
       const after = await read(abs);
       if (after !== null && after !== b) files.push({ path: ctx.repoPath(abs), contents: after });
@@ -2737,9 +2790,20 @@ async function applyAll(ctx, pkgs, outcomes, locked) {
   }
   return { fixed: done.map((d) => d.p), files };
 }
-function strayOverlayVersions(ctx, overlay, fixed, files, locked) {
+async function locksAll(ctx, dirs, eco, ids) {
+  const have = /* @__PURE__ */ new Set();
+  for (const dir of dirs) {
+    const abs = eco === "npm" ? `${dir}/package-lock.json` : `${dir}/go.sum`;
+    if (!await ctx.deps.fs.exists(abs)) continue;
+    const text = await ctx.deps.fs.readFile(abs);
+    const deps = eco === "npm" ? parsePackageLock(text, abs, ctx.inputs.decantUrl) : parseGoSum(text, abs);
+    for (const d of deps) if (d.version) have.add(formatPackageId(d));
+  }
+  return ids.every((id) => have.has(id));
+}
+function strayOverlayVersions(ctx, fixed, files, overlayOnly) {
   const shipped = new Set(fixed.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package));
-  const stray = new Set(overlay.flatMap((p) => allowEntries(ctx, p)).map((a) => a.package).filter((id) => !shipped.has(id) && !locked.has(id)));
+  const stray = new Set([...overlayOnly].filter((id) => !shipped.has(id)));
   if (!stray.size) return;
   const hits = /* @__PURE__ */ new Set();
   for (const f of files) {
@@ -3048,7 +3112,7 @@ async function pruneAllow(ctx, now) {
     if (!p) continue;
     let at = null;
     try {
-      at = p.eco === "npm" ? await npmPublishTime(deps.fetch, p.name, p.version) : await goPublishTime(deps.fetch, p.name, p.version);
+      at = await publishTime(deps, e.package);
     } catch (err) {
       warning(`prune: ${safe3(e.package)}: ${err.message}`);
     }
@@ -3056,7 +3120,7 @@ async function pruneAllow(ctx, now) {
       unknown++;
       continue;
     }
-    if (at.getTime() + ctx.policy.cooldownDays * DAY2 <= now.getTime()) expired.push({ e, at });
+    if (pastCooldown(ctx, at, now)) expired.push({ e, at });
   }
   if (!expired.length) return `nothing expired${unknown ? ` (${unknown} publish time(s) unknown)` : ""}`;
   const gone = new Set(expired.map((x) => x.e));

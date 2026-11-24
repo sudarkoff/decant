@@ -822,47 +822,153 @@ describe('audit: batch consistency', () => {
     expect(h.summary()).toMatch(/minimist.*unresolvable: would regress lodash/);
   });
 
-  it("a package whose install pulls in another package's overlay-only version → that package unresolvable and reverted; the others ship", async () => {
-    const AC = 'GHSA-acrn-0001-aaaa';
-    const BP = 'GHSA-bpkg-0001-aaaa';
-    const CP = 'GHSA-cpkg-0001-aaaa';
-    const h = harness({
-      files: {
-        '/w/package.json': JSON.stringify({ name: 'app', dependencies: { acorn: '^1.0.0', bpkg: '^2.0.0', cpkg: '^3.0.0' } }, null, 2),
-        '/w/package-lock.json': lock([
-          { name: 'acorn', version: '1.0.0' },
-          { name: 'bpkg', version: '2.0.0' },
-          { name: 'cpkg', version: '3.0.0' },
-        ]),
-      },
-      osv: { 'acorn@1.0.0': [AC], 'bpkg@2.0.0': [BP], 'cpkg@3.0.0': [CP] },
-      records: {
-        [AC]: npmRecord(AC, 'acorn', [{ introduced: '0' }, { fixed: '1.0.1' }]),
-        [BP]: npmRecord(BP, 'bpkg', [{ introduced: '0' }, { fixed: '2.0.1' }]),
-        [CP]: npmRecord(CP, 'cpkg', [{ introduced: '0' }, { fixed: '3.0.1' }]),
-      },
-      exec: (c, fs) => {
+  const AC = 'GHSA-acrn-0001-aaaa';
+  const BP = 'GHSA-bpkg-0001-aaaa';
+  const CP = 'GHSA-cpkg-0001-aaaa';
+  /** acorn, bpkg, cpkg each with one fixable advisory; `exec` decides what each install does. */
+  const threeNpm = (exec: World['exec'], extra: Partial<World> = {}): World => ({
+    files: {
+      '/w/package.json': JSON.stringify({ name: 'app', dependencies: { acorn: '^1.0.0', bpkg: '^2.0.0', cpkg: '^3.0.0' } }, null, 2),
+      '/w/package-lock.json': lock([
+        { name: 'acorn', version: '1.0.0' },
+        { name: 'bpkg', version: '2.0.0' },
+        { name: 'cpkg', version: '3.0.0' },
+      ]),
+    },
+    osv: { 'acorn@1.0.0': [AC], 'bpkg@2.0.0': [BP], 'cpkg@3.0.0': [CP] },
+    records: {
+      [AC]: npmRecord(AC, 'acorn', [{ introduced: '0' }, { fixed: '1.0.1' }]),
+      [BP]: npmRecord(BP, 'bpkg', [{ introduced: '0' }, { fixed: '2.0.1' }]),
+      [CP]: npmRecord(CP, 'cpkg', [{ introduced: '0' }, { fixed: '3.0.1' }]),
+    },
+    exec,
+    ...extra,
+  });
+
+  it("a package whose install pulls in a later package's overlay-only fix → accepted; that package still runs its own fix; all ship", async () => {
+    const h = harness(
+      threeNpm((c, fs) => {
         if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
         const spec = c.args.at(-1)!;
         if (spec === 'acorn@1.0.1') bump(fs, '/w', 'acorn', '1.0.1');
         if (spec === 'bpkg@2.0.1') {
           bump(fs, '/w', 'bpkg', '2.0.1');
-          bump(fs, '/w', 'cpkg', '3.0.1', 'node_modules/bpkg/node_modules/cpkg'); // cpkg's overlay-only fix, before cpkg ships
+          bump(fs, '/w', 'cpkg', '3.0.1', 'node_modules/bpkg/node_modules/cpkg'); // cpkg's overlay-only fix, before cpkg's turn
         }
         if (spec === 'cpkg@3.0.1') bump(fs, '/w', 'cpkg', '3.0.1');
-      },
-    });
+      }),
+    );
     expect(await h.run()).toBe(0);
     expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (3 packages, 3 advisories)');
+    const l = JSON.parse(h.written()['package-lock.json']!);
+    expect(l.packages['node_modules/bpkg'].version).toBe('2.0.1');
+    expect(l.packages['node_modules/bpkg/node_modules/cpkg'].version).toBe('3.0.1');
+    expect(l.packages['node_modules/cpkg'].version).toBe('3.0.1');
+    expect(h.exec.calls.filter((c) => c.cmd === 'npm' && c.args[0] === 'install' && c.args.at(-1) === 'cpkg@3.0.1')).toHaveLength(1);
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:acorn@1.0.1', 'npm:bpkg@2.0.1', 'npm:cpkg@3.0.1']);
+    expect(h.summary()).toMatch(/Packages fixed: 3 · declined: 0 · unverified: 0 · unresolvable: 0 · failed: 0/);
+  });
+
+  it('a package whose install pulls in the overlay-only fix of a package that already failed → reverted as unresolvable; the others ship', async () => {
+    const h = harness(
+      threeNpm((c, fs) => {
+        if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+        const spec = c.args.at(-1)!;
+        if (spec === 'acorn@1.0.1') return { code: 1, stderr: 'E500' };
+        if (spec === 'bpkg@2.0.1') {
+          bump(fs, '/w', 'bpkg', '2.0.1');
+          bump(fs, '/w', 'acorn', '1.0.1', 'node_modules/bpkg/node_modules/acorn'); // acorn's overlay-only fix; acorn did not ship
+        }
+        if (spec === 'cpkg@3.0.1') bump(fs, '/w', 'cpkg', '3.0.1');
+      }),
+    );
+    expect(await h.run()).toBe(0);
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (1 package, 1 advisory)');
+    const l = JSON.parse(h.written()['package-lock.json']!);
+    expect(l.packages['node_modules/bpkg'].version).toBe('2.0.0');
+    expect(l.packages['node_modules/bpkg/node_modules/acorn']).toBeUndefined();
+    expect(l.packages['node_modules/cpkg'].version).toBe('3.0.1');
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:cpkg@3.0.1']);
+    expect(h.prs[0]!.body).toMatch(/Not included[\s\S]*`bpkg`.*unresolvable: pulls in overlay-only npm:acorn@1\.0\.1/);
+    expect(h.summary()).toMatch(/bpkg.*unresolvable: pulls in overlay-only npm:acorn@1\.0\.1/);
+  });
+
+  it("pulling in a failed package's fix that has cleared main's cooldown → not overlay-only, so the package ships", async () => {
+    const h = harness(
+      threeNpm(
+        (c, fs) => {
+          if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+          const spec = c.args.at(-1)!;
+          if (spec === 'acorn@1.0.1') return { code: 1, stderr: 'E500' };
+          if (spec === 'bpkg@2.0.1') {
+            bump(fs, '/w', 'bpkg', '2.0.1');
+            bump(fs, '/w', 'acorn', '1.0.1', 'node_modules/bpkg/node_modules/acorn');
+          }
+          if (spec === 'cpkg@3.0.1') bump(fs, '/w', 'cpkg', '3.0.1');
+        },
+        { times: { 'acorn@1.0.1': '2026-10-01T00:00:00Z' } }, // 49 days before the run: main installs it without an allow entry
+      ),
+    );
+    expect(await h.run()).toBe(0);
     expect(h.prs[0]!.title).toBe('decant: security fixes (2 packages, 2 advisories)');
     const l = JSON.parse(h.written()['package-lock.json']!);
-    expect(l.packages['node_modules/acorn'].version).toBe('1.0.1');
-    expect(l.packages['node_modules/bpkg'].version).toBe('2.0.0');
-    expect(l.packages['node_modules/bpkg/node_modules/cpkg']).toBeUndefined();
-    expect(l.packages['node_modules/cpkg'].version).toBe('3.0.1');
-    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:acorn@1.0.1', 'npm:cpkg@3.0.1']);
-    expect(h.prs[0]!.body).toMatch(/Not included[\s\S]*`bpkg`.*unresolvable: pulls in overlay-only npm:cpkg@3\.0\.1/);
-    expect(h.summary()).toMatch(/bpkg.*unresolvable: pulls in overlay-only npm:cpkg@3\.0\.1/);
+    expect(l.packages['node_modules/bpkg'].version).toBe('2.0.1');
+    expect(l.packages['node_modules/bpkg/node_modules/acorn'].version).toBe('1.0.1');
+    expect(h.summary()).toMatch(/acorn.*failed/);
+  });
+
+  it('a later package pulled past its target (not to it) → not skipped: its own fix runs, and no allow entry for an unlocked version', async () => {
+    const h = harness(
+      threeNpm((c, fs) => {
+        if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+        const spec = c.args.at(-1)!;
+        if (spec === 'acorn@1.0.1') bump(fs, '/w', 'acorn', '1.0.1');
+        if (spec === 'bpkg@2.0.1') {
+          bump(fs, '/w', 'bpkg', '2.0.1');
+          bump(fs, '/w', 'cpkg', '3.0.2'); // past cpkg's target 3.0.1: nothing remains, but 3.0.1 is not locked
+        }
+        if (spec === 'cpkg@3.0.1') bump(fs, '/w', 'cpkg', '3.0.1');
+      }),
+    );
+    expect(await h.run()).toBe(0);
+    // cpkg 3.0.2 is past the advisory, so npm update (a no-op here) runs instead of being skipped as fixed.
+    expect(h.exec.calls.filter((c) => c.cmd === 'npm' && c.args[0] === 'update' && c.args.at(-1) === 'cpkg')).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (2 packages, 2 advisories)');
+    const l = JSON.parse(h.written()['package-lock.json']!);
+    expect(l.packages['node_modules/cpkg'].version).toBe('3.0.2');
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:acorn@1.0.1', 'npm:bpkg@2.0.1']);
+    expect(h.summary()).toMatch(/cpkg.*unresolvable: no lockfile changes/);
+  });
+
+  it('a package unresolvable only because of a package dropped later → retried in the next round and ships', async () => {
+    const h = harness(
+      threeNpm((c, fs) => {
+        if (c.cmd !== 'npm' || c.args[0] !== 'install') return;
+        const spec = c.args.at(-1)!;
+        if (spec === 'acorn@1.0.1') {
+          bump(fs, '/w', 'acorn', '1.0.1');
+          bump(fs, '/w', 'cpkg', '3.0.1', 'node_modules/acorn/node_modules/cpkg'); // accepted: cpkg comes later
+        }
+        if (spec === 'bpkg@2.0.1') {
+          bump(fs, '/w', 'bpkg', '2.0.1');
+          bump(fs, '/w', 'acorn', '1.0.0'); // would regress acorn in round 1
+        }
+        if (spec === 'cpkg@3.0.1') return { code: 1, stderr: 'E500' };
+      }),
+    );
+    expect(await h.run()).toBe(0);
+    // Round 1: acorn done, bpkg unresolvable (would regress acorn), cpkg failed, so acorn is dropped. Round 2: bpkg alone ships.
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (1 package, 1 advisory)');
+    const l = JSON.parse(h.written()['package-lock.json']!);
+    expect(l.packages['node_modules/bpkg'].version).toBe('2.0.1');
+    expect(l.packages['node_modules/acorn/node_modules/cpkg']).toBeUndefined();
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(['npm:bpkg@2.0.1']);
+    expect(h.summary()).toMatch(/acorn.*unresolvable: pulls in overlay-only npm:cpkg@3\.0\.1, which did not ship/);
+    expect(h.summary()).toMatch(/cpkg.*failed/);
+    expect(h.exec.calls.filter((c) => c.cmd === 'npm' && c.args.at(-1) === 'cpkg@3.0.1')).toHaveLength(1); // failed: not retried
   });
 
   it('pulling in the overlay-only version of a package that then fails → that package reverted, nothing ships', async () => {
@@ -1141,6 +1247,61 @@ describe('audit: Go', () => {
     expect(Object.keys(h.written()).sort()).toEqual(['decant.json', 'go.mod', 'go.sum']);
     expect(h.prs[0]).toMatchObject({ head: BRANCH, title: 'decant: security fixes (1 package, 1 advisory)' });
     expect(h.labels[0]!.labels).toEqual(['decant:security', 'decant:critical']);
+  });
+});
+
+describe('audit: Go modules released in lockstep', () => {
+  // go.opentelemetry.io/otel, otel/sdk and otel/trace: `go get` of any one moves all three to v1.47.0.
+  const MODS = ['go.opentelemetry.io/otel', 'go.opentelemetry.io/otel/sdk', 'go.opentelemetry.io/otel/trace'];
+  const OT = 'GO-2026-6974'; // otel/sdk + otel/trace, fixed 1.47.0
+  const OT2 = 'GO-2026-6975'; // otel, fixed 1.47.0
+  const goRec = (id: string, names: string[]) => ({
+    id,
+    summary: `${id} in otel`,
+    database_specific: { severity: 'MODERATE' },
+    affected: names.map((name) => ({ package: { ecosystem: 'Go', name }, ranges: [{ type: 'SEMVER', events: [{ introduced: '1.35.0' }, { fixed: '1.47.0' }] }] })),
+  });
+  const sum = (v: string) => MODS.map((m) => `${m} ${v} h1:${m}${v}=\n${m} ${v}/go.mod h1:${m}${v}mod=\n`).join('');
+  const mod = (v: string) => `module example.com/app\n\ngo 1.22\n\nrequire (\n${MODS.map((m) => `\t${m} ${v} // indirect\n`).join('')})\n`;
+  const OTEL: World = {
+    files: { '/w/go.mod': mod('v1.44.0'), '/w/go.sum': sum('v1.44.0') },
+    osv: { 'go.opentelemetry.io/otel@1.44.0': [OT2], 'go.opentelemetry.io/otel/sdk@1.44.0': [OT], 'go.opentelemetry.io/otel/trace@1.44.0': [OT] },
+    records: { [OT]: goRec(OT, [MODS[1]!, MODS[2]!]), [OT2]: goRec(OT2, [MODS[0]!]) },
+    exec: (c, fs) => {
+      if (c.cmd !== 'go' || c.args[0] !== 'get') return;
+      fs.files.set('/w/go.mod', mod('v1.47.0'));
+      fs.files.set('/w/go.sum', sum('v1.47.0'));
+    },
+  };
+
+  it('go get of the first module bumps all three → all three fixed in one PR, one go get', async () => {
+    const h = harness(OTEL);
+    expect(await h.run()).toBe(0);
+    expect(h.exec.calls.filter((c) => c.cmd === 'go' && c.args[0] === 'get').map((c) => c.args.at(-1))).toEqual(['go.opentelemetry.io/otel@v1.47.0']);
+    expect(h.prs).toHaveLength(1);
+    expect(h.prs[0]!.title).toBe('decant: security fixes (3 packages, 2 advisories)');
+    expect(h.prs[0]!.body).not.toMatch(/Not included/);
+    expect(h.written()['go.sum']).toBe(sum('v1.47.0'));
+    expect(h.written()['go.mod']).toBe(mod('v1.47.0'));
+    expect(JSON.parse(h.written()['decant.json']!).allow.map((a: any) => a.package)).toEqual(MODS.map((m) => `go:${m}@v1.47.0`));
+    expect(h.summary()).toMatch(/Packages fixed: 3 · declined: 0 · unverified: 0 · unresolvable: 0 · failed: 0/);
+  });
+
+  it('the first module fails → the others, whose go get pulls in its fix, are reverted; nothing ships', async () => {
+    const h = harness({
+      ...OTEL,
+      exec: (c, fs) => {
+        if (c.cmd !== 'go' || c.args[0] !== 'get') return;
+        if (c.args.at(-1) === 'go.opentelemetry.io/otel@v1.47.0') return { code: 1, stderr: '502 Bad Gateway' };
+        fs.files.set('/w/go.mod', mod('v1.47.0'));
+        fs.files.set('/w/go.sum', sum('v1.47.0'));
+      },
+    });
+    expect(await h.run()).toBe(0);
+    // sdk's go get pulls in otel@v1.47.0, the fix of a package that already failed: reverted. trace likewise.
+    expect(h.prs).toEqual([]);
+    expect(h.summary()).toMatch(/otel\/sdk.*unresolvable: pulls in overlay-only go:go\.opentelemetry\.io\/otel@v1\.47\.0/);
+    expect(h.fs.files.get('/w/go.sum')).toBe(sum('v1.44.0'));
   });
 });
 
